@@ -1,0 +1,90 @@
+name: Work item (agent contract)
+description: Contract-first work item optimized for parallel AI agents + merge captain workflow (public-safe).
+title: "[NN] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Public repo rules (required)**
+        - Do **not** paste cluster details (hostnames, namespaces, pod names, PVCs), internal URLs, or runbooks.
+        - Keep execution container-first (`docker/` + TOML). No hardcoded internal paths.
+        - B200-only (`sm_100a`): no fallbacks.
+
+        **Contract-first**
+        - The `Agent Contract` block below is the source of truth.
+        - If scope/knobs/gates change, update the contract (no “drive-by” edits).
+        - Gate IDs must be from `configs/gates/gates.toml` (named gates; no ad‑hoc commands here).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary (what + why)
+      description: 2–6 sentences. Focus on tokens/s, stability, or correctness.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contract
+    attributes:
+      label: Agent Contract (YAML, required)
+      description: |
+        This block is intentionally machine-readable. Keep it public-safe.
+        Gate IDs and bundles are defined in `configs/gates/gates.toml`.
+      value: |
+        ```yaml
+        nmoe:
+          issue: 03a
+          slug: attention
+          kind: feature          # feature|bugfix|perf|refactor|docs
+          risk: hot              # hot|warm|cold
+          complexity: M          # S|M|L
+          depends_on: [01]       # issue numbers
+          merge_hotspots: [nmoe/train.py, nmoe/config.py]
+
+        scope:
+          allow:
+            - nmoe/attention/**
+            - nmoe/model.py
+            - nmoe/config.py
+          deny:
+            - nmoe/csrc/**
+
+        contract:
+          invariants:
+            - B200-only (sm_100a); fail off-target
+            - No NCCL all-to-all on MoE path
+            - TOML-only config; container-first execution
+          knobs:
+            add: []
+            change: [attn_global_every, attn_local_window]
+
+        gates:
+          required:
+            - cpu:import
+            - cpu:compileall
+            - b200:moonlight_8x20
+          perf:
+            gate: perf:baseline_delta
+            compare: b200:moonlight_8x20
+            metric: node_tps_p50
+            baseline_ref: origin/master
+            budget_pct: -10
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (optional)
+      description: Free-form discussion. Keep public-safe.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: public_safe
+    attributes:
+      label: Public-safety confirmation (required)
+      options:
+        - label: I confirm this issue contains no internal hostnames, cluster identifiers, private URLs, credentials, or runbooks.
+          required: true

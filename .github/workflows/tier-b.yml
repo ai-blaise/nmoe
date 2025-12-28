@@ -1,0 +1,340 @@
+name: Tier B gates (B200, maintainer-controlled)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to test (merge ref is used)"
+        required: true
+        type: string
+      bundle:
+        description: "Gate bundle to run"
+        required: true
+        type: choice
+        options:
+          - hot_path_min
+          - blockscaled_full
+          - zero2_full
+          - frozen_full
+          - full
+          - single
+      single_gate:
+        description: "Gate ID (only used when bundle=single), e.g. b200:moonlight_8x20"
+        required: false
+        type: string
+      baseline_ref:
+        description: "Baseline ref for perf:baseline_delta (default: origin/master)"
+        required: false
+        type: string
+      perf_budget_pct:
+        description: "Optional perf budget (e.g. -10 means >= -10%); only applied if perf:baseline_delta is requested"
+        required: false
+        type: string
+
+jobs:
+  tier-b:
+    runs-on: [self-hosted, b200]
+    environment: b200
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout PR merge ref
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pr_number }}/merge
+          fetch-depth: 0
+
+      - name: Run gates
+        id: run
+        env:
+          BUNDLE: ${{ inputs.bundle }}
+          SINGLE_GATE: ${{ inputs.single_gate }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          PERF_BUDGET_PCT: ${{ inputs.perf_budget_pct }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+          
+          import tomllib
+          
+          
+          def _die(msg: str) -> None:
+            print(f"[tier-b] ERROR: {msg}", file=sys.stderr)
+            raise SystemExit(2)
+          
+          
+          def _run(cmd: str, *, cwd: str | None = None, timeout_s: int | None = None) -> tuple[int, str]:
+            start = time.time()
+            p = subprocess.Popen(
+              cmd,
+              cwd=cwd,
+              shell=True,
+              executable="/bin/bash",
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+              bufsize=1,
+            )
+            out_lines: list[str] = []
+            try:
+              while True:
+                line = p.stdout.readline() if p.stdout else ""
+                if line:
+                  sys.stdout.write(line)
+                  out_lines.append(line)
+                if line == "" and p.poll() is not None:
+                  break
+                if timeout_s is not None and (time.time() - start) > timeout_s:
+                  p.kill()
+                  raise TimeoutError(f"timeout after {timeout_s}s")
+              rc = int(p.wait())
+            except TimeoutError as e:
+              out_lines.append(f"\n[tier-b] TIMEOUT: {e}\n")
+              return 124, "".join(out_lines)
+            return rc, "".join(out_lines)
+          
+          
+          def _p50(xs: list[float]) -> float | None:
+            if not xs:
+              return None
+            xs = sorted(xs)
+            return xs[len(xs)//2]
+          
+          
+          def _parse_node_tps(log: str) -> list[int]:
+            out: list[int] = []
+            for m in re.finditer(r"\\bnode_tps:\\s*([0-9,]+)\\b", log):
+              out.append(int(m.group(1).replace(",", "")))
+            return out
+          
+          
+          def _preflight_env(reqs: list[str]) -> None:
+            missing = [k for k in reqs if not os.getenv(k)]
+            if missing:
+              _die(f"missing required env vars: {', '.join(missing)}")
+          
+          
+          def _preflight_files(paths: list[str]) -> None:
+            missing = [p for p in paths if not Path(p).exists()]
+            if missing:
+              _die(f"missing required files: {', '.join(missing)}")
+          
+          
+          gates_path = Path("configs/gates/gates.toml")
+          if not gates_path.exists():
+            _die("configs/gates/gates.toml not found")
+          
+          cfg = tomllib.loads(gates_path.read_text())
+          gates = cfg.get("gates", {})
+          bundles = cfg.get("bundles", {})
+          
+          bundle = os.environ.get("BUNDLE", "").strip()
+          single_gate = os.environ.get("SINGLE_GATE", "").strip()
+          baseline_ref = (os.environ.get("BASELINE_REF", "").strip() or "origin/master")
+          perf_budget_s = os.environ.get("PERF_BUDGET_PCT", "").strip()
+          perf_budget = float(perf_budget_s) if perf_budget_s else None
+          
+          if not bundle:
+            _die("bundle input is required")
+          if bundle == "single":
+            if not single_gate:
+              _die("single_gate input is required when bundle=single")
+            gate_ids = [single_gate]
+          else:
+            if bundle not in bundles:
+              _die(f"unknown bundle: {bundle}")
+            gate_ids = list(bundles[bundle])
+          
+          # De-dupe while preserving order.
+          seen: set[str] = set()
+          gate_ids = [g for g in gate_ids if not (g in seen or seen.add(g))]
+          
+          # Validate gate IDs exist.
+          for gid in gate_ids:
+            if gid not in gates:
+              _die(f"unknown gate id: {gid}")
+          
+          # Preflight: env + files (fail-fast, clear).
+          for gid in gate_ids:
+            g = gates[gid]
+            _preflight_env(g.get("requires", []))
+            _preflight_files(g.get("requires_files", []))
+          
+          results: dict[str, dict] = {}
+          
+          # Run command gates.
+          for gid in gate_ids:
+            g = gates[gid]
+            kind = str(g.get("kind", "cmd"))
+            tier = str(g.get("tier", ""))
+            if tier != "b":
+              # Tier B workflow only. (Tier A can live in normal CI.)
+              results[gid] = {"status": "skipped", "reason": f"tier={tier}"}
+              continue
+            if kind in ("perf", "external"):
+              results[gid] = {"status": "pending", "kind": kind}
+              continue
+          
+            cmd = str(g.get("cmd", "")).strip()
+            if not cmd:
+              _die(f"gate {gid} has no cmd")
+            timeout_s = int(g.get("timeout_s", 0)) or None
+            print(f"\\n[tier-b] === gate {gid} ===\\n{cmd}\\n")
+            rc, out = _run(cmd, timeout_s=timeout_s)
+            node_tps = _parse_node_tps(out)
+            node_tps_p50 = _p50([float(x) for x in node_tps]) if node_tps else None
+            results[gid] = {
+              "status": "pass" if rc == 0 else "fail",
+              "rc": rc,
+              "node_tps_p50": node_tps_p50,
+              "node_tps_samples": len(node_tps),
+            }
+            if rc != 0:
+              break
+          
+          # perf:baseline_delta (informational unless budget provided)
+          perf_gid = "perf:baseline_delta"
+          if perf_gid in gate_ids and results.get(perf_gid, {}).get("kind") == "perf":
+            perf_def = gates[perf_gid]
+            compare_gate = str(perf_def.get("compare_gate", "")).strip()
+            metric = str(perf_def.get("metric", "node_tps_p50")).strip()
+            if not compare_gate:
+              _die("perf:baseline_delta missing compare_gate")
+            if compare_gate not in results:
+              _die(f"perf:baseline_delta requires {compare_gate} to run in the same bundle")
+            if results.get(compare_gate, {}).get("status") != "pass":
+              results[perf_gid] = {"status": "skipped", "reason": f"compare gate {compare_gate} did not pass"}
+            else:
+              pr_val = results[compare_gate].get(metric)
+              if pr_val is None:
+                results[perf_gid] = {"status": "skipped", "reason": f"missing metric {metric} from {compare_gate}"}
+              else:
+                # Run baseline in a detached git worktree to avoid mutating the checkout.
+                baseline_dir = Path(".baseline_worktree")
+                if baseline_dir.exists():
+                  shutil.rmtree(baseline_dir)
+                subprocess.check_call(["git", "fetch", "origin", "master", "--quiet"])
+                subprocess.check_call(["git", "worktree", "add", "--detach", str(baseline_dir), baseline_ref])
+                try:
+                  base_cmd = str(gates[compare_gate].get("cmd", "")).strip()
+                  base_timeout_s = int(gates[compare_gate].get("timeout_s", 0)) or None
+                  print(f"\\n[tier-b] === perf baseline ({baseline_ref}) for {compare_gate} ===\\n")
+                  rc, out = _run(base_cmd, cwd=str(baseline_dir), timeout_s=base_timeout_s)
+                  if rc != 0:
+                    results[perf_gid] = {"status": "fail", "reason": f"baseline run failed rc={rc}"}
+                  else:
+                    base_tps = _parse_node_tps(out)
+                    base_p50 = _p50([float(x) for x in base_tps]) if base_tps else None
+                    if base_p50 is None:
+                      results[perf_gid] = {"status": "fail", "reason": "baseline missing node_tps samples"}
+                    else:
+                      delta_pct = ((float(pr_val) / float(base_p50)) - 1.0) * 100.0
+                      status = "pass"
+                      if perf_budget is not None and delta_pct < perf_budget:
+                        status = "fail"
+                      results[perf_gid] = {
+                        "status": status,
+                        "compare_gate": compare_gate,
+                        "metric": metric,
+                        "baseline_ref": baseline_ref,
+                        "baseline": float(base_p50),
+                        "result": float(pr_val),
+                        "delta_pct": float(delta_pct),
+                        "budget_pct": float(perf_budget) if perf_budget is not None else None,
+                      }
+                finally:
+                  try:
+                    subprocess.check_call(["git", "worktree", "remove", "-f", str(baseline_dir)])
+                  except Exception:
+                    pass
+          
+          # Summaries
+          overall = "pass"
+          for gid, r in results.items():
+            if r.get("status") == "fail":
+              overall = "fail"
+              break
+          
+          out = {
+            "bundle": bundle,
+            "gate_ids": gate_ids,
+            "results": results,
+            "overall": overall,
+          }
+          Path("tier_b_results.json").write_text(json.dumps(out, indent=2, sort_keys=True))
+          print("\\n[tier-b] results written to tier_b_results.json")
+          
+          # Set outputs for later steps.
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+            with open(gh_out, "a", encoding="utf-8") as f:
+              f.write(f"overall={overall}\\n")
+          if overall != "pass":
+            raise SystemExit(1)
+          PY
+
+      - name: Job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("tier_b_results.json")
+          if not p.exists():
+            raise SystemExit(0)
+          data = json.loads(p.read_text())
+          lines = []
+          lines.append(f"## Tier B results ({data.get('bundle')})")
+          lines.append("")
+          lines.append("| Gate | Status | node_tps_p50 | Notes |")
+          lines.append("|---|---:|---:|---|")
+          for gid in data.get("gate_ids", []):
+            r = data["results"].get(gid, {})
+            status = r.get("status", "unknown")
+            tps = r.get("node_tps_p50")
+            note = r.get("reason", "")
+            if gid == "perf:baseline_delta" and status in ("pass", "fail"):
+              note = f"baseline_ref={r.get('baseline_ref')} delta_pct={r.get('delta_pct'):.2f} budget_pct={r.get('budget_pct')}"
+            lines.append(f"| `{gid}` | **{status}** | {'' if tps is None else f'{tps:.0f}'} | {note} |")
+          Path("/tmp/summary.md").write_text("\\n".join(lines))
+          PY
+          cat /tmp/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment results on PR (sanitized)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('tier_b_results.json')) return;
+            const data = JSON.parse(fs.readFileSync('tier_b_results.json', 'utf8'));
+            const gateIds = data.gate_ids || [];
+            const results = data.results || {};
+            let body = `### Tier B gate results (${data.bundle})\\n\\n`;
+            body += `| Gate | Status | node_tps_p50 | Notes |\\n|---|---:|---:|---|\\n`;
+            for (const gid of gateIds) {
+              const r = results[gid] || {};
+              const status = r.status || 'unknown';
+              const tps = (r.node_tps_p50 === undefined || r.node_tps_p50 === null) ? '' : String(Math.round(r.node_tps_p50));
+              let note = r.reason || '';
+              if (gid === 'perf:baseline_delta' && (status === 'pass' || status === 'fail')) {
+                note = `baseline_ref=${r.baseline_ref} delta_pct=${r.delta_pct.toFixed(2)} budget_pct=${r.budget_pct ?? ''}`;
+              }
+              body += `| \`${gid}\` | **${status}** | ${tps} | ${note} |\\n`;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number('${{ inputs.pr_number }}'),
+              body,
+            });

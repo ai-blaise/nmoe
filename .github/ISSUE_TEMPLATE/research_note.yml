@@ -1,0 +1,59 @@
+name: Research / design note (no-code OK)
+description: Track design decisions and experiments (public-safe).
+title: "[RESEARCH] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This template is for design exploration. Keep it **public-safe** (no internal infra details).
+        If this becomes an implementation, open a separate **Work item** issue with explicit gates.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Question / hypothesis
+      placeholder: |
+        What are we trying to learn or decide?
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints / invariants
+      placeholder: |
+        - B200-only (sm_100a)
+        - RDEP-only expert parallelism (no NCCL all-to-all)
+        - TOML-only config
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed direction(s)
+      placeholder: |
+        Option A:
+        Option B:
+        Decision criteria:
+    validations:
+      required: true
+
+  - type: textarea
+    id: experiment
+    attributes:
+      label: Experiment plan (if any)
+      placeholder: |
+        - Minimal config(s):
+        - Metrics to compare:
+        - Success criteria:
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: public_safe
+    attributes:
+      label: Public-safety confirmation (required)
+      options:
+        - label: I confirm this issue text contains no internal hostnames, cluster identifiers, private URLs, credentials, or runbooks.
+          required: true

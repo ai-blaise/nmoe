@@ -1,0 +1,28 @@
+# GitHub Actions self-hosted runner for nmoe gates
+# Based on nmoe_train for full training capability
+#
+# Build:
+#   docker build -f docker/Dockerfile.runner -t ghcr.io/noumena-network/nmoe:runner-$(git rev-parse --short HEAD) .
+#
+# The runner will be used by ARC (Actions Runner Controller) on B200 nodes.
+
+ARG BASE_IMAGE=ghcr.io/noumena-network/nmoe:train-latest
+FROM ${BASE_IMAGE}
+
+ARG RUNNER_VERSION=2.321.0
+ARG RUNNER_ARCH=x64
+
+# Install GitHub Actions runner
+WORKDIR /home/runner
+RUN curl -sL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz" | tar xz && \
+    ./bin/installdependencies.sh && \
+    chown -R root:root /home/runner
+
+# Back to nmoe workspace
+WORKDIR /workspace/nmoe
+
+# Runner expects these env vars at runtime (set by ARC):
+#   RUNNER_NAME, RUNNER_REPOSITORY_URL, RUNNER_TOKEN, RUNNER_LABELS
+
+# Entrypoint for ARC - run.sh handles registration and job execution
+ENTRYPOINT ["/home/runner/run.sh"]

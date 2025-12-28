@@ -1,0 +1,172 @@
+[meta]
+version = "1"
+target = "b200"
+
+# =============================================================================
+# Tier A (CPU/container)
+# =============================================================================
+
+[gates."cpu:import"]
+tier = "a"
+timeout_s = 30
+cmd = "python -c \"import nmoe\""
+
+[gates."cpu:compileall"]
+tier = "a"
+timeout_s = 60
+cmd = "python -m compileall -q nmoe/"
+
+# =============================================================================
+# Tier B (B200)
+#
+# All Tier B gates are intended to run on a controlled self-hosted runner.
+# Keep commands public-safe and parameterized via env (no internal paths).
+# =============================================================================
+
+[gates."b200:moonlet_1x10"]
+tier = "b"
+gpus = 1
+timeout_s = 600
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT"]
+requires_files = ["configs/moonlet.toml"]
+cmd = """
+python -m nmoe.train configs/moonlet.toml \
+  --steps=10 \
+  --data_path=${NMOE_DATA_PATH} \
+  --checkpoint_dir=${NMOE_RUN_ROOT}/checkpoints \
+  --metrics_dir=${NMOE_RUN_ROOT}/metrics \
+  --experiments_db=${NMOE_RUN_ROOT}/experiments.db
+"""
+
+[gates."b200:moonlight_8x20"]
+tier = "b"
+gpus = 8
+timeout_s = 900
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT"]
+requires_files = ["configs/moonlight.toml"]
+cmd = """
+torchrun --nproc_per_node=8 -m nmoe.train configs/moonlight.toml \
+  --steps=20 \
+  --data_path=${NMOE_DATA_PATH} \
+  --checkpoint_dir=${NMOE_RUN_ROOT}/checkpoints \
+  --metrics_dir=${NMOE_RUN_ROOT}/metrics \
+  --experiments_db=${NMOE_RUN_ROOT}/experiments.db
+"""
+
+[gates."b200:moonlight_frozen_8x20"]
+tier = "b"
+gpus = 8
+timeout_s = 900
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT", "NMOE_FROZEN_DIR"]
+requires_files = ["configs/moonlight_frozen.toml"]
+cmd = """
+torchrun --nproc_per_node=8 -m nmoe.train configs/moonlight_frozen.toml \
+  --steps=20 \
+  --data_path=${NMOE_DATA_PATH} \
+  --checkpoint_dir=${NMOE_RUN_ROOT}/checkpoints \
+  --metrics_dir=${NMOE_RUN_ROOT}/metrics \
+  --experiments_db=${NMOE_RUN_ROOT}/experiments.db \
+  --frozen_dir=${NMOE_FROZEN_DIR}
+"""
+
+[gates."b200:profile_fp8"]
+tier = "b"
+gpus = 8
+timeout_s = 900
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT"]
+requires_files = ["configs/moonlight.toml"]
+cmd = """
+torchrun --nproc_per_node=8 -m nmoe.train configs/moonlight.toml \
+  --dtype=fp8 \
+  --steps=10 \
+  --data_path=${NMOE_DATA_PATH} \
+  --checkpoint_dir=${NMOE_RUN_ROOT}/checkpoints \
+  --metrics_dir=${NMOE_RUN_ROOT}/metrics \
+  --experiments_db=${NMOE_RUN_ROOT}/experiments.db
+"""
+
+[gates."b200:profile_nvfp4"]
+tier = "b"
+gpus = 8
+timeout_s = 900
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT"]
+requires_files = ["configs/moonlight.toml"]
+cmd = """
+torchrun --nproc_per_node=8 -m nmoe.train configs/moonlight.toml \
+  --dtype=nvfp4 \
+  --steps=10 \
+  --data_path=${NMOE_DATA_PATH} \
+  --checkpoint_dir=${NMOE_RUN_ROOT}/checkpoints \
+  --metrics_dir=${NMOE_RUN_ROOT}/metrics \
+  --experiments_db=${NMOE_RUN_ROOT}/experiments.db
+"""
+
+[gates."b200:frozen_profile_fp8"]
+tier = "b"
+gpus = 8
+timeout_s = 900
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT", "NMOE_FROZEN_DIR"]
+requires_files = ["configs/moonlight_frozen.toml"]
+cmd = """
+torchrun --nproc_per_node=8 -m nmoe.train configs/moonlight_frozen.toml \
+  --dtype=fp8 \
+  --steps=10 \
+  --data_path=${NMOE_DATA_PATH} \
+  --checkpoint_dir=${NMOE_RUN_ROOT}/checkpoints \
+  --metrics_dir=${NMOE_RUN_ROOT}/metrics \
+  --experiments_db=${NMOE_RUN_ROOT}/experiments.db \
+  --frozen_dir=${NMOE_FROZEN_DIR}
+"""
+
+[gates."b200:frozen_profile_nvfp4"]
+tier = "b"
+gpus = 8
+timeout_s = 900
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT", "NMOE_FROZEN_DIR"]
+requires_files = ["configs/moonlight_frozen.toml"]
+cmd = """
+torchrun --nproc_per_node=8 -m nmoe.train configs/moonlight_frozen.toml \
+  --dtype=nvfp4 \
+  --steps=10 \
+  --data_path=${NMOE_DATA_PATH} \
+  --checkpoint_dir=${NMOE_RUN_ROOT}/checkpoints \
+  --metrics_dir=${NMOE_RUN_ROOT}/metrics \
+  --experiments_db=${NMOE_RUN_ROOT}/experiments.db \
+  --frozen_dir=${NMOE_FROZEN_DIR}
+"""
+
+[gates."zero2:resume_determinism"]
+tier = "b"
+gpus = 8
+timeout_s = 1200
+requires = ["NMOE_DATA_PATH", "NMOE_RUN_ROOT"]
+kind = "external"
+note = "Repo-tracked implementation pending (see repo cleanup issue)."
+
+[gates."perf:baseline_delta"]
+tier = "b"
+kind = "perf"
+timeout_s = 0
+compare_gate = "b200:moonlight_8x20"
+metric = "node_tps_p50"
+
+# =============================================================================
+# Bundles (Tier B)
+# =============================================================================
+
+[bundles]
+hot_path_min = ["b200:moonlet_1x10", "b200:moonlight_8x20"]
+blockscaled_full = ["b200:moonlet_1x10", "b200:moonlight_8x20", "b200:profile_fp8", "b200:profile_nvfp4"]
+zero2_full = ["b200:moonlet_1x10", "b200:moonlight_8x20", "zero2:resume_determinism"]
+frozen_full = ["b200:moonlight_frozen_8x20", "b200:frozen_profile_fp8", "b200:frozen_profile_nvfp4"]
+full = [
+  "b200:moonlet_1x10",
+  "b200:moonlight_8x20",
+  "b200:moonlight_frozen_8x20",
+  "b200:profile_fp8",
+  "b200:profile_nvfp4",
+  "b200:frozen_profile_fp8",
+  "b200:frozen_profile_nvfp4",
+  "zero2:resume_determinism",
+  "perf:baseline_delta",
+]

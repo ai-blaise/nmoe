@@ -1,0 +1,70 @@
+# ARC Runner Scale Set values for nmoe Tier‑B (B200) gates.
+#
+# Public-safe template:
+# - Do not store tokens/secrets in git. Reference a pre-created Kubernetes Secret by name.
+# - Cluster-specific items (PVC names, node selectors, tolerations) may need adjustment.
+#
+# Intended behavior:
+# - Scale-to-zero (minRunners=0) when idle.
+# - Runner pods request 8×B200 and run `.github/workflows/tier-b.yml` jobs.
+
+githubConfigUrl: "https://github.com/Noumena-Network/nmoe"
+githubConfigSecret: github-runner-pat
+runnerScaleSetName: "b200"
+
+minRunners: 0
+maxRunners: 1
+
+# Pod template (align with your training pods; adjust as needed)
+template:
+  spec:
+    restartPolicy: Never
+    runtimeClassName: nvidia
+    tolerations:
+      - key: nvidia.com/gpu
+        value: "true"
+        effect: NoSchedule
+
+    containers:
+      - name: runner
+        image: ghcr.io/noumena-network/nmoe:runner-latest
+        imagePullPolicy: Always
+        workingDir: /workspace/nmoe
+        env:
+          # Paths
+          - name: NMOE_DATA_PATH
+            value: "/data"
+          - name: NMOE_RUN_ROOT
+            value: "/workspace/run"
+          # PyTorch/NCCL settings (from k8s/train.yaml)
+          - name: PYTORCH_CUDA_ALLOC_CONF
+            value: "expandable_segments:True"
+          - name: NCCL_DEBUG
+            value: "WARN"
+          - name: NCCL_IB_DISABLE
+            value: "1"
+          - name: NCCL_P2P_DISABLE
+            value: "0"
+          - name: NCCL_P2P_LEVEL
+            value: "NVL"
+          - name: CUDA_DEVICE_MAX_CONNECTIONS
+            value: "1"
+        resources:
+          requests:
+            nvidia.com/gpu: "8"
+          limits:
+            nvidia.com/gpu: "8"
+        volumeMounts:
+          - name: data
+            mountPath: /data
+          - name: dshm
+            mountPath: /dev/shm
+
+    volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: nmoe-data
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
