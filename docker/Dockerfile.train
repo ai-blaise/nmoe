@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=xjdr/nmoe:base
+ARG BASE_IMAGE=ghcr.io/noumena-network/nmoe:base-latest
 FROM ${BASE_IMAGE}
 
 WORKDIR /workspace/nmoe

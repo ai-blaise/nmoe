@@ -10,10 +10,6 @@ on:
       - '.github/workflows/build-runner.yml'
   workflow_dispatch:
     inputs:
-      train_base_image:
-        description: 'Base image for docker/Dockerfile.train'
-        required: false
-        default: 'xjdr/nmoe:base'
       runner_version:
         description: 'GitHub Actions runner version (e.g. 2.330.0) or "latest"'
         required: false
@@ -55,11 +51,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          TRAIN_BASE_IMAGE="${{ github.event.inputs.train_base_image }}"
-          if [ -z "${TRAIN_BASE_IMAGE}" ]; then
-            TRAIN_BASE_IMAGE="xjdr/nmoe:base"
-          fi
-
           RV_IN="${{ github.event.inputs.runner_version }}"
           if [ -z "${RV_IN}" ]; then
             RV_IN="2.330.0"
@@ -76,8 +67,19 @@ jobs:
             RV="${RV_IN#v}"
           fi
 
-          echo "train_base_image=${TRAIN_BASE_IMAGE}" >> $GITHUB_OUTPUT
           echo "runner_version=${RV}" >> $GITHUB_OUTPUT
+
+      - name: Build and push base image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.base
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:base-${{ steps.meta.outputs.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:base-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Build and push train image
         uses: docker/build-push-action@v5
@@ -89,7 +91,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:train-${{ steps.meta.outputs.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:train-latest
           build-args: |
-            BASE_IMAGE=${{ steps.inputs.outputs.train_base_image }}
+            BASE_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:base-${{ steps.meta.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -112,6 +114,7 @@ jobs:
         run: |
           echo "### Train + runner images built" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Train**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:train-${{ steps.meta.outputs.sha }}\` (base: \`${{ steps.inputs.outputs.train_base_image }}\`)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Base**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:base-${{ steps.meta.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Train**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:train-${{ steps.meta.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Runner**: \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:runner-${{ steps.meta.outputs.sha }}\` (runner: \`${{ steps.inputs.outputs.runner_version }}\`)" >> $GITHUB_STEP_SUMMARY
           echo "- **SHA**: \`${{ steps.meta.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
