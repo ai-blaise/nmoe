@@ -1,4 +1,5 @@
-FROM xjdr/nmoe:base
+ARG BASE_IMAGE=xjdr/nmoe:base
+FROM ${BASE_IMAGE}
 
 WORKDIR /workspace/nmoe
 
@@ -18,4 +19,3 @@ RUN . .venv/bin/activate && make -C nmoe/csrc
 
 # Python path
 ENV PYTHONPATH=/workspace/nmoe:/workspace/nmoe/nmoe/csrc:/workspace/nmoe/third_party/flash_attn
-

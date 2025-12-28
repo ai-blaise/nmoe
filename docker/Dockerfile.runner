@@ -9,7 +9,7 @@
 ARG BASE_IMAGE=ghcr.io/noumena-network/nmoe:train-latest
 FROM ${BASE_IMAGE}
 
-ARG RUNNER_VERSION=2.321.0
+ARG RUNNER_VERSION=2.330.0
 ARG RUNNER_ARCH=x64
 
 # Install GitHub Actions runner
