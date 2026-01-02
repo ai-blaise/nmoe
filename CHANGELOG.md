@@ -4,6 +4,20 @@ All notable changes to nmoe are documented here.
 
 ## [Unreleased]
 
+## [2026-01-02] - Issue 07: Eval Framework
+
+### Added
+- Choice-based eval (`nmoe/eval/choices.py`): MMLU, MMLU-pro, ARC, HellaSwag, BoolQ, OpenBookQA, WinoGrande, COPA
+- Generation-based eval (`nmoe/eval/run_gen.py`): GSM8K, HumanEval, GPQA
+- Code execution sandbox (`nmoe/eval/execution.py`) for HumanEval
+- HF dataset adapters (`nmoe/eval/adapters.py`) for all choice tasks
+- Training integration via `eval_every` config in `nmoe/train.py`
+
+### Notes
+- Choice-based eval uses chunked logsumexp to avoid materializing `(seq, vocab)` logits
+- Multi-GPU eval keeps ranks in lockstep by construction (no barriers in inner loops)
+- Requires `datasets` library: `uv pip install datasets`
+
 ## [2026-01-02] - Issue 08: ZeRO-2 Chunked Reduce-Scatter and Checkpoint Reliability
 
 ### Added
