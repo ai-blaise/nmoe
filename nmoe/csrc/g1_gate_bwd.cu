@@ -7,7 +7,9 @@ struct alignas(16) bf16x8 { __nv_bfloat162 v[4]; };
 
 __device__ __forceinline__
 bf16x8 load_bf16x8(const __nv_bfloat16* __restrict__ p) {
-  return *reinterpret_cast<const bf16x8*>(p);
+  bf16x8 result;
+  *reinterpret_cast<float4*>(&result) = __ldg(reinterpret_cast<const float4*>(p));
+  return result;
 }
 
 __device__ __forceinline__
