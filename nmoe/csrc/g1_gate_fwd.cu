@@ -46,18 +46,15 @@ g1_gate_fwd_kernel(
   const int n_vec8 = n_total / 8;
 
   for (int i = tid; i < n_vec8; i += stride) {
+    int off = i * 8;
+    bf16x8 lin = load_bf16x8(linear_out + off);
+    bf16x8 attn = load_bf16x8(attn_out + off);
+    bf16x8 o, g;
     #pragma unroll
-    for (int u = 0; u < UNROLL && i + u * stride < n_vec8; u++) {
-      int off = (i + u * stride) * 8;
-      bf16x8 lin = load_bf16x8(linear_out + off);
-      bf16x8 attn = load_bf16x8(attn_out + off);
-      bf16x8 o, g;
-      #pragma unroll
-      for (int j = 0; j < 4; j++)
-        compute_fwd(lin.v[j], attn.v[j], o.v[j], g.v[j]);
-      store_bf16x8(output + off, o);
-      store_bf16x8(gate + off, g);
-    }
+    for (int j = 0; j < 4; j++)
+      compute_fwd(lin.v[j], attn.v[j], o.v[j], g.v[j]);
+    store_bf16x8(output + off, o);
+    store_bf16x8(gate + off, g);
   }
 
   int64_t rem_start = n_vec8 * 8;
@@ -82,7 +79,7 @@ extern "C" cudaError_t g1_gate_fwd(
 ) {
   if (n <= 0) return cudaSuccess;
 
-  constexpr int BLOCK = 256, UNROLL = 4;
+  constexpr int BLOCK = 256;
   int64_t n_vec8 = n / 8;
 
   int dev, sm;
@@ -91,12 +88,12 @@ extern "C" cudaError_t g1_gate_fwd(
   int blocks = min(sm * 4, int((n_vec8 + BLOCK - 1) / BLOCK));
   if (blocks < 1) blocks = 1;
 
-  nmoe::g1_gate_fwd_kernel<BLOCK, UNROLL><<<blocks, BLOCK, 0, stream>>>(
+  nmoe::g1_gate_fwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
       (const __nv_bfloat16*)linear_out,
       (const __nv_bfloat16*)attn_out,
       (__nv_bfloat16*)output,
       (__nv_bfloat16*)gate,
-      n_vec8, n);
+      n);
 
   return cudaGetLastError();
 }
