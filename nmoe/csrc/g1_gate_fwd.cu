@@ -30,20 +30,20 @@ void compute_fwd(__nv_bfloat162 lin, __nv_bfloat162 attn,
   out = __float22bfloat162_rn({fa.x * fg.x, fa.y * fg.y});
 }
 
-template <int BLOCK, int UNROLL>
+template <int BLOCK>
 __global__ void __launch_bounds__(BLOCK)
 g1_gate_fwd_kernel(
     const __nv_bfloat16* __restrict__ linear_out,
     const __nv_bfloat16* __restrict__ attn_out,
     __nv_bfloat16* __restrict__ output,
     __nv_bfloat16* __restrict__ gate,
-    int64_t n_vec8,
     int64_t n_total
 ) {
-  const int64_t tid = int64_t(blockIdx.x) * BLOCK + threadIdx.x;
-  const int64_t stride = int64_t(gridDim.x) * BLOCK;
+  const int tid = blockIdx.x * BLOCK + threadIdx.x;
+  const int stride = gridDim.x * BLOCK;
+  const int n_vec8 = n_total / 8;
 
-  for (int64_t i = tid; i < n_vec8; i += stride * UNROLL) {
+  for (int i = tid; i < n_vec8; i += stride) {
     #pragma unroll
     for (int u = 0; u < UNROLL && i + u * stride < n_vec8; u++) {
       int64_t off = (i + u * stride) * 8;

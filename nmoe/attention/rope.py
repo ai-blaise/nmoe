@@ -3,7 +3,7 @@ import math
 import torch
 from torch import nn
 
-
+@torch.compile
 def rotate_pe(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
   """Apply rotary position embedding to tensor x.
 
