@@ -1,5 +1,7 @@
 // G1 Gate backward kernel - sm_100a (Blackwell)
-#include "sm100_primitives.cuh"
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cstdint>
 
 namespace nmoe {
 
@@ -39,11 +41,12 @@ g1_gate_bwd_kernel(
     int64_t n_vec8,
     int64_t n_total
 ) {
-  const int tid = blockIdx.x * BLOCK + threadIdx.x;
-  const int stride = gridDim.x * BLOCK;
+  const int64_t tid = int64_t(blockIdx.x) * BLOCK + threadIdx.x;
+  const int64_t stride = int64_t(gridDim.x) * BLOCK;
+  const int64_t rem_start = n_vec8 * 8;
 
-  for (int i = tid; i < n_vec8; i += stride) {
-    int64_t off = i * 8;
+  for (int64_t i = tid; i < n_vec8; i += stride) {
+    const int64_t off = i * 8;
     bf16x8 d_o = load_bf16x8(d_out + off);
     bf16x8 o_u = load_bf16x8(out_ungated + off);
     bf16x8 g = load_bf16x8(gate + off);
@@ -55,7 +58,6 @@ g1_gate_bwd_kernel(
     store_bf16x8(d_gate_linear + off, d_g_l);
   }
 
-  int64_t rem_start = n_vec8 * 8;
   for (int64_t i = rem_start + tid; i < n_total; i += stride) {
     float fd = __bfloat162float(d_out[i]);
     float fo = __bfloat162float(out_ungated[i]);
@@ -84,7 +86,8 @@ extern "C" cudaError_t g1_gate_bwd(
   int dev, sm;
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, dev);
-  int blocks = min(sm * 4, int((n_vec8 + BLOCK - 1) / BLOCK));
+  const int64_t total_threads = (n + 7) / 8 * 8;
+  int blocks = min(sm * 4, int((total_threads + BLOCK - 1) / BLOCK));
   if (blocks < 1) blocks = 1;
 
   nmoe::g1_gate_bwd_kernel<BLOCK><<<blocks, BLOCK, 0, stream>>>(
@@ -95,5 +98,7 @@ extern "C" cudaError_t g1_gate_bwd(
       (__nv_bfloat16*)d_gate_linear,
       n_vec8, n);
 
-  return cudaGetLastError();
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  return cudaStreamSynchronize(stream);
 }
