@@ -22,7 +22,7 @@ void store_bf16x8(__nv_bfloat16* __restrict__ p, const bf16x8& x) {
 
 __device__ __forceinline__
 float fast_sigmoid(float x) {
-  return 1.f / (1.f + expf(-x));
+  return 1.f / (1.f + __expf(-x));
 }
 
 __device__ __forceinline__
