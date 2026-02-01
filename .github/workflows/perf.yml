@@ -1,0 +1,158 @@
+name: Performance Regression Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'nmoe/**/*.py'
+      - 'nmoe/**/*.cu'
+      - 'nmoe/**/*.cpp'
+      - 'tests/test_performance.py'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'nmoe/**/*.py'
+      - 'nmoe/**/*.cu'
+      - 'nmoe/**/*.cpp'
+      - 'tests/test_performance.py'
+  schedule:
+    # Run nightly at 3 AM UTC (after integration tests)
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      full_benchmark:
+        description: 'Run full benchmark suite including slow tests'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: perf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NMOE_PERF_RESULTS: /tmp/nmoe_perf_results.json
+
+jobs:
+  perf-quick:
+    name: Quick Performance Tests
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python environment
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          source .venv/bin/activate
+          pip install torch numpy pytest safetensors
+
+      - name: Install nmoe
+        run: |
+          source .venv/bin/activate
+          pip install -e .
+
+      - name: Run quick performance tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/test_performance.py -v -m "gpu and not slow" --tb=short
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-quick-${{ github.run_id }}
+          path: ${{ env.NMOE_PERF_RESULTS }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+  perf-full:
+    name: Full Performance Tests
+    runs-on: self-hosted
+    timeout-minutes: 60
+    if: github.event_name == 'schedule' || github.event.inputs.full_benchmark == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python environment
+        run: |
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          source .venv/bin/activate
+          pip install torch numpy pytest safetensors
+
+      - name: Install nmoe
+        run: |
+          source .venv/bin/activate
+          pip install -e .
+
+      - name: Run full performance tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/test_performance.py -v -m "gpu" --tb=short
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-full-${{ github.run_id }}
+          path: ${{ env.NMOE_PERF_RESULTS }}
+          if-no-files-found: ignore
+          retention-days: 90
+
+  perf-report:
+    name: Performance Report
+    runs-on: ubuntu-latest
+    needs: [perf-quick]
+    if: always()
+
+    steps:
+      - name: Download performance results
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-results-quick-${{ github.run_id }}
+          path: /tmp/perf
+        continue-on-error: true
+
+      - name: Generate report
+        run: |
+          if [ -f /tmp/perf/nmoe_perf_results.json ]; then
+            echo "## Performance Results" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Test | P50 (ms) | P99 (ms) | Throughput | Memory (GB) |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|----------|----------|------------|-------------|" >> $GITHUB_STEP_SUMMARY
+            cat /tmp/perf/nmoe_perf_results.json | python3 -c "
+import json
+import sys
+results = json.load(sys.stdin)
+for r in results:
+    name = r['name']
+    p50 = r['latency_p50_ms']
+    p99 = r['latency_p99_ms']
+    tput = r['throughput']
+    mem = r['memory_peak_gb']
+    # Format throughput
+    if tput > 1e6:
+        tput_str = f'{tput/1e6:.2f}M/s'
+    else:
+        tput_str = f'{tput/1e3:.2f}K/s'
+    print(f'| {name} | {p50:.3f} | {p99:.3f} | {tput_str} | {mem:.2f} |')
+" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No performance results found" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check for regressions
+        run: |
+          echo "Performance tests completed. Check summary for results."

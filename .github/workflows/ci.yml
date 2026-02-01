@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Run Ruff linter
+        run: ruff check nmoe/ tests/ --output-format=github
+
+      - name: Run Ruff formatter check
+        run: ruff format --check nmoe/ tests/
+
+  test-cpu:
+    name: CPU Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest pytest-cov numpy
+
+      - name: Install nmoe (editable)
+        run: pip install -e .
+
+      - name: Run CPU tests
+        run: |
+          pytest tests/ -v \
+            -m "not gpu and not multi_gpu and not distributed and not nvshmem" \
+            --tb=short \
+            --cov=nmoe \
+            --cov-report=xml \
+            --cov-report=term-missing
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+
+  test-gpu:
+    name: GPU Tests
+    runs-on: self-hosted
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        run: |
+          # Assumes Python 3.12 is available on self-hosted runner
+          python3.12 -m venv .venv
+          source .venv/bin/activate
+
+      - name: Install dependencies
+        run: |
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install torch numpy pytest
+
+      - name: Install nmoe (editable)
+        run: |
+          source .venv/bin/activate
+          pip install -e .
+
+      - name: Run GPU tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/ -v \
+            -m "gpu" \
+            --tb=short
+
+  # Multi-GPU tests are now in a separate workflow: .github/workflows/multi-gpu.yml
+  # They run on schedule and manual dispatch with configurable GPU counts
