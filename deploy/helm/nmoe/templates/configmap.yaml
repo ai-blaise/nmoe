@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nmoe.fullname" . }}-config
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nmoe.labels" . | nindent 4 }}
+data:
+  # nmoe configuration
+  nmoe-config.yaml: |
+    # RDEP (Routed Dispatch Expert Parallel) configuration
+    rdep:
+      backend: {{ .Values.nmoe.rdep.backend | quote }}
+      buffer_size: {{ .Values.nmoe.rdep.bufferSize }}
+      num_buffers: {{ .Values.nmoe.rdep.numBuffers }}
+      enable_async_dispatch: {{ .Values.nmoe.rdep.enableAsyncDispatch }}
+
+    # Expert configuration
+    experts:
+      num_experts: {{ .Values.nmoe.experts.numExperts }}
+      num_active_experts: {{ .Values.nmoe.experts.numActiveExperts }}
+      num_shared_experts: {{ .Values.nmoe.experts.numSharedExperts }}
+      expert_capacity_factor: {{ .Values.nmoe.experts.expertCapacityFactor }}
+      drop_tokens: {{ .Values.nmoe.experts.dropTokens }}
+      aux_loss_coeff: {{ .Values.nmoe.experts.auxLossCoeff }}
+
+    # Memory optimization
+    memory:
+      enable_pooling: {{ .Values.nmoe.memory.enablePooling }}
+      pool_size: {{ .Values.nmoe.memory.poolSize | quote }}
+      enable_prefetch: {{ .Values.nmoe.memory.enablePrefetch }}
+      prefetch_depth: {{ .Values.nmoe.memory.prefetchDepth }}
+
+    # Performance settings
+    performance:
+      enable_cuda_graphs: {{ .Values.nmoe.performance.enableCudaGraphs }}
+      enable_torch_compile: {{ .Values.nmoe.performance.enableTorchCompile }}
+      enable_flash_attention: {{ .Values.nmoe.performance.enableFlashAttention }}
+      enable_fused_kernels: {{ .Values.nmoe.performance.enableFusedKernels }}
+
+  # SGLang server configuration
+  sglang-config.yaml: |
+    model:
+      name: {{ .Values.sglang.model.name | quote }}
+      trust_remote_code: {{ .Values.sglang.model.trustRemoteCode }}
+      dtype: {{ .Values.sglang.model.dtype | quote }}
+      {{- if .Values.sglang.model.quantization }}
+      quantization: {{ .Values.sglang.model.quantization | quote }}
+      {{- end }}
+
+    server:
+      port: {{ .Values.sglang.server.port }}
+      host: {{ .Values.sglang.server.host | quote }}
+      max_total_tokens: {{ .Values.sglang.server.maxTotalTokens }}
+      context_length: {{ .Values.sglang.server.contextLength }}
+
+    moe:
+      tensor_parallel_size: {{ .Values.sglang.moe.tensorParallelSize }}
+      expert_parallel_size: {{ .Values.sglang.moe.expertParallelSize }}
+      enable_mixed_precision: {{ .Values.sglang.moe.enableMixedPrecision }}
+      enable_torch_compile: {{ .Values.sglang.moe.enableTorchCompile }}
+
+  # SkyRL training configuration
+  skyrl-config.yaml: |
+    training:
+      algorithm: {{ .Values.skyrl.training.algorithm | quote }}
+      batch_size: {{ .Values.skyrl.training.batchSize }}
+      gradient_accumulation_steps: {{ .Values.skyrl.training.gradientAccumulationSteps }}
+      learning_rate: {{ .Values.skyrl.training.learningRate }}
+      num_epochs: {{ .Values.skyrl.training.numEpochs }}
+      warmup_steps: {{ .Values.skyrl.training.warmupSteps }}
+      max_grad_norm: {{ .Values.skyrl.training.maxGradNorm }}
+      weight_decay: {{ .Values.skyrl.training.weightDecay }}
+
+    rl:
+      kl_coefficient: {{ .Values.skyrl.rl.klCoefficient }}
+      clip_range: {{ .Values.skyrl.rl.clipRange }}
+      value_coefficient: {{ .Values.skyrl.rl.valueCoefficient }}
+      entropy_coefficient: {{ .Values.skyrl.rl.entropyCoefficient }}
+      gamma: {{ .Values.skyrl.rl.gamma }}
+      gae_lambda: {{ .Values.skyrl.rl.gaeLambda }}
+
+    ray:
+      head_service_port: {{ .Values.skyrl.ray.headServicePort }}
+      dashboard_port: {{ .Values.skyrl.ray.dashboardPort }}
+      num_cpus_per_worker: {{ .Values.skyrl.ray.numCpusPerWorker }}
+      num_gpus_per_worker: {{ .Values.skyrl.ray.numGpusPerWorker }}

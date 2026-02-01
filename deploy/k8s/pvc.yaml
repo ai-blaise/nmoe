@@ -1,0 +1,56 @@
+---
+# PersistentVolumeClaim for model storage
+# Replaces hostPath with proper persistent storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nmoe-model-storage
+  namespace: nmoe
+  labels:
+    app: nmoe
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteMany  # Shared across multiple pods
+  resources:
+    requests:
+      storage: 500Gi  # Adjust for model size (DeepSeek-V3 = ~350GB)
+  storageClassName: fast-ssd  # Use your cluster's storage class
+  # For cloud providers:
+  # storageClassName: gp3        # AWS EBS gp3
+  # storageClassName: pd-ssd     # GCP Persistent Disk SSD
+  # storageClassName: managed-premium  # Azure Managed Premium
+---
+# PVC for checkpoints and logs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nmoe-checkpoints
+  namespace: nmoe
+  labels:
+    app: nmoe
+    component: checkpoints
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: fast-ssd
+---
+# PVC for training data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nmoe-training-data
+  namespace: nmoe
+  labels:
+    app: nmoe
+    component: data
+spec:
+  accessModes:
+    - ReadOnlyMany  # Data is read-only during training
+  resources:
+    requests:
+      storage: 1Ti  # Large datasets
+  storageClassName: standard  # Can use cheaper storage for data

@@ -27,12 +27,26 @@ from .transforms import normalize_text
 
 
 def exact_hash(text: str) -> str:
-    """Stable content hash for exact dedup (placeholder)."""
+    """Compute stable SHA-256 content hash for exact deduplication.
+
+    Args:
+        text: Input text to hash.
+
+    Returns:
+        Hex string of SHA-256 hash.
+    """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def dedup_exact(texts: Iterable[str]) -> Tuple[List[str], Set[str]]:
-    """Return unique texts and the set of seen hashes (placeholder)."""
+    """Deduplicate texts using exact hash matching.
+
+    Args:
+        texts: Iterable of text strings to deduplicate.
+
+    Returns:
+        Tuple of (unique texts, set of seen hashes).
+    """
     seen: Set[str] = set()
     out: List[str] = []
     for t in texts:
@@ -45,7 +59,14 @@ def dedup_exact(texts: Iterable[str]) -> Tuple[List[str], Set[str]]:
 
 
 def dedup_line_level(text: str) -> str:
-    """Remove repeated lines within a single document (placeholder)."""
+    """Remove repeated lines within a single document.
+
+    Args:
+        text: Input document text.
+
+    Returns:
+        Text with duplicate lines removed (first occurrence kept).
+    """
     lines = text.splitlines()
     seen: Set[str] = set()
     out: List[str] = []
@@ -57,7 +78,14 @@ def dedup_line_level(text: str) -> str:
 
 
 def dedup_paragraph_level(text: str) -> str:
-    """Remove repeated paragraphs within a single document (placeholder)."""
+    """Remove repeated paragraphs within a single document.
+
+    Args:
+        text: Input document text with paragraphs separated by blank lines.
+
+    Returns:
+        Text with duplicate paragraphs removed (first occurrence kept).
+    """
     paras = [p.strip() for p in text.split("\n\n")]
     seen: Set[str] = set()
     out: List[str] = []

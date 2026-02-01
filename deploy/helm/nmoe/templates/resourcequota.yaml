@@ -1,0 +1,38 @@
+{{- if .Values.resourceQuota.enabled }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "nmoe.fullname" . }}-quota
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nmoe.labels" . | nindent 4 }}
+spec:
+  hard:
+    {{- range $key, $value := .Values.resourceQuota.hard }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "nmoe.fullname" . }}-limits
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nmoe.labels" . | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      default:
+        memory: "64Gi"
+        cpu: "8"
+      defaultRequest:
+        memory: "32Gi"
+        cpu: "4"
+      max:
+        memory: "512Gi"
+        cpu: "64"
+        nvidia.com/gpu: "8"
+    - type: PersistentVolumeClaim
+      max:
+        storage: "2Ti"
+{{- end }}

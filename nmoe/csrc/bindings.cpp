@@ -45,6 +45,7 @@ extern "C" {
   void rdep_open_ipc_handles_blockscaled(const void* handles, int world);
   void rdep_sync_buffer_ptrs_bf16();
   void rdep_sync_buffer_ptrs_blockscaled();
+  void rdep_direct_ipc_write(void* src_ptr, int target_rank, size_t offset, size_t n_bytes, cudaStream_t stream);
 
   // BF16 path
   void rdep_alloc_bf16(size_t capacity, int H, int n_local);
@@ -226,24 +227,6 @@ extern "C" {
       const int64_t* ptrs_sfasfb,
       int E, int sf_k,
       cudaStream_t stream);
-
-  // G1 Gate kernels (gated linear unit forward/backward)
-  cudaError_t g1_gate_fwd(
-      const void* linear_out,
-      const void* attn_out,
-      void* output,
-      void* gate,
-      int64_t n,
-      cudaStream_t stream);
-
-  cudaError_t g1_gate_bwd(
-      const void* d_out,
-      const void* out_ungated,
-      const void* gate,
-      void* d_out_ungated,
-      void* d_gate_linear,
-      int64_t n,
-      cudaStream_t stream);
 }
 #endif
 
@@ -319,6 +302,16 @@ PYBIND11_MODULE(rdep, m) {
         "Sync BF16 buffer pointers to device");
   m.def("sync_buffer_ptrs_blockscaled", &rdep_sync_buffer_ptrs_blockscaled,
         "Sync blockscaled buffer pointers to device");
+
+  m.def("direct_ipc_write", [](uintptr_t src_ptr, int target_rank, size_t offset, size_t n_bytes, uintptr_t stream_ptr) {
+    rdep_direct_ipc_write(
+        reinterpret_cast<void*>(src_ptr),
+        target_rank,
+        offset,
+        n_bytes,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+  }, py::arg("src_ptr"), py::arg("target_rank"), py::arg("offset"), py::arg("n_bytes"), py::arg("stream") = 0,
+     "Direct write to peer's IPC buffer. Used for low-level buffer access.");
 
   // ========== BF16 Path ==========
   m.def("alloc_bf16", [](size_t capacity, int H, int n_local) {
@@ -943,38 +936,6 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("ptrs_abc"), py::arg("ptrs_sfasfb"),
      py::arg("stream") = py::none(),
      "Build grouped GEMM metadata on GPU for strided grouped interface");
-
-  // ========== G1 Gate (Gated Linear Unit) ==========
-  m.def("g1_gate_fwd", [](uintptr_t linear_out_ptr, uintptr_t attn_out_ptr,
-                          uintptr_t output_ptr, uintptr_t gate_ptr,
-                          int64_t n, py::object stream) {
-    auto err = g1_gate_fwd(
-        reinterpret_cast<const void*>(linear_out_ptr),
-        reinterpret_cast<const void*>(attn_out_ptr),
-        reinterpret_cast<void*>(output_ptr),
-        reinterpret_cast<void*>(gate_ptr),
-        n, to_stream(stream));
-    if (err != cudaSuccess) throw std::runtime_error("g1_gate_fwd failed: " + cuda_err(err));
-  }, py::arg("linear_out"), py::arg("attn_out"),
-     py::arg("output"), py::arg("gate"),
-     py::arg("n"), py::arg("stream") = py::none(),
-     "G1 Gate forward: output = attn_out * sigmoid(linear_out), gate = sigmoid(linear_out)");
-
-  m.def("g1_gate_bwd", [](uintptr_t d_out_ptr, uintptr_t out_ungated_ptr, uintptr_t gate_ptr,
-                          uintptr_t d_out_ungated_ptr, uintptr_t d_gate_linear_ptr,
-                          int64_t n, py::object stream) {
-    auto err = g1_gate_bwd(
-        reinterpret_cast<const void*>(d_out_ptr),
-        reinterpret_cast<const void*>(out_ungated_ptr),
-        reinterpret_cast<const void*>(gate_ptr),
-        reinterpret_cast<void*>(d_out_ungated_ptr),
-        reinterpret_cast<void*>(d_gate_linear_ptr),
-        n, to_stream(stream));
-    if (err != cudaSuccess) throw std::runtime_error("g1_gate_bwd failed: " + cuda_err(err));
-  }, py::arg("d_out"), py::arg("out_ungated"), py::arg("gate"),
-     py::arg("d_out_ungated"), py::arg("d_gate_linear"),
-     py::arg("n"), py::arg("stream") = py::none(),
-     "G1 Gate backward: d_out_ungated = d_out * gate, d_gate_linear = d_out * out_ungated * gate * (1 - gate)");
 
 #ifdef WITH_NVSHMEM
   // ========== NVSHMEM Functions ==========

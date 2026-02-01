@@ -33,10 +33,16 @@ from nmoe.eval.hooks import maybe_schedule_eval
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
-def train(cfg: Config):
-  """Train MoE model. One clear path: forward → loss → backward → step → log → checkpoint."""
-  rank, world = runtime.init(cfg.seed)
-  #TODO(EM): these if blocks and raises are ugly. rewrite or move
+def _validate_training_config(cfg: Config, world: int) -> None:
+  """Validate training configuration parameters.
+
+  Args:
+      cfg: Training configuration
+      world: World size for distributed training
+
+  Raises:
+      ValueError: If configuration is invalid
+  """
   if cfg.batch_size <= 0:
     raise ValueError(f"batch_size must be > 0 (got {cfg.batch_size})")
   if world > 1 and (cfg.batch_size % world) != 0:
@@ -53,6 +59,12 @@ def train(cfg: Config):
       raise ValueError(
         f"n_activated_experts ({cfg.n_activated_experts}) must be <= n_routed_experts ({cfg.n_routed_experts})"
       )
+
+
+def train(cfg: Config):
+  """Train MoE model. One clear path: forward → loss → backward → step → log → checkpoint."""
+  rank, world = runtime.init(cfg.seed)
+  _validate_training_config(cfg, world)
   timers_on = os.getenv('NMOE_TIMERS', '1') not in ('0', 'false', 'False')
   time_ctx = cuda_time if timers_on else (lambda _tag: nullcontext())
   nvtx_on = os.getenv('NMOE_NVTX', '0') in ('1', 'true', 'True')

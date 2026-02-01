@@ -16,6 +16,13 @@ import torch.distributed as dist
 from nmoe.data.mixture import MixturePlan, resolve_plan
 
 
+# Checkpoint format versioning for backwards compatibility
+# Version history:
+#   1: Initial format (rd.pt + dp_rank_*.pt, run_info metadata)
+#   2: Added checkpoint_version field and format versioning
+#   3: Added EP sharding info (ep_size, ep_rank, expert_range) for resharding support
+CHECKPOINT_FORMAT_VERSION = 3
+
 TRACKER = "latest_checkpointed_iteration.txt"
 
 
@@ -77,6 +84,48 @@ def _safe_load(path: str) -> Optional[dict]:
         return None
 
 
+def get_checkpoint_version(state: dict) -> int:
+    """Get checkpoint format version from state dict.
+
+    Returns:
+        Version number (1 if not present, for legacy checkpoints).
+    """
+    return state.get('checkpoint_version', 1)
+
+
+def validate_checkpoint_version(state: dict, max_version: int = CHECKPOINT_FORMAT_VERSION) -> None:
+    """Validate that checkpoint version is compatible.
+
+    Args:
+        state: Loaded checkpoint state dict.
+        max_version: Maximum supported version (default: current version).
+
+    Raises:
+        ValueError: If checkpoint version is newer than max_version.
+    """
+    version = get_checkpoint_version(state)
+    if version > max_version:
+        raise ValueError(
+            f"Checkpoint format version {version} is newer than supported version {max_version}. "
+            f"Please upgrade nmoe to load this checkpoint."
+        )
+
+
+def read_checkpoint_version(path: str | Path) -> Optional[int]:
+    """Read checkpoint version from a checkpoint file.
+
+    Args:
+        path: Path to checkpoint file (rd.pt or dp_rank_*.pt).
+
+    Returns:
+        Version number, or None if file cannot be read.
+    """
+    state = _safe_load(str(path))
+    if state is None:
+        return None
+    return get_checkpoint_version(state)
+
+
 def read_latest_rd_info(base: str | Path) -> Optional[dict]:
     """Read run_info from the latest checkpoint's rd.pt, if present.
 
@@ -99,6 +148,143 @@ def read_latest_rd_info(base: str | Path) -> Optional[dict]:
             pass
         return out
     return None
+
+
+# =============================================================================
+# EP Sharding Info for Checkpoint
+# =============================================================================
+
+@dataclass
+class EPShardInfo:
+    """Expert Parallelism sharding information for checkpoints.
+
+    This metadata is saved with checkpoints to enable resharding across
+    different EP configurations (e.g., training with EP=4, resuming with EP=8).
+
+    Attributes:
+        ep_size: Number of EP ranks used during checkpoint creation.
+        ep_rank: EP rank that created this shard (0 to ep_size-1).
+        n_total_experts: Total number of experts in the model.
+        n_local_experts: Number of experts in this shard.
+        expert_start: First expert index in this shard (inclusive).
+        expert_end: Last expert index in this shard (exclusive).
+    """
+    ep_size: int
+    ep_rank: int
+    n_total_experts: int
+    n_local_experts: int
+    expert_start: int
+    expert_end: int
+
+    def to_dict(self) -> Dict[str, int]:
+        """Serialize to dictionary for checkpoint storage."""
+        return {
+            'ep_size': self.ep_size,
+            'ep_rank': self.ep_rank,
+            'n_total_experts': self.n_total_experts,
+            'n_local_experts': self.n_local_experts,
+            'expert_start': self.expert_start,
+            'expert_end': self.expert_end,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, int]) -> 'EPShardInfo':
+        """Deserialize from dictionary."""
+        return cls(
+            ep_size=d['ep_size'],
+            ep_rank=d['ep_rank'],
+            n_total_experts=d['n_total_experts'],
+            n_local_experts=d['n_local_experts'],
+            expert_start=d['expert_start'],
+            expert_end=d['expert_end'],
+        )
+
+    @classmethod
+    def create(cls, ep_size: int, ep_rank: int, n_total_experts: int) -> 'EPShardInfo':
+        """Create EPShardInfo from basic parameters.
+
+        Args:
+            ep_size: Total number of EP ranks.
+            ep_rank: This rank's EP index.
+            n_total_experts: Total number of experts.
+
+        Returns:
+            EPShardInfo with computed expert range.
+
+        Raises:
+            ValueError: If n_total_experts is not divisible by ep_size.
+        """
+        if n_total_experts % ep_size != 0:
+            raise ValueError(
+                f"n_total_experts ({n_total_experts}) must be divisible by "
+                f"ep_size ({ep_size})"
+            )
+        n_local = n_total_experts // ep_size
+        expert_start = ep_rank * n_local
+        expert_end = expert_start + n_local
+        return cls(
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            n_total_experts=n_total_experts,
+            n_local_experts=n_local,
+            expert_start=expert_start,
+            expert_end=expert_end,
+        )
+
+
+def get_ep_shard_info_from_checkpoint(state: dict) -> Optional[EPShardInfo]:
+    """Extract EP sharding info from checkpoint state dict.
+
+    Args:
+        state: Checkpoint state dictionary.
+
+    Returns:
+        EPShardInfo if present, None for legacy checkpoints.
+    """
+    ep_info = state.get('ep_shard_info')
+    if ep_info is None:
+        return None
+    return EPShardInfo.from_dict(ep_info)
+
+
+def validate_ep_shard_compatibility(
+    saved_info: Optional[EPShardInfo],
+    current_ep_size: int,
+    current_ep_rank: int,
+    n_total_experts: int,
+) -> Tuple[bool, str]:
+    """Check if saved checkpoint EP sharding is compatible with current config.
+
+    Args:
+        saved_info: EP info from checkpoint (None for legacy).
+        current_ep_size: Current EP size.
+        current_ep_rank: Current EP rank.
+        n_total_experts: Current total experts.
+
+    Returns:
+        (compatible, message) tuple. compatible=True if direct load is OK.
+    """
+    if saved_info is None:
+        # Legacy checkpoint - assume world=1 (all experts in single shard)
+        return (current_ep_size == 1,
+                "Legacy checkpoint has no EP info. Can only load with EP=1.")
+
+    if saved_info.n_total_experts != n_total_experts:
+        return (False,
+                f"Expert count mismatch: checkpoint has {saved_info.n_total_experts}, "
+                f"current model has {n_total_experts}")
+
+    if saved_info.ep_size != current_ep_size:
+        return (False,
+                f"EP size mismatch: checkpoint has EP={saved_info.ep_size}, "
+                f"current config has EP={current_ep_size}. Resharding required.")
+
+    if saved_info.ep_rank != current_ep_rank:
+        return (False,
+                f"EP rank mismatch: checkpoint shard is for EP rank {saved_info.ep_rank}, "
+                f"but current rank is {current_ep_rank}.")
+
+    return (True, "EP sharding compatible")
 
 
 @dataclass
@@ -582,11 +768,23 @@ def build_states(
     config_fingerprint: str = "",
     zero2_state: Optional[dict[str, Any]] = None,
     plan: Optional[MixturePlan] = None,
+    ep_shard_info: Optional[EPShardInfo] = None,
 ) -> Tuple[Optional[dict[str, Any]], dict[str, Any]]:
     """Build (replicated_dense_state, rank_local_state).
 
     - replicated_dense_state (rank 0 writes rd.pt): only replicated parameters (dense/router).
     - rank_local_state (every rank writes dp_rank_XXX.pt): expert (sharded) params + local optimizer state.
+
+    Args:
+        step: Training step number.
+        model: Model to checkpoint.
+        optimizer: Optimizer to checkpoint.
+        tokens: Number of tokens processed.
+        loader: Data loader (for state_dict).
+        config_fingerprint: Config hash for validation.
+        zero2_state: Optional ZeRO-2 optimizer state.
+        plan: Optional mixture plan.
+        ep_shard_info: Optional EP sharding info for resharding support.
     """
     full_sd = model.state_dict()
     dense_names, expert_names = _split_param_names(model)
@@ -609,6 +807,7 @@ def build_states(
         git_sha = 'unknown'
 
     rd_state: Optional[dict[str, Any]] = {
+        'checkpoint_version': CHECKPOINT_FORMAT_VERSION,
         'step': step,
         'model_dense': dense_sd,
         'tokens': tokens,
@@ -637,6 +836,7 @@ def build_states(
         }
 
     dp_state: dict[str, Any] = {
+        'checkpoint_version': CHECKPOINT_FORMAT_VERSION,
         'step': step,
         'model_expert': expert_sd,
         'optimizer': optimizer.state_dict(),
@@ -650,7 +850,58 @@ def build_states(
     if zero2_state is not None:
         dp_state['zero2'] = zero2_state
 
+    # Add EP sharding info for resharding support (version 3+)
+    if ep_shard_info is not None:
+        dp_state['ep_shard_info'] = ep_shard_info.to_dict()
+
     return rd_state, dp_state
+
+
+def build_states_with_ep(
+    step: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    tokens: int,
+    loader,
+    ep_size: int,
+    ep_rank: int,
+    n_total_experts: int,
+    config_fingerprint: str = "",
+    zero2_state: Optional[dict[str, Any]] = None,
+    plan: Optional[MixturePlan] = None,
+) -> Tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    """Build states with EP sharding info for multi-EP checkpoint.
+
+    Convenience wrapper around build_states that creates EPShardInfo automatically.
+
+    Args:
+        step: Training step number.
+        model: Model to checkpoint.
+        optimizer: Optimizer to checkpoint.
+        tokens: Number of tokens processed.
+        loader: Data loader.
+        ep_size: Total number of EP ranks.
+        ep_rank: This rank's EP index.
+        n_total_experts: Total number of experts.
+        config_fingerprint: Config hash.
+        zero2_state: Optional ZeRO-2 state.
+        plan: Optional mixture plan.
+
+    Returns:
+        (rd_state, dp_state) tuple with EP sharding info.
+    """
+    ep_shard_info = EPShardInfo.create(ep_size, ep_rank, n_total_experts)
+    return build_states(
+        step=step,
+        model=model,
+        optimizer=optimizer,
+        tokens=tokens,
+        loader=loader,
+        config_fingerprint=config_fingerprint,
+        zero2_state=zero2_state,
+        plan=plan,
+        ep_shard_info=ep_shard_info,
+    )
 
 
 def load_state(
@@ -674,6 +925,7 @@ def load_state(
 
     # Load replicated dense/router weights
     rd = torch.load(rd_path, map_location=map_location, weights_only=False)
+    validate_checkpoint_version(rd)  # Fail early if checkpoint is too new
     dense_sd = rd['model_dense']
     model.load_state_dict(dense_sd, strict=False)
     tokens = int(rd.get('tokens', 0))
@@ -707,12 +959,403 @@ def load_state(
     # Load rank-local shard
     print_fn(f'Loading checkpoint: {path}')
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    validate_checkpoint_version(ckpt)  # Validate dp_rank checkpoint version too
     model.load_state_dict(ckpt['model_expert'], strict=False)
     optimizer.load_state_dict(ckpt['optimizer'])
 
     if loader is not None and ckpt.get('loader'):
         loader.load_state_dict(ckpt['loader'])
 
+    if ckpt.get('rng'):
+        torch_state = ckpt['rng'].get('torch')
+        if torch_state is not None:
+            if not torch.is_tensor(torch_state):
+                torch_state = torch.as_tensor(torch_state, dtype=torch.uint8)
+            torch.random.set_rng_state(torch_state.cpu())
+        cuda_states = ckpt['rng'].get('cuda')
+        if cuda_states is not None and torch.cuda.is_available():
+            for dev, state in enumerate(cuda_states):
+                if state is not None:
+                    state = torch.as_tensor(state, dtype=torch.uint8).cpu()
+                    torch.cuda.set_rng_state(state, dev)
+
+    return int(step), tokens, ckpt.get('zero2')
+
+
+def load_state_with_ep_check(
+    path: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    ep_size: int,
+    ep_rank: int,
+    n_total_experts: int,
+    loader=None,
+    print_fn=print,
+    strict_ep: bool = True,
+) -> tuple[int, int, Optional[dict[str, Any]], Optional[EPShardInfo]]:
+    """Load checkpoint with EP sharding compatibility check.
+
+    This is an enhanced version of load_state that validates EP configuration
+    and returns the saved EP sharding info for debugging/logging.
+
+    Args:
+        path: Path to dp_rank_*.pt file.
+        model: Model to load into.
+        optimizer: Optimizer to load into.
+        ep_size: Current EP size.
+        ep_rank: Current EP rank.
+        n_total_experts: Current total experts.
+        loader: Optional data loader.
+        print_fn: Print function for logging.
+        strict_ep: If True, raise error on EP mismatch. If False, warn only.
+
+    Returns:
+        (step, tokens, zero2_state, saved_ep_info) tuple.
+
+    Raises:
+        RuntimeError: If strict_ep=True and EP configuration doesn't match.
+    """
+    it_dir = os.path.dirname(path)
+    rd_path = os.path.join(it_dir, 'rd.pt')
+
+    map_location = 'cpu'
+    if torch.cuda.is_available():
+        map_location = f'cuda:{torch.cuda.current_device()}'
+
+    # Load dp_rank checkpoint first to check EP sharding
+    print_fn(f'Loading checkpoint: {path}')
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    validate_checkpoint_version(ckpt)
+
+    # Check EP sharding compatibility
+    saved_ep_info = get_ep_shard_info_from_checkpoint(ckpt)
+    compatible, message = validate_ep_shard_compatibility(
+        saved_ep_info, ep_size, ep_rank, n_total_experts
+    )
+
+    if not compatible:
+        if strict_ep:
+            raise RuntimeError(f"EP sharding incompatible: {message}")
+        else:
+            print_fn(f"[WARNING] EP sharding mismatch (non-strict mode): {message}")
+
+    if saved_ep_info is not None:
+        print_fn(
+            f"[resume] EP sharding: saved EP={saved_ep_info.ep_size} rank={saved_ep_info.ep_rank} "
+            f"experts={saved_ep_info.expert_start}-{saved_ep_info.expert_end}, "
+            f"current EP={ep_size} rank={ep_rank}"
+        )
+
+    # Load replicated dense/router weights
+    rd = torch.load(rd_path, map_location=map_location, weights_only=False)
+    validate_checkpoint_version(rd)
+    dense_sd = rd['model_dense']
+    model.load_state_dict(dense_sd, strict=False)
+    tokens = int(rd.get('tokens', 0))
+    step = int(rd.get('step', 0))
+
+    # Validate config hash
+    try:
+        from nmoe.config import fingerprint as _fingerprint
+        current_fp = _fingerprint(getattr(model, 'config', None))
+        saved_fp = str(rd.get('config_fingerprint', ''))
+        if saved_fp and current_fp and saved_fp != current_fp:
+            raise RuntimeError(
+                f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
+                "Refusing to resume with a different config."
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass  # Best effort
+
+    # Load expert weights
+    model.load_state_dict(ckpt['model_expert'], strict=False)
+    optimizer.load_state_dict(ckpt['optimizer'])
+
+    if loader is not None and ckpt.get('loader'):
+        loader.load_state_dict(ckpt['loader'])
+
+    if ckpt.get('rng'):
+        torch_state = ckpt['rng'].get('torch')
+        if torch_state is not None:
+            if not torch.is_tensor(torch_state):
+                torch_state = torch.as_tensor(torch_state, dtype=torch.uint8)
+            torch.random.set_rng_state(torch_state.cpu())
+        cuda_states = ckpt['rng'].get('cuda')
+        if cuda_states is not None and torch.cuda.is_available():
+            for dev, state in enumerate(cuda_states):
+                if state is not None:
+                    state = torch.as_tensor(state, dtype=torch.uint8).cpu()
+                    torch.cuda.set_rng_state(state, dev)
+
+    return int(step), tokens, ckpt.get('zero2'), saved_ep_info
+
+
+# =============================================================================
+# EP Resharding Utilities (for resuming with different EP configurations)
+# =============================================================================
+
+def reshard_expert_weights(
+    expert_state_dict: Dict[str, torch.Tensor],
+    saved_ep_info: EPShardInfo,
+    target_ep_size: int,
+    target_ep_rank: int,
+    print_fn=print,
+) -> Dict[str, torch.Tensor]:
+    """Reshard expert weights from one EP configuration to another.
+
+    This function takes expert weights from a checkpoint saved with one EP
+    configuration and reshards them for loading with a different EP configuration.
+
+    Args:
+        expert_state_dict: State dict with expert weights from checkpoint.
+        saved_ep_info: EP sharding info from the checkpoint.
+        target_ep_size: Target EP size to reshard for.
+        target_ep_rank: Target EP rank to extract.
+        print_fn: Print function for logging.
+
+    Returns:
+        New state dict with resharded expert weights for target EP rank.
+
+    Note:
+        This function requires all shards to be available for full resharding.
+        For partial resharding (when not all shards are loaded), use
+        reshard_expert_weights_partial.
+    """
+    # Calculate target expert range
+    n_total = saved_ep_info.n_total_experts
+    if n_total % target_ep_size != 0:
+        raise ValueError(
+            f"Cannot reshard: n_total_experts ({n_total}) not divisible by "
+            f"target_ep_size ({target_ep_size})"
+        )
+
+    n_local_target = n_total // target_ep_size
+    target_start = target_ep_rank * n_local_target
+    target_end = target_start + n_local_target
+
+    # Calculate source expert range
+    src_start = saved_ep_info.expert_start
+    src_end = saved_ep_info.expert_end
+
+    print_fn(
+        f"[reshard] source experts {src_start}-{src_end} -> "
+        f"target experts {target_start}-{target_end}"
+    )
+
+    # Check overlap between source and target
+    overlap_start = max(src_start, target_start)
+    overlap_end = min(src_end, target_end)
+
+    if overlap_start >= overlap_end:
+        # No overlap - this shard doesn't contain any experts for target
+        print_fn(f"[reshard] No overlap, returning empty state dict")
+        return {}
+
+    # Calculate which experts to extract
+    # relative_start: offset within the source shard
+    # relative_end: end offset within the source shard
+    relative_start = overlap_start - src_start
+    relative_end = overlap_end - src_start
+
+    resharded = {}
+    for key, tensor in expert_state_dict.items():
+        # Assume expert weights have expert dimension as first dim
+        # e.g., [n_local_experts, hidden_size, intermediate_size]
+        if tensor.ndim >= 1:
+            # Extract the overlapping experts
+            sliced = tensor[relative_start:relative_end].contiguous()
+            resharded[key] = sliced
+            print_fn(f"[reshard] {key}: {tensor.shape} -> {sliced.shape}")
+        else:
+            # Scalar or 0-dim tensor, keep as is
+            resharded[key] = tensor
+
+    return resharded
+
+
+def gather_all_expert_shards(
+    base_path: str,
+    step: int,
+    saved_ep_size: int,
+) -> Dict[str, torch.Tensor]:
+    """Gather expert weights from all EP shards into a single state dict.
+
+    This function loads all dp_rank_*.pt files and concatenates the expert
+    weights to reconstruct the full model.
+
+    Args:
+        base_path: Base checkpoint directory.
+        step: Step number to load.
+        saved_ep_size: EP size used when saving (number of shards).
+
+    Returns:
+        Combined state dict with all expert weights concatenated.
+
+    Raises:
+        FileNotFoundError: If any shard is missing.
+    """
+    it_dir = iteration_dir(base_path, step)
+    all_experts: Dict[str, list] = {}
+
+    for ep_rank in range(saved_ep_size):
+        dp_path = os.path.join(it_dir, f'dp_rank_{ep_rank:03d}.pt')
+        if not os.path.exists(dp_path):
+            raise FileNotFoundError(f"Missing shard: {dp_path}")
+
+        ckpt = torch.load(dp_path, map_location='cpu', weights_only=False)
+        expert_sd = ckpt.get('model_expert', {})
+
+        for key, tensor in expert_sd.items():
+            if key not in all_experts:
+                all_experts[key] = []
+            all_experts[key].append(tensor)
+
+    # Concatenate along expert dimension (assumed to be dim 0)
+    combined = {}
+    for key, tensors in all_experts.items():
+        if tensors[0].ndim >= 1:
+            combined[key] = torch.cat(tensors, dim=0)
+        else:
+            # Scalar - should be the same across shards
+            combined[key] = tensors[0]
+
+    return combined
+
+
+def load_with_resharding(
+    path: str,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    target_ep_size: int,
+    target_ep_rank: int,
+    n_total_experts: int,
+    loader=None,
+    print_fn=print,
+) -> tuple[int, int, Optional[dict[str, Any]]]:
+    """Load checkpoint with automatic EP resharding.
+
+    This function detects EP configuration mismatch and automatically reshards
+    expert weights to match the target configuration.
+
+    Args:
+        path: Path to dp_rank_*.pt file.
+        model: Model to load into.
+        optimizer: Optimizer to load into.
+        target_ep_size: Target EP size.
+        target_ep_rank: Target EP rank.
+        n_total_experts: Total number of experts.
+        loader: Optional data loader.
+        print_fn: Print function for logging.
+
+    Returns:
+        (step, tokens, zero2_state) tuple.
+
+    Note:
+        For resharding, this function may need to load multiple checkpoint
+        shards and will be slower than direct loading.
+    """
+    it_dir = os.path.dirname(path)
+    rd_path = os.path.join(it_dir, 'rd.pt')
+
+    map_location = 'cpu'
+    if torch.cuda.is_available():
+        map_location = f'cuda:{torch.cuda.current_device()}'
+
+    # Load rd.pt (dense weights)
+    rd = torch.load(rd_path, map_location=map_location, weights_only=False)
+    validate_checkpoint_version(rd)
+    dense_sd = rd['model_dense']
+    model.load_state_dict(dense_sd, strict=False)
+    tokens = int(rd.get('tokens', 0))
+    step = int(rd.get('step', 0))
+
+    # Load the specified dp_rank checkpoint to check EP info
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    validate_checkpoint_version(ckpt)
+
+    saved_ep_info = get_ep_shard_info_from_checkpoint(ckpt)
+
+    if saved_ep_info is None:
+        # Legacy checkpoint - assume world=1
+        print_fn("[reshard] Legacy checkpoint, assuming EP=1")
+        saved_ep_info = EPShardInfo.create(ep_size=1, ep_rank=0, n_total_experts=n_total_experts)
+
+    # Check if resharding is needed
+    compatible, msg = validate_ep_shard_compatibility(
+        saved_ep_info, target_ep_size, target_ep_rank, n_total_experts
+    )
+
+    if compatible:
+        # No resharding needed - load directly
+        print_fn(f"[reshard] EP config matches, loading directly")
+        model.load_state_dict(ckpt['model_expert'], strict=False)
+        optimizer.load_state_dict(ckpt['optimizer'])
+    else:
+        # Resharding needed
+        print_fn(f"[reshard] EP config mismatch: {msg}")
+        print_fn(f"[reshard] Resharding from EP={saved_ep_info.ep_size} to EP={target_ep_size}")
+
+        if saved_ep_info.ep_size == 1:
+            # Single shard contains all experts - can reshard directly
+            expert_sd = ckpt['model_expert']
+            resharded = reshard_expert_weights(
+                expert_sd, saved_ep_info, target_ep_size, target_ep_rank, print_fn
+            )
+            model.load_state_dict(resharded, strict=False)
+        else:
+            # Multiple shards - need to figure out which shards to load
+            # For simplicity, load all shards that overlap with target range
+            base_path = os.path.dirname(it_dir)
+
+            # Calculate which source shards overlap with target
+            n_local_target = n_total_experts // target_ep_size
+            target_start = target_ep_rank * n_local_target
+            target_end = target_start + n_local_target
+
+            merged_experts = {}
+            for src_rank in range(saved_ep_info.ep_size):
+                src_info = EPShardInfo.create(
+                    saved_ep_info.ep_size, src_rank, n_total_experts
+                )
+                # Check if this source shard overlaps with target
+                if src_info.expert_end <= target_start or src_info.expert_start >= target_end:
+                    continue  # No overlap
+
+                src_path = os.path.join(it_dir, f'dp_rank_{src_rank:03d}.pt')
+                if not os.path.exists(src_path):
+                    raise FileNotFoundError(f"Missing shard for resharding: {src_path}")
+
+                src_ckpt = torch.load(src_path, map_location=map_location, weights_only=False)
+                resharded = reshard_expert_weights(
+                    src_ckpt['model_expert'], src_info, target_ep_size, target_ep_rank, print_fn
+                )
+
+                # Merge into final dict
+                for key, tensor in resharded.items():
+                    if key not in merged_experts:
+                        merged_experts[key] = []
+                    merged_experts[key].append(tensor)
+
+            # Concatenate tensors from multiple source shards
+            final_experts = {}
+            for key, tensors in merged_experts.items():
+                if len(tensors) == 1:
+                    final_experts[key] = tensors[0]
+                else:
+                    final_experts[key] = torch.cat(tensors, dim=0)
+
+            model.load_state_dict(final_experts, strict=False)
+
+        # Optimizer state cannot be resharded easily - reinitialize
+        print_fn("[reshard] WARNING: Optimizer state not resharded, reinitializing")
+
+    # Load data loader state if available
+    if loader is not None and ckpt.get('loader'):
+        loader.load_state_dict(ckpt['loader'])
+
+    # Restore RNG state
     if ckpt.get('rng'):
         torch_state = ckpt['rng'].get('torch')
         if torch_state is not None:

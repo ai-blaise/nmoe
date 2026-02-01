@@ -1,0 +1,90 @@
+# Prometheus configuration for nmoe monitoring
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: nmoe-cluster
+    environment: production
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - /etc/prometheus/alerts/*.yml
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # nmoe application metrics
+  - job_name: 'nmoe'
+    static_configs:
+      - targets:
+          - 'nmoe-app:9090'  # nmoe Python application metrics
+    metrics_path: /metrics
+    scrape_interval: 15s
+
+  # SGLang inference servers
+  - job_name: 'sglang'
+    static_configs:
+      - targets:
+          - 'sglang-server-0:30000'
+          - 'sglang-server-1:30000'
+          - 'sglang-server-2:30000'
+          - 'sglang-server-3:30000'
+    metrics_path: /metrics
+    scrape_interval: 5s
+    scrape_timeout: 5s
+
+  # SkyRL training workers
+  - job_name: 'skyrl-workers'
+    static_configs:
+      - targets:
+          - 'skyrl-worker-0:8265'  # Ray dashboard
+          - 'skyrl-worker-1:8265'
+          - 'skyrl-worker-2:8265'
+          - 'skyrl-worker-3:8265'
+    metrics_path: /metrics
+
+  # Node metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets:
+          - 'node-exporter:9100'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):\d+'
+        replacement: '${1}'
+
+  # GPU metrics via DCGM
+  - job_name: 'dcgm-exporter'
+    static_configs:
+      - targets:
+          - 'dcgm-exporter:9400'
+    scrape_interval: 10s
+    scrape_timeout: 10s
+
+  # Kubernetes service discovery (if running in K8s)
+  # - job_name: 'kubernetes-pods'
+  #   kubernetes_sd_configs:
+  #     - role: pod
+  #   relabel_configs:
+  #     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+  #       action: keep
+  #       regex: true
+  #     - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+  #       action: replace
+  #       target_label: __metrics_path__
+  #       regex: (.+)
+  #     - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+  #       action: replace
+  #       regex: ([^:]+)(?::\d+)?;(\d+)
+  #       replacement: $1:$2
+  #       target_label: __address__

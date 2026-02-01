@@ -187,8 +187,8 @@ def _fp8_pack2_e4m3(x0: Float32, x1: Float32, *, loc=None, ip=None):
     Uses inline PTX: cvt.rn.satfinite.e4m3x2.f32 (sm_89+).
     Matches nmoe/csrc/ptx.cu behavior.
 
-    TODO: Explore CUTLASS EVT (Epilogue Visitor Tree) for native FP8 support
-    which may provide better codegen and avoid inline PTX.
+    Future optimization: CUTLASS EVT (Epilogue Visitor Tree) could provide native FP8 support
+    with better codegen and avoid inline PTX. See NVIDIA CUTLASS documentation.
     """
     x0_v = x0.ir_value(loc=loc, ip=ip) if hasattr(x0, 'ir_value') else x0
     x1_v = x1.ir_value(loc=loc, ip=ip) if hasattr(x1, 'ir_value') else x1
@@ -213,8 +213,8 @@ def _nvfp4_pack2_e2m1(x0: Float32, x1: Float32, *, loc=None, ip=None):
     Uses inline PTX: cvt.rn.satfinite.e2m1x2.f32 (sm_100a / Blackwell).
     Matches nmoe/csrc/ptx.cu behavior.
 
-    TODO: Explore CUTLASS EVT (Epilogue Visitor Tree) for native NVFP4 support
-    which may provide better codegen and avoid inline PTX.
+    Future optimization: CUTLASS EVT (Epilogue Visitor Tree) could provide native NVFP4 support
+    with better codegen and avoid inline PTX. See NVIDIA CUTLASS documentation.
     """
     x0_v = x0.ir_value(loc=loc, ip=ip) if hasattr(x0, 'ir_value') else x0
     x1_v = x1.ir_value(loc=loc, ip=ip) if hasattr(x1, 'ir_value') else x1

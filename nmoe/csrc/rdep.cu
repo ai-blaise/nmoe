@@ -761,6 +761,48 @@ extern "C" void rdep_sync_buffer_ptrs_blockscaled() {
 }
 
 // ============================================================================
+// Direct IPC Write - Copy data directly to peer's IPC buffer
+// Used by rdep_adapter.py for low-level direct buffer access
+// ============================================================================
+extern "C" void rdep_direct_ipc_write(
+    void* src_ptr,      // Source data pointer on local GPU
+    int target_rank,    // Destination rank
+    size_t offset,      // Offset in peer buffer (in bytes)
+    size_t n_bytes,     // Number of bytes to copy
+    cudaStream_t stream // CUDA stream for async copy
+) {
+    if (!g_bf16.initialized) {
+        fprintf(stderr, "RDEP ERROR: direct_ipc_write called before initialization\n");
+        return;
+    }
+
+    if (target_rank < 0 || target_rank >= g_bf16.world) {
+        fprintf(stderr, "RDEP ERROR: invalid target_rank %d (world=%d)\n",
+                target_rank, g_bf16.world);
+        return;
+    }
+
+    // Get destination buffer pointer (already mapped via IPC)
+    void* dest_buf = g_bf16.buffer_ptrs[target_rank];
+    if (!dest_buf) {
+        fprintf(stderr, "RDEP ERROR: peer buffer for rank %d not initialized\n", target_rank);
+        return;
+    }
+
+    // Calculate destination address
+    char* dest_ptr = static_cast<char*>(dest_buf) + offset;
+
+    // Perform async copy to peer buffer
+    // Since IPC handles were opened with cudaIpcMemLazyEnablePeerAccess,
+    // this uses P2P transfer when available, otherwise falls back to host staging
+    if (stream) {
+        cudaMemcpyAsync(dest_ptr, src_ptr, n_bytes, cudaMemcpyDeviceToDevice, stream);
+    } else {
+        cudaMemcpy(dest_ptr, src_ptr, n_bytes, cudaMemcpyDeviceToDevice);
+    }
+}
+
+// ============================================================================
 // BF16 Dispatch Kernel
 // Each warp handles one (token, slot) pair
 // ============================================================================

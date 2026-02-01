@@ -1,0 +1,29 @@
+apiVersion: v2
+name: nmoe
+description: Helm chart for nmoe + SGLang + SkyRL MoE training and inference
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+
+keywords:
+  - moe
+  - mixture-of-experts
+  - llm
+  - inference
+  - training
+  - distributed
+  - gpu
+
+home: https://github.com/anthropics/nmoe
+sources:
+  - https://github.com/anthropics/nmoe
+
+maintainers:
+  - name: nmoe-team
+    email: nmoe@anthropic.com
+
+dependencies: []
+
+annotations:
+  artifacthub.io/category: ai-machine-learning
+  artifacthub.io/license: Apache-2.0

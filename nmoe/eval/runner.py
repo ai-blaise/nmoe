@@ -4,16 +4,20 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
+import re
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 
 from nmoe.metrics import start_metrics, stop_metrics
 from nmoe.eval.adapters import iter_choices, iter_span
+from nmoe.eval.execution import run_python, humaneval_check, ExecResult
 
 
 # -----------------------------
@@ -140,6 +144,607 @@ def _sim_examples_judge(n: int) -> list[dict]:
 
 
 # -----------------------------
+# Unittest Dataset Adapters
+# -----------------------------
+
+def iter_unittest(name: str, source: str, max_examples: int) -> Iterator[Dict]:
+    """Iterate over code generation datasets (HumanEval, MBPP, etc.)."""
+    from datasets import load_dataset
+
+    scheme, args = _parse_source(source)
+    assert scheme == "hf", f"Unsupported scheme for unittest: {scheme}"
+
+    if len(args) == 3:
+        dataset, subset, split = args
+        ds = load_dataset(dataset, subset, split=split, trust_remote_code=True)
+    elif len(args) == 2:
+        dataset, split = args
+        ds = load_dataset(dataset, split=split, trust_remote_code=True)
+    else:
+        raise ValueError(f"Bad source spec: {source}")
+
+    n = 0
+    dataset_base = dataset.split("/")[-1]
+    for ex in ds:
+        try:
+            if dataset_base in ("openai_humaneval", "humaneval"):
+                # HumanEval format: prompt (function signature + docstring), test, entry_point
+                prompt = ex.get("prompt", "")
+                test = ex.get("test", "")
+                entry_point = ex.get("entry_point", "")
+                canonical_solution = ex.get("canonical_solution", "")
+                task_id = ex.get("task_id", f"HumanEval/{n}")
+                yield {
+                    "prompt": prompt,
+                    "tests": test,
+                    "entry_point": entry_point,
+                    "canonical_solution": canonical_solution,
+                    "task_id": task_id,
+                }
+            elif dataset_base in ("mbpp", "google-research-datasets/mbpp", "sanitized_mbpp"):
+                # MBPP format: text (description), code (solution), test_list
+                text = ex.get("text", "")
+                code = ex.get("code", "")
+                test_list = ex.get("test_list", [])
+                task_id = ex.get("task_id", n)
+                # Format prompt as function request
+                prompt = f"# {text}\n\ndef solution("
+                yield {
+                    "prompt": prompt,
+                    "tests": "\n".join(test_list) if isinstance(test_list, list) else str(test_list),
+                    "entry_point": "solution",
+                    "canonical_solution": code,
+                    "task_id": f"MBPP/{task_id}",
+                }
+            elif dataset_base in ("apps", "codeparrot/apps"):
+                # APPS format: question, solutions (json list), input_output (json)
+                question = ex.get("question", "")
+                solutions = ex.get("solutions", "[]")
+                input_output = ex.get("input_output", "{}")
+                difficulty = ex.get("difficulty", "unknown")
+                problem_id = ex.get("problem_id", n)
+                try:
+                    solutions_list = json.loads(solutions) if isinstance(solutions, str) else solutions
+                    io_dict = json.loads(input_output) if isinstance(input_output, str) else input_output
+                except json.JSONDecodeError:
+                    solutions_list = []
+                    io_dict = {}
+                # Build test cases from input_output
+                inputs = io_dict.get("inputs", [])
+                outputs = io_dict.get("outputs", [])
+                test_code = ""
+                for inp, out in zip(inputs[:3], outputs[:3]):  # Limit to 3 test cases
+                    test_code += f"assert solution({repr(inp)}) == {repr(out)}\n"
+                yield {
+                    "prompt": f"# {question}\n\ndef solution(",
+                    "tests": test_code,
+                    "entry_point": "solution",
+                    "canonical_solution": solutions_list[0] if solutions_list else "",
+                    "task_id": f"APPS/{problem_id}",
+                    "difficulty": difficulty,
+                }
+            else:
+                continue
+            n += 1
+            if n >= max_examples:
+                break
+        except Exception:
+            continue
+
+
+def _parse_source(src: str) -> Tuple[str, List[str]]:
+    parts = src.split(":")
+    scheme = parts[0]
+    args = parts[1:]
+    return scheme, args
+
+
+# -----------------------------
+# Judge Dataset Adapters
+# -----------------------------
+
+def iter_judge(name: str, source: str, max_examples: int) -> Iterator[Dict]:
+    """Iterate over open-ended evaluation datasets for judge scoring."""
+    from datasets import load_dataset
+
+    scheme, args = _parse_source(source)
+    assert scheme == "hf", f"Unsupported scheme for judge: {scheme}"
+
+    if len(args) == 3:
+        dataset, subset, split = args
+        ds = load_dataset(dataset, subset, split=split, trust_remote_code=True)
+    elif len(args) == 2:
+        dataset, split = args
+        ds = load_dataset(dataset, split=split, trust_remote_code=True)
+    else:
+        raise ValueError(f"Bad source spec: {source}")
+
+    n = 0
+    dataset_base = dataset.split("/")[-1]
+    for ex in ds:
+        try:
+            if dataset_base in ("alpaca_eval", "tatsu-lab/alpaca_eval"):
+                # AlpacaEval format
+                instruction = ex.get("instruction", "")
+                output = ex.get("output", "")
+                generator = ex.get("generator", "")
+                yield {
+                    "prompt": instruction,
+                    "reference": output,
+                    "reference_generator": generator,
+                }
+            elif dataset_base in ("mt_bench", "lmsys/mt_bench_human_judgments"):
+                # MT-Bench format
+                question = ex.get("question", "")
+                reference = ex.get("reference", "")
+                category = ex.get("category", "")
+                yield {
+                    "prompt": question,
+                    "reference": reference,
+                    "category": category,
+                }
+            elif dataset_base in ("lima", "GAIR/lima"):
+                # LIMA format
+                conversations = ex.get("conversations", [])
+                if conversations and len(conversations) >= 1:
+                    prompt = conversations[0] if isinstance(conversations[0], str) else conversations[0].get("value", "")
+                    reference = conversations[1] if len(conversations) > 1 else ""
+                    if isinstance(reference, dict):
+                        reference = reference.get("value", "")
+                    yield {
+                        "prompt": prompt,
+                        "reference": reference,
+                    }
+            elif dataset_base in ("wildchat", "allenai/WildChat"):
+                # WildChat format
+                conversation = ex.get("conversation", [])
+                if conversation and len(conversation) >= 1:
+                    prompt = conversation[0].get("content", "") if isinstance(conversation[0], dict) else ""
+                    yield {
+                        "prompt": prompt,
+                        "reference": "",  # No reference for WildChat
+                    }
+            else:
+                # Generic format: look for common keys
+                prompt = ex.get("instruction") or ex.get("prompt") or ex.get("question") or ex.get("input", "")
+                reference = ex.get("output") or ex.get("response") or ex.get("answer", "")
+                if prompt:
+                    yield {
+                        "prompt": prompt,
+                        "reference": reference,
+                    }
+                else:
+                    continue
+            n += 1
+            if n >= max_examples:
+                break
+        except Exception:
+            continue
+
+
+# -----------------------------
+# Code Generation & Execution
+# -----------------------------
+
+@dataclass
+class CodeGenResult:
+    """Result of code generation and execution."""
+    task_id: str
+    prompt: str
+    completion: str
+    passed: bool
+    error_msg: str = ""
+    exec_time_ms: float = 0.0
+
+
+def generate_code_completion(
+    model: torch.nn.Module,
+    enc: Any,
+    prompt: str,
+    max_new_tokens: int = 256,
+    temperature: float = 0.0,
+    stop_tokens: Optional[List[str]] = None,
+) -> str:
+    """Generate code completion from the model."""
+    if stop_tokens is None:
+        stop_tokens = ["\nclass ", "\ndef ", "\n#", "\nif __name__"]
+
+    toks = torch.tensor(enc.encode(prompt), device="cuda", dtype=torch.long)[None, :]
+    generated = []
+
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            logits = model(toks)
+            if temperature > 0:
+                probs = torch.softmax(logits[0, -1] / temperature, dim=-1)
+                next_id = torch.multinomial(probs, 1).item()
+            else:
+                next_id = int(torch.argmax(logits[0, -1]).item())
+
+            generated.append(next_id)
+            next_tok = torch.tensor([[next_id]], device="cuda", dtype=torch.long)
+            toks = torch.cat([toks, next_tok], dim=1)
+
+            # Check for stop tokens
+            try:
+                partial = enc.decode(generated)
+                for stop in stop_tokens:
+                    if stop in partial:
+                        # Truncate at stop token
+                        idx = partial.find(stop)
+                        return partial[:idx]
+            except Exception:
+                pass
+
+    try:
+        return enc.decode(generated)
+    except Exception:
+        return ""
+
+
+def execute_unittest(
+    prompt: str,
+    completion: str,
+    tests: str,
+    entry_point: str = "",
+    timeout_s: float = 10.0,
+) -> Tuple[bool, str]:
+    """Execute generated code against unit tests.
+
+    Returns:
+        Tuple of (passed, error_message)
+    """
+    # Strip markdown code fences if present
+    code = completion.strip()
+    if code.startswith("```"):
+        lines = code.split("\n")
+        lines = lines[1:]  # Remove first fence line
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        code = "\n".join(lines)
+
+    # Combine prompt + completion + tests
+    full_code = prompt + code + "\n\n" + tests
+
+    # Add check function call if entry_point is specified and tests use check()
+    if entry_point and "check(" not in tests.lower():
+        full_code += f"\n\ncheck({entry_point})\n"
+
+    result = run_python(full_code, timeout_s=timeout_s)
+
+    if result.ok:
+        return True, ""
+    else:
+        error = result.stderr.strip()
+        if "TIMEOUT" in error:
+            return False, "Execution timed out"
+        # Extract just the last line of error for brevity
+        error_lines = error.split("\n")
+        return False, error_lines[-1] if error_lines else "Unknown error"
+
+
+# -----------------------------
+# LLM-as-Judge Scoring
+# -----------------------------
+
+JUDGE_PROMPT_TEMPLATE = """You are an expert judge evaluating the quality of AI assistant responses.
+
+## Task
+Evaluate the following response to the given instruction. Score the response on a scale of 1-10 based on:
+- Helpfulness: Does it address the user's request?
+- Accuracy: Is the information correct?
+- Clarity: Is it well-written and easy to understand?
+- Completeness: Does it fully answer the question?
+
+## Instruction
+{instruction}
+
+## Response to Evaluate
+{response}
+
+{reference_section}
+
+## Evaluation
+Provide a brief explanation (2-3 sentences) followed by your score.
+Format your response as:
+EXPLANATION: [your explanation]
+SCORE: [1-10]
+"""
+
+JUDGE_PROMPT_WITH_REFERENCE = """## Reference Response (for comparison)
+{reference}
+"""
+
+
+@dataclass
+class JudgeResult:
+    """Result of LLM judge evaluation."""
+    prompt: str
+    response: str
+    reference: str
+    score: float
+    explanation: str
+    raw_judge_output: str
+
+
+def _extract_judge_score(judge_output: str) -> Tuple[float, str]:
+    """Extract score and explanation from judge output."""
+    score = 5.0  # Default middle score
+    explanation = ""
+
+    # Try to extract SCORE: X pattern
+    score_match = re.search(r"SCORE:\s*(\d+(?:\.\d+)?)", judge_output, re.IGNORECASE)
+    if score_match:
+        try:
+            score = float(score_match.group(1))
+            score = max(1.0, min(10.0, score))  # Clamp to 1-10
+        except ValueError:
+            pass
+
+    # Try to extract EXPLANATION: pattern
+    expl_match = re.search(r"EXPLANATION:\s*(.+?)(?:SCORE:|$)", judge_output, re.IGNORECASE | re.DOTALL)
+    if expl_match:
+        explanation = expl_match.group(1).strip()
+
+    return score, explanation
+
+
+def run_judge_evaluation(
+    model: torch.nn.Module,
+    enc: Any,
+    prompt: str,
+    response: str,
+    reference: str = "",
+    max_new_tokens: int = 256,
+) -> JudgeResult:
+    """Run LLM-as-judge evaluation on a single response."""
+    # Build judge prompt
+    reference_section = ""
+    if reference:
+        reference_section = JUDGE_PROMPT_WITH_REFERENCE.format(reference=reference)
+
+    judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
+        instruction=prompt,
+        response=response,
+        reference_section=reference_section,
+    )
+
+    # Generate judge output
+    toks = torch.tensor(enc.encode(judge_prompt), device="cuda", dtype=torch.long)[None, :]
+    generated = []
+
+    with torch.inference_mode():
+        for _ in range(max_new_tokens):
+            logits = model(toks)
+            next_id = int(torch.argmax(logits[0, -1]).item())
+            generated.append(next_id)
+            next_tok = torch.tensor([[next_id]], device="cuda", dtype=torch.long)
+            toks = torch.cat([toks, next_tok], dim=1)
+
+            # Stop if we see clear end markers
+            try:
+                partial = enc.decode(generated)
+                if "SCORE:" in partial and len(partial) > partial.find("SCORE:") + 10:
+                    break
+            except Exception:
+                pass
+
+    try:
+        judge_output = enc.decode(generated)
+    except Exception:
+        judge_output = ""
+
+    score, explanation = _extract_judge_score(judge_output)
+
+    return JudgeResult(
+        prompt=prompt,
+        response=response,
+        reference=reference,
+        score=score,
+        explanation=explanation,
+        raw_judge_output=judge_output,
+    )
+
+
+def run_external_judge_evaluation(
+    prompt: str,
+    response: str,
+    reference: str = "",
+    api_provider: str = "openai",
+    model_name: str = "gpt-4o-mini",
+    api_key: Optional[str] = None,
+) -> JudgeResult:
+    """Run LLM-as-judge evaluation using external API (OpenAI/Anthropic).
+
+    Args:
+        prompt: Original instruction/question
+        response: Model response to evaluate
+        reference: Optional reference answer
+        api_provider: "openai" or "anthropic"
+        model_name: Model identifier (e.g., "gpt-4o-mini", "claude-3-haiku-20240307")
+        api_key: API key (defaults to env var)
+
+    Returns:
+        JudgeResult with score, explanation, and raw output
+    """
+    # Build judge prompt
+    reference_section = ""
+    if reference:
+        reference_section = JUDGE_PROMPT_WITH_REFERENCE.format(reference=reference)
+
+    judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
+        instruction=prompt,
+        response=response,
+        reference_section=reference_section,
+    )
+
+    judge_output = ""
+
+    try:
+        if api_provider == "openai":
+            import openai
+            client = openai.OpenAI(api_key=api_key or os.environ.get("OPENAI_API_KEY"))
+            completion = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": judge_prompt}],
+                max_tokens=256,
+                temperature=0.0,
+            )
+            judge_output = completion.choices[0].message.content or ""
+
+        elif api_provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+            message = client.messages.create(
+                model=model_name,
+                max_tokens=256,
+                messages=[{"role": "user", "content": judge_prompt}],
+            )
+            judge_output = message.content[0].text if message.content else ""
+
+        else:
+            raise ValueError(f"Unknown API provider: {api_provider}")
+
+    except Exception as e:
+        judge_output = f"ERROR: {str(e)}"
+
+    score, explanation = _extract_judge_score(judge_output)
+
+    return JudgeResult(
+        prompt=prompt,
+        response=response,
+        reference=reference,
+        score=score,
+        explanation=explanation,
+        raw_judge_output=judge_output,
+    )
+
+
+# -----------------------------
+# Pass@k Evaluation (HumanEval-style)
+# -----------------------------
+
+def compute_pass_at_k(
+    n: int,
+    c: int,
+    k: int,
+) -> float:
+    """Compute pass@k metric.
+
+    Args:
+        n: Total number of samples per problem
+        c: Number of correct samples
+        k: k in pass@k
+
+    Returns:
+        pass@k probability
+    """
+    if n - c < k:
+        return 1.0
+    # Use combinatorial formula: 1 - C(n-c, k) / C(n, k)
+    # Computed numerically for stability
+    result = 1.0
+    for i in range(k):
+        result *= (n - c - i) / (n - i)
+    return 1.0 - result
+
+
+@dataclass
+class PassAtKResult:
+    """Results for pass@k evaluation."""
+    task_id: str
+    n_samples: int
+    n_correct: int
+    pass_at_1: float
+    pass_at_10: float = 0.0
+    pass_at_100: float = 0.0
+
+
+def evaluate_pass_at_k(
+    model: torch.nn.Module,
+    enc: Any,
+    items: List[Dict],
+    n_samples: int = 200,
+    temperature: float = 0.8,
+    max_gen_tokens: int = 512,
+    timeout_s: float = 10.0,
+    ks: List[int] = None,
+) -> Tuple[Dict[str, float], List[PassAtKResult]]:
+    """Evaluate pass@k on code generation dataset.
+
+    Args:
+        model: Model to evaluate
+        enc: Tokenizer
+        items: List of evaluation items from iter_unittest
+        n_samples: Number of samples per problem
+        temperature: Sampling temperature (>0 for diversity)
+        max_gen_tokens: Max tokens to generate
+        timeout_s: Execution timeout per sample
+        ks: List of k values to compute (default [1, 10, 100])
+
+    Returns:
+        Tuple of (aggregate_metrics, per_task_results)
+    """
+    if ks is None:
+        ks = [1, 10, 100]
+
+    per_task_results = []
+    all_correct = []
+
+    for it in items:
+        task_id = it.get("task_id", "unknown")
+        prompt = it["prompt"]
+        tests = it.get("tests", "")
+        entry_point = it.get("entry_point", "")
+
+        # Generate n_samples completions
+        correct_count = 0
+        for _ in range(n_samples):
+            with torch.inference_mode():
+                completion = generate_code_completion(
+                    model,
+                    enc,
+                    prompt,
+                    max_new_tokens=max_gen_tokens,
+                    temperature=temperature,
+                )
+
+            success, _ = execute_unittest(
+                prompt=prompt,
+                completion=completion,
+                tests=tests,
+                entry_point=entry_point,
+                timeout_s=timeout_s,
+            )
+            if success:
+                correct_count += 1
+
+        # Compute pass@k for this task
+        result = PassAtKResult(
+            task_id=task_id,
+            n_samples=n_samples,
+            n_correct=correct_count,
+            pass_at_1=compute_pass_at_k(n_samples, correct_count, 1),
+            pass_at_10=compute_pass_at_k(n_samples, correct_count, 10) if 10 in ks else 0.0,
+            pass_at_100=compute_pass_at_k(n_samples, correct_count, 100) if 100 in ks else 0.0,
+        )
+        per_task_results.append(result)
+        all_correct.append(correct_count)
+
+    # Aggregate metrics
+    n_tasks = len(per_task_results)
+    aggregate = {}
+    for k in ks:
+        if k <= n_samples:
+            pass_at_k_values = [
+                compute_pass_at_k(n_samples, c, k) for c in all_correct
+            ]
+            aggregate[f"pass@{k}"] = sum(pass_at_k_values) / max(1, n_tasks)
+
+    return aggregate, per_task_results
+
+
+# -----------------------------
 # Scorers
 # -----------------------------
 
@@ -248,6 +853,14 @@ def main() -> None:
     ap.add_argument("--sim-acc-unittest", type=float, default=0.5)
     ap.add_argument("--sim-acc-judge", type=float, default=0.6)
     ap.add_argument("--sim-seed", type=int, default=123)
+    # External judge options
+    ap.add_argument("--external-judge", action="store_true", help="Use external API for judge evaluation")
+    ap.add_argument("--judge-provider", default="openai", choices=["openai", "anthropic"])
+    ap.add_argument("--judge-model", default="gpt-4o-mini", help="Model for external judge")
+    # Pass@k options
+    ap.add_argument("--pass-at-k", action="store_true", help="Run pass@k evaluation for code tasks")
+    ap.add_argument("--pass-k-samples", type=int, default=200, help="Number of samples for pass@k")
+    ap.add_argument("--pass-k-temp", type=float, default=0.8, help="Temperature for pass@k sampling")
     args = ap.parse_args()
 
     snap = Path(args.snapshot)
@@ -365,12 +978,115 @@ def main() -> None:
             results.append(EvalResult(task=name, raw_acc=acc, centered_acc=_centered(acc, baseline), n=total))
 
         elif scorer == "unittest":
-            # Placeholder until sandbox harness is added (count as 0)
-            results.append(EvalResult(task=name, raw_acc=0.0, centered_acc=0.0, n=0))
+            # Code generation with sandbox execution
+            timeout_s = float(spec.get("timeout", 10.0))
+            max_gen_tokens = int(spec.get("max_gen_tokens", 512))
+            items = list(iter_unittest(name, spec.get("source", ""), n))
+
+            if args.pass_at_k:
+                # Run pass@k evaluation
+                aggregate, per_task = evaluate_pass_at_k(
+                    model=model,
+                    enc=enc,
+                    items=items,
+                    n_samples=args.pass_k_samples,
+                    temperature=args.pass_k_temp,
+                    max_gen_tokens=max_gen_tokens,
+                    timeout_s=timeout_s,
+                    ks=[1, 10, 100],
+                )
+                # Use pass@1 as the primary metric
+                acc = aggregate.get("pass@1", 0.0)
+                # Store pass@k details in summary
+                results.append(EvalResult(task=name, raw_acc=acc, centered_acc=acc, n=len(items)))
+                # Add pass@k breakdown to summary later
+            else:
+                # Standard greedy evaluation (pass@1 with temp=0)
+                passed = 0
+                total = 0
+                for it in items:
+                    prompt = it["prompt"]
+                    tests = it.get("tests", "")
+                    entry_point = it.get("entry_point", "")
+                    task_id = it.get("task_id", f"{name}/{total}")
+
+                    # Generate code completion
+                    with torch.inference_mode():
+                        completion = generate_code_completion(
+                            model,
+                            enc,
+                            prompt,
+                            max_new_tokens=max_gen_tokens,
+                            temperature=0.0,
+                        )
+
+                    # Execute and check
+                    success, error_msg = execute_unittest(
+                        prompt=prompt,
+                        completion=completion,
+                        tests=tests,
+                        entry_point=entry_point,
+                        timeout_s=timeout_s,
+                    )
+                    if success:
+                        passed += 1
+                    total += 1
+
+                acc = passed / max(1, total)
+                # Unittest baseline is 0 (no code passes without writing)
+                results.append(EvalResult(task=name, raw_acc=acc, centered_acc=acc, n=total))
 
         elif scorer == "judge":
-            # Placeholder until HYDRA judge harness is added (count as 0)
-            results.append(EvalResult(task=name, raw_acc=0.0, centered_acc=0.0, n=0))
+            # LLM-as-judge evaluation for open-ended responses
+            total_score = 0.0
+            total = 0
+            max_gen_tokens = int(spec.get("max_gen_tokens", 256))
+            tau_keep = float(spec.get("tau_keep", 0.5))  # Threshold for "good" response
+            items = list(iter_judge(name, spec.get("source", ""), n))
+
+            for it in items:
+                prompt = it["prompt"]
+                reference = it.get("reference", "")
+
+                # Generate response from the model
+                with torch.inference_mode():
+                    response_completion = generate_code_completion(
+                        model,
+                        enc,
+                        prompt,
+                        max_new_tokens=max_gen_tokens,
+                        temperature=0.0,
+                        stop_tokens=["\n\n", "Human:", "User:"],
+                    )
+
+                # Run judge evaluation (external API or local model)
+                if args.external_judge:
+                    judge_result = run_external_judge_evaluation(
+                        prompt=prompt,
+                        response=response_completion,
+                        reference=reference,
+                        api_provider=args.judge_provider,
+                        model_name=args.judge_model,
+                    )
+                else:
+                    judge_result = run_judge_evaluation(
+                        model=model,
+                        enc=enc,
+                        prompt=prompt,
+                        response=response_completion,
+                        reference=reference,
+                        max_new_tokens=256,
+                    )
+
+                # Normalize score to 0-1 range (from 1-10)
+                normalized_score = (judge_result.score - 1.0) / 9.0
+                total_score += normalized_score
+                total += 1
+
+            acc = total_score / max(1, total)
+            # Use tau_keep as baseline for centering
+            centered = _centered(acc, tau_keep)
+            results.append(EvalResult(task=name, raw_acc=acc, centered_acc=centered, n=total))
         else:
             results.append(EvalResult(task=name, raw_acc=0.0, centered_acc=0.0, n=0))
 

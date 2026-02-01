@@ -1,0 +1,71 @@
+🚀 nmoe has been deployed successfully!
+
+{{- if .Values.sglang.enabled }}
+
+=== SGLang Inference Server ===
+
+1. Get the SGLang service URL:
+{{- if .Values.sglang.ingress.enabled }}
+   http{{ if .Values.sglang.ingress.tls }}s{{ end }}://{{ (index .Values.sglang.ingress.hosts 0).host }}
+{{- else if eq .Values.sglang.service.type "LoadBalancer" }}
+   export SERVICE_IP=$(kubectl get svc {{ include "nmoe.sglang.fullname" . }} -n {{ .Values.global.namespace | default .Release.Namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   echo "SGLang URL: http://$SERVICE_IP:{{ .Values.sglang.service.port }}"
+{{- else if eq .Values.sglang.service.type "NodePort" }}
+   export NODE_PORT=$(kubectl get svc {{ include "nmoe.sglang.fullname" . }} -n {{ .Values.global.namespace | default .Release.Namespace }} -o jsonpath='{.spec.ports[0].nodePort}')
+   export NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+   echo "SGLang URL: http://$NODE_IP:$NODE_PORT"
+{{- else }}
+   kubectl port-forward svc/{{ include "nmoe.sglang.fullname" . }} {{ .Values.sglang.service.port }}:{{ .Values.sglang.service.port }} -n {{ .Values.global.namespace | default .Release.Namespace }}
+   echo "SGLang URL: http://localhost:{{ .Values.sglang.service.port }}"
+{{- end }}
+
+2. Test the server:
+   curl -X POST "http://localhost:{{ .Values.sglang.service.port }}/generate" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "Hello, world!", "sampling_params": {"max_new_tokens": 100}}'
+
+{{- end }}
+
+{{- if .Values.skyrl.enabled }}
+
+=== SkyRL Training Worker ===
+
+1. Access the Ray dashboard:
+   kubectl port-forward svc/{{ include "nmoe.skyrl.fullname" . }} {{ .Values.skyrl.ray.dashboardPort }}:{{ .Values.skyrl.ray.dashboardPort }} -n {{ .Values.global.namespace | default .Release.Namespace }}
+   echo "Ray Dashboard: http://localhost:{{ .Values.skyrl.ray.dashboardPort }}"
+
+2. View training logs:
+   kubectl logs -f deploy/{{ include "nmoe.skyrl.fullname" . }} -n {{ .Values.global.namespace | default .Release.Namespace }}
+
+{{- end }}
+
+=== Configuration ===
+
+Model: {{ .Values.sglang.model.name }}
+Tensor Parallel: {{ .Values.sglang.moe.tensorParallelSize }}
+Expert Parallel: {{ .Values.sglang.moe.expertParallelSize }}
+RDEP Backend: {{ .Values.nmoe.rdep.backend }}
+
+=== Monitoring ===
+
+{{- if .Values.monitoring.enabled }}
+Metrics endpoint: :{{ .Values.monitoring.metrics.port }}{{ .Values.monitoring.metrics.path }}
+{{- if .Values.monitoring.prometheus.serviceMonitor.enabled }}
+ServiceMonitor: Enabled (Prometheus Operator will auto-discover)
+{{- end }}
+{{- else }}
+Monitoring: Disabled
+{{- end }}
+
+=== Useful Commands ===
+
+# Check pod status
+kubectl get pods -n {{ .Values.global.namespace | default .Release.Namespace }} -l app=nmoe
+
+# View GPU utilization
+kubectl exec -it deploy/{{ include "nmoe.sglang.fullname" . }} -n {{ .Values.global.namespace | default .Release.Namespace }} -- nvidia-smi
+
+# Scale replicas
+kubectl scale deploy/{{ include "nmoe.sglang.fullname" . }} --replicas=2 -n {{ .Values.global.namespace | default .Release.Namespace }}
+
+For more information, visit: {{ .Chart.Home }}

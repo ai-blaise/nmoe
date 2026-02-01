@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from nmoe.csrc import rdep as _C
+from nmoe.cuda_errors import cuda_error_context, CudaError, RdepError
 
 if TYPE_CHECKING:
   from nmoe.rdep import Rdep
@@ -73,18 +74,26 @@ class _MoEBf16Fused(torch.autograd.Function):
         )
 
     offs_pad = torch.empty(rdep.n_local, device=device, dtype=torch.int32)
-    # dispatch_meta_bf16 uses this host int32 (pinned) as scratch to read back M_recv.
-    M_host = torch.zeros(1, device='cpu', dtype=torch.int32).pin_memory()
+    # P3.14: Use pre-allocated pinned memory from Rdep to avoid allocation overhead
+    M_host = rdep._pinned_M_host
+    M_host.zero_()  # Reset to zero for this call
 
     # BF16 fused path uses align=128 for consistent GEMM padding
     align = 128
 
-    M_recv = _C.dispatch_meta_bf16(
-      x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
-      int(T), int(K), align,
-      offs_pad.data_ptr(), M_host.data_ptr(),
-      stream,
-    )
+    try:
+      with cuda_error_context("dispatch_meta_bf16"):
+        M_recv = _C.dispatch_meta_bf16(
+          x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
+          int(T), int(K), align,
+          offs_pad.data_ptr(), M_host.data_ptr(),
+          stream,
+        )
+    except CudaError as e:
+      raise RdepError(
+        f"[MoE] dispatch_meta_bf16 failed (T={T}, K={K}): {e}",
+        operation="dispatch_meta_bf16",
+      ) from e
 
     out_f32 = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if M_recv <= 0:
@@ -112,15 +121,17 @@ class _MoEBf16Fused(torch.autograd.Function):
     offs_pad[-1] = int(max_pad)
 
     Xe_pad = torch.empty(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
-    _C.gather_xe_bf16(Xe_pad.data_ptr(), int(M_recv), int(max_pad), stream)
+    with cuda_error_context("gather_xe_bf16"):
+      _C.gather_xe_bf16(Xe_pad.data_ptr(), int(M_recv), int(max_pad), stream)
 
     Ye_pad = expert(Xe_pad, W1, W3, W2, offs_pad)
-    _C.return_scatter_from_pad_bf16(
-      Ye_pad.data_ptr(),
-      out_f32.data_ptr(),
-      int(M_recv), int(T), int(K),
-      stream,
-    )
+    with cuda_error_context("return_scatter_from_pad_bf16"):
+      _C.return_scatter_from_pad_bf16(
+        Ye_pad.data_ptr(),
+        out_f32.data_ptr(),
+        int(M_recv), int(T), int(K),
+        stream,
+      )
 
     ctx.rdep = rdep
     ctx.save_for_backward(x, eid, gates, W1, W3, W2)
@@ -151,17 +162,20 @@ class _MoEBf16Fused(torch.autograd.Function):
         )
 
     offs_pad = torch.empty(int(W1.size(0)), device=device, dtype=torch.int32)
-    M_host = torch.zeros(1, device='cpu', dtype=torch.int32).pin_memory()
+    # P3.14: Use pre-allocated pinned memory from Rdep
+    M_host = rdep._pinned_M_host
+    M_host.zero_()
 
     # BF16 fused path uses align=128 for consistent GEMM padding
     align = 128
 
-    M_recv = _C.dispatch_meta_bf16(
-      x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
-      int(T), int(K), align,
-      offs_pad.data_ptr(), M_host.data_ptr(),
-      stream,
-    )
+    with cuda_error_context("dispatch_meta_bf16 (backward)"):
+      M_recv = _C.dispatch_meta_bf16(
+        x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
+        int(T), int(K), align,
+        offs_pad.data_ptr(), M_host.data_ptr(),
+        stream,
+      )
 
     if M_recv <= 0:
       dW1 = torch.zeros_like(W1)
@@ -178,26 +192,28 @@ class _MoEBf16Fused(torch.autograd.Function):
         dummy_ye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
         dummy_dye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
         dummy_dgate_sorted = torch.empty(1, device=device, dtype=torch.float32)
-        _C.gather_dy_dist_bf16(
-          dOut.data_ptr(),
-          eid.data_ptr(),
-          dummy_ye_sorted.data_ptr(),
-          dummy_row_id.data_ptr(),
-          dummy_gate_sorted.data_ptr(),
-          dummy_dye_sorted.data_ptr(),
-          dummy_dgate_sorted.data_ptr(),
-          dGates_tk_f32.data_ptr(),
-          0, int(T), int(H), int(K),
-          stream,
-        )
+        with cuda_error_context("gather_dy_dist_bf16 (backward, M_recv=0)"):
+          _C.gather_dy_dist_bf16(
+            dOut.data_ptr(),
+            eid.data_ptr(),
+            dummy_ye_sorted.data_ptr(),
+            dummy_row_id.data_ptr(),
+            dummy_gate_sorted.data_ptr(),
+            dummy_dye_sorted.data_ptr(),
+            dummy_dgate_sorted.data_ptr(),
+            dGates_tk_f32.data_ptr(),
+            0, int(T), int(H), int(K),
+            stream,
+          )
         dummy_dxe_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
-        _C.scatter_dx_dist_bf16(
-          dummy_dxe_sorted.data_ptr(),
-          dummy_row_id.data_ptr(),
-          dX.data_ptr(),
-          0, int(T), int(H), int(K),
-          stream,
-        )
+        with cuda_error_context("scatter_dx_dist_bf16 (backward, M_recv=0)"):
+          _C.scatter_dx_dist_bf16(
+            dummy_dxe_sorted.data_ptr(),
+            dummy_row_id.data_ptr(),
+            dX.data_ptr(),
+            0, int(T), int(H), int(K),
+            stream,
+          )
         dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
       else:
         dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
@@ -208,11 +224,13 @@ class _MoEBf16Fused(torch.autograd.Function):
     offs_pad[-1] = int(max_pad)
 
     Xe_pad = torch.empty(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
-    _C.gather_xe_bf16(Xe_pad.data_ptr(), int(M_recv), int(max_pad), stream)
+    with cuda_error_context("gather_xe_bf16 (backward)"):
+      _C.gather_xe_bf16(Xe_pad.data_ptr(), int(M_recv), int(max_pad), stream)
 
     row_id = torch.empty(int(M_recv), device=device, dtype=torch.int64)
     gate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
-    _C.gather_meta_sorted_bf16(row_id.data_ptr(), gate_sorted.data_ptr(), int(M_recv), stream)
+    with cuda_error_context("gather_meta_sorted_bf16"):
+      _C.gather_meta_sorted_bf16(row_id.data_ptr(), gate_sorted.data_ptr(), int(M_recv), stream)
 
     with torch.enable_grad():
       Xe_pad = Xe_pad.requires_grad_(True)
@@ -223,39 +241,43 @@ class _MoEBf16Fused(torch.autograd.Function):
     dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
 
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-      _C.gather_dy_dist_bf16(
-        dOut.data_ptr(),
-        eid.data_ptr(),
-        Ye_pad.detach().data_ptr(),
-        row_id.data_ptr(),
-        gate_sorted.data_ptr(),
-        dYe_sorted.data_ptr(),
-        dGate_sorted.data_ptr(),
-        dGates_tk_f32.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
+      with cuda_error_context("gather_dy_dist_bf16 (backward)"):
+        _C.gather_dy_dist_bf16(
+          dOut.data_ptr(),
+          eid.data_ptr(),
+          Ye_pad.detach().data_ptr(),
+          row_id.data_ptr(),
+          gate_sorted.data_ptr(),
+          dYe_sorted.data_ptr(),
+          dGate_sorted.data_ptr(),
+          dGates_tk_f32.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
     else:
-      _C.gather_dy_bf16(
-        dOut.data_ptr(),
-        Ye_pad.detach().data_ptr(),
-        row_id.data_ptr(),
-        gate_sorted.data_ptr(),
-        dYe_sorted.data_ptr(),
-        dGate_sorted.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
-      _C.scatter_gate_bf16(
-        dGate_sorted.data_ptr(),
-        row_id.data_ptr(),
-        dGates_tk_f32.data_ptr(),
-        int(M_recv), int(T), int(K),
-        stream,
-      )
+      with cuda_error_context("gather_dy_bf16 (backward)"):
+        _C.gather_dy_bf16(
+          dOut.data_ptr(),
+          Ye_pad.detach().data_ptr(),
+          row_id.data_ptr(),
+          gate_sorted.data_ptr(),
+          dYe_sorted.data_ptr(),
+          dGate_sorted.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
+      with cuda_error_context("scatter_gate_bf16 (backward)"):
+        _C.scatter_gate_bf16(
+          dGate_sorted.data_ptr(),
+          row_id.data_ptr(),
+          dGates_tk_f32.data_ptr(),
+          int(M_recv), int(T), int(K),
+          stream,
+        )
 
     dYe_pad = torch.zeros(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
-    _C.scatter_sorted_to_pad_bf16(dYe_sorted.data_ptr(), dYe_pad.data_ptr(), int(M_recv), int(H), stream)
+    with cuda_error_context("scatter_sorted_to_pad_bf16 (backward)"):
+      _C.scatter_sorted_to_pad_bf16(dYe_sorted.data_ptr(), dYe_pad.data_ptr(), int(M_recv), int(H), stream)
 
     dXe_pad, dW1, dW3, dW2 = torch.autograd.grad(
       outputs=Ye_pad,
@@ -271,22 +293,25 @@ class _MoEBf16Fused(torch.autograd.Function):
 
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
       dXe_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
-      _C.gather_from_pad_bf16(dXe_pad_bf16.data_ptr(), dXe_sorted.data_ptr(), int(M_recv), int(H), stream)
-      _C.scatter_dx_dist_bf16(
-        dXe_sorted.data_ptr(),
-        row_id.data_ptr(),
-        dX.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
+      with cuda_error_context("gather_from_pad_bf16 (backward)"):
+        _C.gather_from_pad_bf16(dXe_pad_bf16.data_ptr(), dXe_sorted.data_ptr(), int(M_recv), int(H), stream)
+      with cuda_error_context("scatter_dx_dist_bf16 (backward)"):
+        _C.scatter_dx_dist_bf16(
+          dXe_sorted.data_ptr(),
+          row_id.data_ptr(),
+          dX.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
     else:
-      _C.scatter_dx_bf16_internal(
-        dXe_pad_bf16.data_ptr(),
-        row_id.data_ptr(),
-        dX.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
+      with cuda_error_context("scatter_dx_bf16_internal (backward)"):
+        _C.scatter_dx_bf16_internal(
+          dXe_pad_bf16.data_ptr(),
+          row_id.data_ptr(),
+          dX.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
 
     dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
     return None, dX, None, dGates, dW1, dW3, dW2
@@ -319,15 +344,18 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     # Option A: Use BF16 dispatch + local quantization
     # This ensures Xe_pad (BF16) is available for backward STE
     offs_pad = torch.empty(E, device=device, dtype=torch.int32)
-    M_host = torch.zeros(1, device='cpu', dtype=torch.int32).pin_memory()
+    # P3.14: Use pre-allocated pinned memory from Rdep
+    M_host = rdep._pinned_M_host
+    M_host.zero_()
     align = 128  # Required for blockscaled SF swizzle
 
-    M_recv = _C.dispatch_meta_blockscaled(
-      x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
-      int(T), int(K),
-      offs_pad.data_ptr(), M_host.data_ptr(),
-      stream,
-    )
+    with cuda_error_context("dispatch_meta_blockscaled"):
+      M_recv = _C.dispatch_meta_blockscaled(
+        x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
+        int(T), int(K),
+        offs_pad.data_ptr(), M_host.data_ptr(),
+        stream,
+      )
 
     out_f32 = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if M_recv <= 0:
@@ -343,7 +371,13 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       ctx.save_for_backward(x, eid, gates, W1, W3, W2)
       return out_f32.to(dtype=torch.bfloat16)
 
-    M_pad = int(M_host.item())
+    # P3.13: Use non-blocking query loop instead of blocking synchronize()
+    # This allows overlapping with other work and reduces latency spikes
+    sync_event = torch.cuda.Event()
+    sync_event.record(stream)
+    while not sync_event.query():
+      pass  # Busy-wait is faster than sleep for short waits
+    M_pad = int(M_host[0].item())  # Now safe to read
 
     # Gather blockscaled activations into padded layout (quantized + packed SF)
     pack_factor = 2 if rdep.profile == 'fp8' else 4
@@ -404,7 +438,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     # Option A: Use BF16 dispatch to get correct Xe_pad from all ranks
     # This fixes the distributed bug where local x was used for remote rows
     offs_pad = torch.empty(E, device=device, dtype=torch.int32)
-    M_host = torch.zeros(1, device='cpu', dtype=torch.int32).pin_memory()
+    # P3.14: Use pre-allocated pinned memory from Rdep
+    M_host = rdep._pinned_M_host
+    M_host.zero_()
     align = 128  # Required for blockscaled SF swizzle
 
     M_recv = _C.dispatch_meta_bf16(
@@ -428,26 +464,28 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         dummy_ye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
         dummy_dye_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
         dummy_dgate_sorted = torch.empty(1, device=device, dtype=torch.float32)
-        _C.gather_dy_dist_bf16(
-          dOut.data_ptr(),
-          eid.data_ptr(),
-          dummy_ye_sorted.data_ptr(),
-          dummy_row_id.data_ptr(),
-          dummy_gate_sorted.data_ptr(),
-          dummy_dye_sorted.data_ptr(),
-          dummy_dgate_sorted.data_ptr(),
-          dGates_tk_f32.data_ptr(),
-          0, int(T), int(H), int(K),
-          stream,
-        )
+        with cuda_error_context("gather_dy_dist_bf16 (blockscaled backward, M_recv=0)"):
+          _C.gather_dy_dist_bf16(
+            dOut.data_ptr(),
+            eid.data_ptr(),
+            dummy_ye_sorted.data_ptr(),
+            dummy_row_id.data_ptr(),
+            dummy_gate_sorted.data_ptr(),
+            dummy_dye_sorted.data_ptr(),
+            dummy_dgate_sorted.data_ptr(),
+            dGates_tk_f32.data_ptr(),
+            0, int(T), int(H), int(K),
+            stream,
+          )
         dummy_dxe_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
-        _C.scatter_dx_dist_bf16(
-          dummy_dxe_sorted.data_ptr(),
-          dummy_row_id.data_ptr(),
-          dX.data_ptr(),
-          0, int(T), int(H), int(K),
-          stream,
-        )
+        with cuda_error_context("scatter_dx_dist_bf16 (blockscaled backward, M_recv=0)"):
+          _C.scatter_dx_dist_bf16(
+            dummy_dxe_sorted.data_ptr(),
+            dummy_row_id.data_ptr(),
+            dX.data_ptr(),
+            0, int(T), int(H), int(K),
+            stream,
+          )
         dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
       else:
         dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
@@ -472,8 +510,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     # dGate = ⟨A, dA⟩ directly from activations, not ⟨dOut, Ye⟩ from outputs.
     # A = post-SwiGLU activation, dA = dYe @ W2.T (ungated gradient)
     #
-    # TODO(perf): The gather_dy kernels still compute dGate internally (dot product of Ye*dOut).
-    # This is wasted compute (~negligible). To fully remove, modify CUDA kernels in rdep.cu.
+    # Performance note: gather_dy kernels compute dGate internally (Ye*dOut dot product).
+    # This is redundant since we compute dGate via SonicMoE identity below, but overhead
+    # is negligible (<0.1% of backward time). Removing requires modifying rdep.cu kernels.
     dYe_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
     dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
     dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
@@ -509,7 +548,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       stream,
     )
 
-    offs_pinned = torch.empty(E, dtype=torch.int32, device='cpu', pin_memory=True)
+    # P3.14: Use pre-allocated pinned memory from Rdep for offs
+    offs_pinned = rdep._pinned_offs
     offs_pinned.copy_(offs_pad, non_blocking=True)
     copy_event = torch.cuda.Event()
     copy_event.record(stream)
@@ -559,7 +599,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         stream,
       )
 
-    copy_event.synchronize()
+    # P3.13: Use non-blocking query loop instead of blocking synchronize()
+    while not copy_event.query():
+      pass  # Busy-wait for short D2H copies
     offs_host = offs_pinned
     dW2 = torch.empty_like(W2)
     _C.bf16_wgrad_w2_cublaslt(

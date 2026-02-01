@@ -17,6 +17,75 @@ def fingerprint(cfg: "Config") -> str:
   return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+# P3.10: Config attribute mapping between NMoE and SGLang/HuggingFace naming
+NMOE_TO_HF_MAPPING = {
+    # NMoE name -> HuggingFace name
+    "dim": "hidden_size",
+    "inter_dim": "intermediate_size",
+    "moe_inter_dim": "moe_intermediate_size",
+    "n_layers": "num_hidden_layers",
+    "n_heads": "num_attention_heads",
+    "n_routed_experts": "num_local_experts",  # Or num_experts
+    "n_activated_experts": "num_experts_per_tok",
+    "vocab_size": "vocab_size",
+    "max_position_embeddings": "max_position_embeddings",
+    "rms_norm_eps": "rms_norm_eps",
+    "rope_theta": "rope_theta",
+}
+
+
+def validate_config_mapping(nmoe_config: "Config", hf_config: Any) -> None:
+    """Validate that NMoE config values match HuggingFace config values.
+
+    P3.10: Provides explicit validation with clear error messages for
+    config attribute naming mismatches.
+
+    Args:
+        nmoe_config: NMoE Config instance
+        hf_config: HuggingFace PretrainedConfig or similar
+
+    Raises:
+        ValueError: If any mapped attribute values don't match
+    """
+    errors = []
+
+    for nmoe_attr, hf_attr in NMOE_TO_HF_MAPPING.items():
+        nmoe_val = getattr(nmoe_config, nmoe_attr, None)
+        hf_val = getattr(hf_config, hf_attr, None)
+
+        if nmoe_val is None or hf_val is None:
+            continue
+
+        if nmoe_val != hf_val:
+            errors.append(
+                f"Config mismatch: nmoe.{nmoe_attr}={nmoe_val} vs hf.{hf_attr}={hf_val}"
+            )
+
+    if errors:
+        raise ValueError(
+            "Config validation failed:\n  " + "\n  ".join(errors)
+        )
+
+
+def nmoe_to_hf_config(nmoe_config: "Config") -> Dict[str, Any]:
+    """Convert NMoE Config to HuggingFace-style config dict.
+
+    Args:
+        nmoe_config: NMoE Config instance
+
+    Returns:
+        Dictionary with HuggingFace naming conventions
+    """
+    hf_dict = {}
+
+    for nmoe_attr, hf_attr in NMOE_TO_HF_MAPPING.items():
+        val = getattr(nmoe_config, nmoe_attr, None)
+        if val is not None:
+            hf_dict[hf_attr] = val
+
+    return hf_dict
+
+
 @dataclass
 class Config:
   # =============================================================================

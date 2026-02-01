@@ -3,38 +3,36 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.profiler import record_function
 
 from nmoe.attention.rope import rotate_pe
 from nmoe.config import Config
 from nmoe.norm import RMSNorm
-from nmoe.csrc import rdep as _C
 
 
 def _require(cond: bool, msg: str) -> None:
-    if not cond:
-        raise RuntimeError(msg)
+  if not cond:
+    raise RuntimeError(msg)
 
 
 def _sm100_only(device: torch.device) -> None:
-    _require(torch.cuda.is_available(), "MLA requires CUDA (B200 / SM100).")
-    major, minor = torch.cuda.get_device_capability(device)
-    _require(
-        major == 10,
-        f"MLA requires SM100 (B200). Got compute capability {major}.{minor}.",
-    )
+  _require(torch.cuda.is_available(), "MLA requires CUDA (B200 / SM100).")
+  major, minor = torch.cuda.get_device_capability(device)
+  _require(major == 10, f"MLA requires SM100 (B200). Got compute capability {major}.{minor}.")
 
 
 def _nvtx(tag: str):
-    if os.getenv("NMOE_NVTX", "0") not in ("1", "true", "True"):
-        return nullcontext()
-    if (
-        torch.cuda.is_available()
-        and hasattr(torch.cuda, "nvtx")
-        and hasattr(torch.cuda.nvtx, "range")
-    ):
-        return torch.cuda.nvtx.range(tag)
+  if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
     return nullcontext()
+  if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+    return torch.cuda.nvtx.range(tag)
+  return nullcontext()
+
+
+# Use PyTorch SDPA by default. FA4 cute-dsl has a bug with (192, 128) dimensions on SM100.
+# Set NMOE_USE_FA4=1 to use FA4+FlashMLA (may produce NaN).
+_USE_SDPA = os.getenv('NMOE_USE_FA4', '0') not in ('1', 'true', 'True')
 
 
 # Module-level workspace cache for MLA backward pass.
@@ -47,262 +45,204 @@ _mla_workspace_cache: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_mla_workspace(device: torch.device, workspace_bytes: int) -> torch.Tensor:
-    """Get a cached workspace buffer for MLA backward.
+  """Get a cached workspace buffer for MLA backward.
 
-    Returns a `torch.uint8` CUDA tensor with `numel() >= workspace_bytes`.
-    """
-    buf = _mla_workspace_cache.get(device)
-    if buf is None or buf.numel() < workspace_bytes:
-        buf = torch.empty((workspace_bytes,), device=device, dtype=torch.uint8)
-        _mla_workspace_cache[device] = buf
-    return buf
+  Returns a `torch.uint8` CUDA tensor with `numel() >= workspace_bytes`.
+  """
+  buf = _mla_workspace_cache.get(device)
+  if buf is None or buf.numel() < workspace_bytes:
+    buf = torch.empty((workspace_bytes,), device=device, dtype=torch.uint8)
+    _mla_workspace_cache[device] = buf
+  return buf
 
 
-class _G1Gate(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, lin: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
-        lin, attn = lin.contiguous(), attn.contiguous()
-        out = torch.empty_like(attn)
-        gate = torch.empty_like(lin)
-        _C.g1_gate_fwd(
-            lin.data_ptr(),
-            attn.data_ptr(),
-            out.data_ptr(),
-            gate.data_ptr(),
-            lin.numel(),
-            None,
-        )
-        ctx.save_for_backward(attn, gate)
-        return out
+def _mla_sdpa_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float) -> torch.Tensor:
+  """MLA attention using PyTorch's native SDPA.
 
-    @staticmethod
-    def backward(ctx, d_out: torch.Tensor):
-        attn, gate = ctx.saved_tensors
-        d_out = d_out.contiguous()
-        d_attn = torch.empty_like(attn)
-        d_lin = torch.empty_like(gate)
-        _C.g1_gate_bwd(
-            d_out.data_ptr(),
-            attn.data_ptr(),
-            gate.data_ptr(),
-            d_attn.data_ptr(),  # d_out_ungated: grad w.r.t. attn_out
-            d_lin.data_ptr(),   # d_gate_linear: grad w.r.t. linear_out
-            d_out.numel(),
-            None,
-        )
-        return d_lin, d_attn
+  This is the default implementation as FA4 cute-dsl has a bug with (192, 128) dimensions.
+  Uses PyTorch's optimized scaled_dot_product_attention which works correctly on all GPUs.
+
+  Args:
+    q: Query tensor [B, S, H, D_qk]
+    k: Key tensor [B, S, H, D_qk]
+    v: Value tensor [B, S, H, D_v]
+    softmax_scale: Softmax scaling factor
+
+  Returns:
+    Output tensor [B, S, H, D_v]
+  """
+  # SDPA expects [B, H, S, D]
+  q = q.transpose(1, 2)  # [B, H, S, D_qk]
+  k = k.transpose(1, 2)  # [B, H, S, D_qk]
+  v = v.transpose(1, 2)  # [B, H, S, D_v]
+
+  with _nvtx("attn/sdpa_fwd"):
+    out = F.scaled_dot_product_attention(
+        q, k, v,
+        scale=softmax_scale,
+        is_causal=True,
+    )
+
+  # Back to [B, S, H, D_v]
+  return out.transpose(1, 2)
 
 
 class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float
-    ) -> torch.Tensor:
-        _sm100_only(q.device)
-        _require(
-            q.is_cuda and k.is_cuda and v.is_cuda,
-            "MLA FA4+FlashMLA requires CUDA tensors.",
-        )
-        _require(
-            q.dtype == torch.bfloat16
-            and k.dtype == torch.bfloat16
-            and v.dtype == torch.bfloat16,
-            "MLA FA4+FlashMLA requires BF16 inputs.",
-        )
-        _require(
-            q.ndim == 4 and k.ndim == 4 and v.ndim == 4,
-            "Expected q/k/v with shape [B, S, H, D].",
-        )
+  """MLA attention using FA4 forward + FlashMLA backward.
 
-        bsz, seqlen, n_heads, d_qk = q.shape
-        _require(k.shape == (bsz, seqlen, n_heads, d_qk), "k must match q shape.")
-        d_v = v.shape[-1]
-        _require(
-            v.shape == (bsz, seqlen, n_heads, d_v), "v must have shape [B, S, H, Dv]."
-        )
-        _require(
-            d_qk == 192 and d_v == 128,
-            f"Only (d_qk, d_v) = (192, 128) is supported. Got ({d_qk}, {d_v}).",
-        )
+  WARNING: FA4 cute-dsl has a known bug with (192, 128) dimensions on SM100 that
+  produces NaN outputs. Use PyTorch SDPA instead (default).
+  """
+  @staticmethod
+  def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float) -> torch.Tensor:
+    _sm100_only(q.device)
+    _require(q.is_cuda and k.is_cuda and v.is_cuda, "MLA FA4+FlashMLA requires CUDA tensors.")
+    _require(q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16,
+             "MLA FA4+FlashMLA requires BF16 inputs.")
+    _require(q.ndim == 4 and k.ndim == 4 and v.ndim == 4, "Expected q/k/v with shape [B, S, H, D].")
 
-        # Hard requirement: do not proceed without FA4 forward + FlashMLA backward.
-        # Environment contract: `third_party/flash_attn` is on PYTHONPATH (so `flash_attn.cute` is importable),
-        # and `nmoe.csrc.flashmla_sm100` is built.
-        from flash_attn.cute.interface import _flash_attn_fwd  # type: ignore
-        from nmoe.csrc import flashmla_sm100 as _flashmla  # type: ignore
+    bsz, seqlen, n_heads, d_qk = q.shape
+    _require(k.shape == (bsz, seqlen, n_heads, d_qk), "k must match q shape.")
+    d_v = v.shape[-1]
+    _require(v.shape == (bsz, seqlen, n_heads, d_v), "v must have shape [B, S, H, Dv].")
+    _require(d_qk == 192 and d_v == 128, f"Only (d_qk, d_v) = (192, 128) is supported. Got ({d_qk}, {d_v}).")
 
-        total = bsz * seqlen
-        q_ = q.reshape(total, n_heads, d_qk).contiguous()
-        k_ = k.reshape(total, n_heads, d_qk).contiguous()
-        v_ = v.reshape(total, n_heads, d_v).contiguous()
+    # Hard requirement: do not proceed without FA4 forward + FlashMLA backward.
+    # Environment contract: `third_party/flash_attn` is on PYTHONPATH (so `flash_attn.cute` is importable),
+    # and `nmoe.csrc.flashmla_sm100` is built.
+    from flash_attn.cute.interface import _flash_attn_fwd  # type: ignore
+    from nmoe.csrc import flashmla_sm100 as _flashmla  # type: ignore
 
-        cu = torch.arange(
-            0, (bsz + 1) * seqlen, step=seqlen, device=q.device, dtype=torch.int32
-        )
+    total = bsz * seqlen
+    q_ = q.reshape(total, n_heads, d_qk).contiguous()
+    k_ = k.reshape(total, n_heads, d_qk).contiguous()
+    v_ = v.reshape(total, n_heads, d_v).contiguous()
 
-        with _nvtx("attn/fa4_fwd"):
-            out, lse = _flash_attn_fwd(
-                q_,
-                k_,
-                v_,
-                cu_seqlens_q=cu,
-                cu_seqlens_k=cu,
-                softmax_scale=float(softmax_scale),
-                causal=True,
-                return_lse=True,
-            )
+    cu = torch.arange(0, (bsz + 1) * seqlen, step=seqlen, device=q.device, dtype=torch.int32)
 
-        # FlashMLA expects lse as [total, H] float32 with stride(0) == 1.
-        lse_t = lse.T
+    with _nvtx("attn/fa4_fwd"):
+      # Use m_block=128, n_block=64 for (d_qk=192, d_v=128) on SM100 (B200)
+      # The default n_block=128 triggers a TMEM layout mismatch in cute-dsl
+      out, lse = _flash_attn_fwd(
+          q_,
+          k_,
+          v_,
+          cu_seqlens_q=cu,
+          cu_seqlens_k=cu,
+          softmax_scale=float(softmax_scale),
+          causal=True,
+          return_lse=True,
+          m_block_size=128,
+          n_block_size=64,
+      )
 
-        ctx.save_for_backward(q_, k_, v_, out, lse_t, cu)
-        ctx.softmax_scale = float(softmax_scale)
-        ctx.seqlen = int(seqlen)
-        ctx._flashmla = _flashmla
-        return out.reshape(bsz, seqlen, n_heads, d_v)
+    # FlashMLA expects lse as [total, H] float32 with stride(0) == 1.
+    lse_t = lse.T
 
-    @staticmethod
-    def backward(ctx, d_out: torch.Tensor):
-        q, k, v, out, lse_t, cu = ctx.saved_tensors
-        softmax_scale = ctx.softmax_scale
-        seqlen = ctx.seqlen
-        flashmla = ctx._flashmla
+    ctx.save_for_backward(q_, k_, v_, out, lse_t, cu)
+    ctx.softmax_scale = float(softmax_scale)
+    ctx.seqlen = int(seqlen)
+    ctx._flashmla = _flashmla
+    return out.reshape(bsz, seqlen, n_heads, d_v)
 
-        bsz = cu.numel() - 1
-        total, n_heads, d_qk = q.shape
-        d_v = v.shape[-1]
+  @staticmethod
+  def backward(ctx, d_out: torch.Tensor):
+    q, k, v, out, lse_t, cu = ctx.saved_tensors
+    softmax_scale = ctx.softmax_scale
+    seqlen = ctx.seqlen
+    flashmla = ctx._flashmla
 
-        d_o = d_out.reshape(total, n_heads, d_v).contiguous()
+    bsz = cu.numel() - 1
+    total, n_heads, d_qk = q.shape
+    d_v = v.shape[-1]
 
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
+    d_o = d_out.reshape(total, n_heads, d_v).contiguous()
 
-        max_seqlen_aligned = ((seqlen + 7) // 8) * 8
-        workspace_bytes = 0
-        workspace_bytes += 4 * bsz * max_seqlen_aligned * n_heads * d_qk  # dQ_acc
-        workspace_bytes += (
-            4 * max_seqlen_aligned * bsz * n_heads * 2
-        )  # sum_OdO + scaled_lse
-        # Use cached workspace to avoid allocation churn
-        workspace = _get_mla_workspace(q.device, workspace_bytes)
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
 
-        with _nvtx("attn/flashmla_bwd"):
-            flashmla.dense_prefill_bwd(
-                workspace,
-                d_o,
-                q,
-                k,
-                v,
-                out,
-                lse_t,
-                cu,
-                cu,
-                dq,
-                dk,
-                dv,
-                1,  # causal
-                softmax_scale,
-                seqlen,
-                seqlen,
-                True,  # is_varlen
-            )
+    max_seqlen_aligned = ((seqlen + 7) // 8) * 8
+    workspace_bytes = 0
+    workspace_bytes += 4 * bsz * max_seqlen_aligned * n_heads * d_qk  # dQ_acc
+    workspace_bytes += 4 * max_seqlen_aligned * bsz * n_heads * 2  # sum_OdO + scaled_lse
+    # Use cached workspace to avoid allocation churn
+    workspace = _get_mla_workspace(q.device, workspace_bytes)
 
-        return (
-            dq.reshape(bsz, seqlen, n_heads, d_qk),
-            dk.reshape(bsz, seqlen, n_heads, d_qk),
-            dv.reshape(bsz, seqlen, n_heads, d_v),
-            None,
-        )
+    with _nvtx("attn/flashmla_bwd"):
+      flashmla.dense_prefill_bwd(
+          workspace,
+          d_o,
+          q,
+          k,
+          v,
+          out,
+          lse_t,
+          cu,
+          cu,
+          dq,
+          dk,
+          dv,
+          1,  # causal
+          softmax_scale,
+          seqlen,
+          seqlen,
+          True,  # is_varlen
+      )
+
+    return dq.reshape(bsz, seqlen, n_heads, d_qk), dk.reshape(bsz, seqlen, n_heads, d_qk), dv.reshape(bsz, seqlen, n_heads, d_v), None
 
 
 class MLA(nn.Module):
-    def __init__(self, config: Config):
-        super().__init__()
-        self.dim = config.dim
-        self.n_heads = config.n_heads
-        self.q_lora_rank = config.q_lora_rank
-        self.kv_lora_rank = config.kv_lora_rank
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
-        self.wq_a = nn.Linear(
-            self.dim, self.q_lora_rank, bias=False, dtype=torch.bfloat16
-        )
-        self.q_norm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
-        self.wq_b = nn.Linear(
-            self.q_lora_rank,
-            self.n_heads * self.qk_head_dim,
-            bias=False,
-            dtype=torch.bfloat16,
-        )
-        self.wkv_a = nn.Linear(
-            self.dim,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-            dtype=torch.bfloat16,
-        )
-        self.kv_norm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
-        self.wkv_b = nn.Linear(
-            self.kv_lora_rank,
-            self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            dtype=torch.bfloat16,
-        )
-        self.wo = nn.Linear(
-            self.n_heads * self.v_head_dim, self.dim, bias=False, dtype=torch.bfloat16
-        )
-        self.softmax_scale = self.qk_head_dim**-0.5
-        self.is_attn_gate: bool = True
-        if self.is_attn_gate:
-            self.g1_gate_proj = nn.Linear(
-                self.dim,
-                self.n_heads * self.v_head_dim,
-                bias=False,
-                dtype=torch.bfloat16,
-            )
+  def __init__(self, config: Config):
+    super().__init__()
+    self.dim = config.dim
+    self.n_heads = config.n_heads
+    self.q_lora_rank = config.q_lora_rank
+    self.kv_lora_rank = config.kv_lora_rank
+    self.qk_nope_head_dim = config.qk_nope_head_dim
+    self.qk_rope_head_dim = config.qk_rope_head_dim
+    self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+    self.v_head_dim = config.v_head_dim
+    self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False, dtype=torch.bfloat16)
+    self.q_norm = RMSNorm(self.q_lora_rank, config.rms_norm_eps)
+    self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False, dtype=torch.bfloat16)
+    self.wkv_a = nn.Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False, dtype=torch.bfloat16)
+    self.kv_norm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
+    self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False, dtype=torch.bfloat16)
+    self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False, dtype=torch.bfloat16)
+    self.softmax_scale = self.qk_head_dim ** -0.5
 
-    def init_weights(self, init_std: float = 0.02):
-        for proj in [self.wq_a, self.wq_b, self.wkv_a, self.wkv_b]:
-            nn.init.trunc_normal_(proj.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
-        self.q_norm.weight.data.fill_(1.0)
-        self.kv_norm.weight.data.fill_(1.0)
-        if self.is_attn_gate:
-            nn.init.trunc_normal_(self.g1_gate_proj.weight, mean=0.0, std=0.02)
+  def init_weights(self, init_std: float = 0.02):
+    for proj in [self.wq_a, self.wq_b, self.wkv_a, self.wkv_b]:
+      nn.init.trunc_normal_(proj.weight, mean=0.0, std=0.02)
+    nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+    self.q_norm.weight.data.fill_(1.0)
+    self.kv_norm.weight.data.fill_(1.0)
 
-    @record_function("attn")
-    def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ) -> torch.Tensor:
-        bsz, seqlen, _ = x.size()
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        q_pe = rotate_pe(q_pe, cos, sin)
-        q[..., self.qk_nope_head_dim :].copy_(q_pe)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = rotate_pe(k_pe.unsqueeze(2), cos, sin)
-        kv = self.wkv_b(self.kv_norm(kv))
-        kv = kv.view(bsz, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = torch.empty(
-            (bsz, seqlen, self.n_heads, self.qk_head_dim),
-            device=x.device,
-            dtype=k_nope.dtype,
-        )
-        k[..., : self.qk_nope_head_dim].copy_(k_nope)
-        k[..., self.qk_nope_head_dim :].copy_(k_pe.expand(-1, -1, self.n_heads, -1))
-        with record_function("attn.kernel[mla]"):
-            output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
-        if self.is_attn_gate:
-            linear_out = self.g1_gate_proj(x).view(
-                bsz, seqlen, self.n_heads, self.v_head_dim
-            )
-            output = _G1Gate.apply(linear_out, output)
-        output = output.contiguous().view(bsz, seqlen, self.n_heads * self.v_head_dim)
-        return self.wo(output)
+  @record_function("attn")
+  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    bsz, seqlen, _ = x.size()
+    q = self.wq_b(self.q_norm(self.wq_a(x)))
+    q = q.view(bsz, seqlen, self.n_heads, self.qk_head_dim)
+    q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+    q_pe = rotate_pe(q_pe, cos, sin)
+    q[..., self.qk_nope_head_dim:].copy_(q_pe)
+    kv = self.wkv_a(x)
+    kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+    k_pe = rotate_pe(k_pe.unsqueeze(2), cos, sin)
+    kv = self.wkv_b(self.kv_norm(kv))
+    kv = kv.view(bsz, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
+    k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+    k = torch.empty((bsz, seqlen, self.n_heads, self.qk_head_dim), device=x.device, dtype=k_nope.dtype)
+    k[..., :self.qk_nope_head_dim].copy_(k_nope)
+    k[..., self.qk_nope_head_dim:].copy_(k_pe.expand(-1, -1, self.n_heads, -1))
+    with record_function("attn.kernel[mla]"):
+      if _USE_SDPA:
+        # Use PyTorch SDPA (default) - FA4 has a bug with (192, 128) on SM100
+        output = _mla_sdpa_forward(q, k, v, self.softmax_scale)
+      else:
+        # Use FA4+FlashMLA (may produce NaN with current FA4 cute-dsl)
+        output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
+    output = output.contiguous().view(bsz, seqlen, self.n_heads * self.v_head_dim)
+    return self.wo(output)

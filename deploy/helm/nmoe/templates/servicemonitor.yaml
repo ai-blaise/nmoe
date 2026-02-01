@@ -1,0 +1,46 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.prometheus.serviceMonitor.enabled }}
+---
+{{- if .Values.sglang.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "nmoe.sglang.fullname" . }}
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nmoe.sglang.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "nmoe.sglang.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.prometheus.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.prometheus.serviceMonitor.scrapeTimeout }}
+      path: {{ .Values.monitoring.metrics.path }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.global.namespace | default .Release.Namespace }}
+{{- end }}
+---
+{{- if .Values.skyrl.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "nmoe.skyrl.fullname" . }}
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nmoe.skyrl.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "nmoe.skyrl.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: dashboard
+      interval: {{ .Values.monitoring.prometheus.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.prometheus.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.global.namespace | default .Release.Namespace }}
+{{- end }}
+{{- end }}

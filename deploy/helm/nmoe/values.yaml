@@ -1,0 +1,303 @@
+# Default values for nmoe Helm chart
+# This is a YAML-formatted file.
+
+# Override chart name
+nameOverride: ""
+fullnameOverride: ""
+
+# Global configuration
+global:
+  namespace: nmoe
+  imageRegistry: ""
+  imagePullSecrets: []
+
+# SGLang inference server configuration
+sglang:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: lmsysorg/sglang
+    tag: "v0.4.1-cu124"
+    pullPolicy: IfNotPresent
+
+  # Model configuration
+  model:
+    name: "deepseek-ai/DeepSeek-V3"
+    trustRemoteCode: true
+    dtype: "bfloat16"
+    quantization: null  # null, "fp8", "nvfp4"
+
+  # Server configuration
+  server:
+    port: 30000
+    host: "0.0.0.0"
+    apiKey: ""  # Set via secret
+    maxTotalTokens: 131072
+    contextLength: 131072
+
+  # MoE configuration
+  moe:
+    enabled: true
+    tensorParallelSize: 8
+    expertParallelSize: 1
+    enableMixedPrecision: true
+    enableTorchCompile: true
+
+  # CUDA/GPU settings
+  cuda:
+    maxSplitSize: "256m"
+    graphMemoryPool: true
+    pinnedMemory: true
+
+  resources:
+    limits:
+      nvidia.com/gpu: 8
+      memory: "512Gi"
+      cpu: "64"
+    requests:
+      nvidia.com/gpu: 8
+      memory: "256Gi"
+      cpu: "32"
+
+  # Node selector for GPU nodes
+  nodeSelector:
+    nvidia.com/gpu.product: "NVIDIA-B200"
+
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+  affinity: {}
+
+  # Probe configuration for slow-starting LLM containers
+  startupProbe:
+    enabled: true
+    initialDelaySeconds: 60
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 30  # 60 + 30*30 = 960s max startup time for large models
+    httpGet:
+      path: /health
+      port: http
+
+  # Deployment strategy - Recreate recommended for GPU workloads
+  strategy:
+    type: Recreate
+
+  # Graceful shutdown time for in-flight requests
+  terminationGracePeriodSeconds: 120
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 30000
+    annotations: {}
+
+  # Ingress configuration
+  ingress:
+    enabled: false
+    className: "nginx"
+    annotations: {}
+    hosts:
+      - host: sglang.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  # Persistence for model cache
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 500Gi
+    mountPath: /root/.cache/huggingface
+
+# SkyRL training worker configuration
+skyrl:
+  enabled: true
+  replicaCount: 1
+
+  image:
+    repository: nmoe/skyrl-worker
+    tag: "latest"
+    pullPolicy: IfNotPresent
+
+  # Training configuration
+  training:
+    algorithm: "grpo"  # grpo, ppo, dpo
+    batchSize: 32
+    gradientAccumulationSteps: 4
+    learningRate: 1.0e-5
+    numEpochs: 3
+    warmupSteps: 100
+    maxGradNorm: 1.0
+    weightDecay: 0.01
+
+  # RL-specific settings
+  rl:
+    klCoefficient: 0.01
+    clipRange: 0.2
+    valueCoefficient: 0.5
+    entropyCoefficient: 0.01
+    gamma: 0.99
+    gaeLambda: 0.95  # GAE lambda parameter (renamed from gaeλ for ASCII compatibility)
+
+  # Ray cluster settings
+  ray:
+    headServicePort: 6379
+    dashboardPort: 8265
+    numCpusPerWorker: 8
+    numGpusPerWorker: 8
+
+  resources:
+    limits:
+      nvidia.com/gpu: 8
+      memory: "512Gi"
+      cpu: "64"
+    requests:
+      nvidia.com/gpu: 8
+      memory: "256Gi"
+      cpu: "32"
+
+  nodeSelector:
+    nvidia.com/gpu.product: "NVIDIA-B200"
+
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+  affinity: {}
+
+  # Persistence for checkpoints
+  persistence:
+    enabled: true
+    storageClass: ""
+    accessMode: ReadWriteOnce
+    size: 1Ti
+    mountPath: /checkpoints
+
+# nmoe core library configuration
+nmoe:
+  # RDEP dispatcher settings
+  rdep:
+    enabled: true
+    backend: "nvshmem"  # nvshmem, ipc, gloo
+    bufferSize: 134217728  # 128MB
+    numBuffers: 4
+    enableAsyncDispatch: true
+
+  # Expert configuration
+  experts:
+    numExperts: 256
+    numActiveExperts: 8
+    numSharedExperts: 1
+    expertCapacityFactor: 1.25
+    dropTokens: false
+    auxLossCoeff: 0.001
+
+  # Memory optimization
+  memory:
+    enablePooling: true
+    poolSize: "64GB"
+    enablePrefetch: true
+    prefetchDepth: 2
+
+  # Performance settings
+  performance:
+    enableCudaGraphs: true
+    enableTorchCompile: true
+    enableFlashAttention: true
+    enableFusedKernels: true
+
+# Secrets configuration
+secrets:
+  # Create secrets or use existing
+  create: true
+
+  # HuggingFace token
+  huggingface:
+    secretName: nmoe-hf-token
+    key: HF_TOKEN
+    existingSecret: ""
+
+  # API key for authentication
+  apiKey:
+    secretName: nmoe-api-key
+    key: API_KEY
+    existingSecret: ""
+
+  # Weights & Biases
+  wandb:
+    enabled: false
+    secretName: nmoe-wandb
+    existingSecret: ""
+
+# Monitoring configuration
+monitoring:
+  enabled: true
+
+  # Prometheus settings
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      interval: 15s
+      scrapeTimeout: 10s
+
+  # Grafana dashboards
+  grafana:
+    enabled: true
+    dashboardsConfigMap: nmoe-dashboards
+
+  # Custom metrics
+  metrics:
+    port: 9090
+    path: /metrics
+
+# Network policies
+networkPolicy:
+  enabled: true
+
+  # Allow RDMA/NCCL traffic
+  rdma:
+    enabled: true
+    ports:
+      - 29500  # PyTorch distributed
+      - 12355  # NVSHMEM bootstrap
+      - 4791   # RoCEv2
+
+  # Allow ingress from specific namespaces
+  ingressNamespaces:
+    - ingress-nginx
+    - monitoring
+
+# Resource quotas (for namespace)
+resourceQuota:
+  enabled: false
+  hard:
+    requests.nvidia.com/gpu: "32"
+    requests.cpu: "256"
+    requests.memory: "2Ti"
+    limits.nvidia.com/gpu: "32"
+    limits.cpu: "512"
+    limits.memory: "4Ti"
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# Service account
+serviceAccount:
+  create: true
+  name: nmoe-service-account
+  annotations: {}
+
+# RBAC
+rbac:
+  create: true

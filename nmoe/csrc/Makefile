@@ -67,7 +67,7 @@ CUTLASS_UTIL_INCLUDE ?= $(FLASHMLA_CSRC)/cutlass/tools/util/include
 HAS_FLASHMLA := $(shell test -f $(FLASHMLA_CSRC)/sm100/prefill/dense/interface.h && test -f $(CUTLASS_INCLUDE)/cutlass/cutlass.h && echo 1 || echo 0)
 
 ifeq ($(HAS_FLASHMLA), 1)
-    FLASHMLA_INCLUDE_FLAGS := -I$(FLASHMLA_CSRC) -I$(CUTLASS_INCLUDE) -I$(CUTLASS_UTIL_INCLUDE)
+    FLASHMLA_INCLUDE_FLAGS := -I$(FLASHMLA_CSRC) -I$(FLASHMLA_CSRC)/kerutils/include -I$(CUTLASS_INCLUDE) -I$(CUTLASS_UTIL_INCLUDE)
     FLASHMLA_STATUS := enabled (FLASHMLA_HOME=$(FLASHMLA_HOME))
 else
     $(error FlashMLA not found. Clone https://github.com/deepseek-ai/FlashMLA into third_party/flashmla (with submodules) or set FLASHMLA_HOME=/path/to/FlashMLA)
@@ -82,7 +82,7 @@ MUON_TARGET := $(OPT_DIR)/muon$(PYTHON_EXT_SUFFIX)
 FLASHMLA_TARGET := flashmla_sm100$(PYTHON_EXT_SUFFIX)
 
 # RDEP sources
-RDEP_CUDA_SRCS := rdep.cu quant.cu ptx.cu adamw.cu gemm.cu g1_gate_fwd.cu g1_gate_bwd.cu $(NVSHMEM_SRCS)
+RDEP_CUDA_SRCS := rdep.cu quant.cu ptx.cu adamw.cu gemm.cu $(NVSHMEM_SRCS)
 # Compile bindings.cpp with BUILD_RDEP into a dedicated object to avoid flag clashes
 RDEP_CPP_OBJS := bindings_rdep.o
 
@@ -126,7 +126,7 @@ FLASHMLA_LDFLAGS := -shared \
 	-Wl,-rpath,$(TORCH_LIB_DIR) -Wl,-rpath,$(CUDA_HOME)/lib64
 
 # Objects
-RDEP_CUDA_OBJS := rdep.o quant.o ptx.o adamw.o gemm.o g1_gate_fwd.o g1_gate_bwd.o $(NVSHMEM_SRCS:.cu=.o)
+RDEP_CUDA_OBJS := rdep.o quant.o ptx.o adamw.o gemm.o $(NVSHMEM_SRCS:.cu=.o)
 # Explicit binding object for RDEP pybind module
 RDEP_CPP_OBJS := bindings_rdep.o
 DLINK_OBJ := dlink.o
@@ -153,8 +153,8 @@ $(RDEP_TARGET): $(RDEP_CUDA_OBJS) $(DLINK_OBJ) $(RDEP_CPP_OBJS)
 # ========== GPU telemetry module (NVML only, no CUDA) ==========
 
 $(GPU_TARGET): $(GPU_OBJS)
-	$(CXX) -o $@ $^ -shared -lnvidia-ml \
-		-L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64
+	$(CXX) -o $@ $^ -shared -l:libnvidia-ml.so.1 \
+		-L/usr/lib64 -L$(CUDA_HOME)/lib64 -Wl,-rpath,/usr/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64
 	@echo ""
 	@echo "Built $(GPU_TARGET)"
 	@echo ""

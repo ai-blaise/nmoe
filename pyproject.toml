@@ -11,9 +11,53 @@ requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "The NMoE Authors" }]
 
- # Container-first: the supported install path is via the Dockerfiles in `docker/`.
- # We intentionally do not declare a pip-first dependency graph here.
-dependencies = []
+# Container-first: the supported install path is via the Dockerfiles in `docker/`.
+# Core dependencies with pinned versions for reproducibility.
+dependencies = [
+    "numpy>=2.4.0,<3.0",
+    "safetensors>=0.7.0,<1.0",
+]
+
+[project.optional-dependencies]
+# Dev/test dependencies
+# NOTE: torch/triton must be installed separately from PyTorch nightly index:
+#   uv pip install torch==2.11.0.dev20260130+cu128 triton==3.6.0+git9844da95 \
+#     --index-url https://download.pytorch.org/whl/nightly/cu128
+# Or use: uv pip install -r requirements-dev.txt
+dev = [
+    # NVIDIA CUDA libraries
+    "nvidia-cutlass-dsl>=4.3.1,<5.0",
+    "cuda-python>=13.1.0,<14.0",
+    "cuda-bindings>=13.1.0,<14.0",
+
+    # ML libraries
+    "transformers>=4.57.0,<5.0",
+    "scipy>=1.17.0,<2.0",
+
+    # Testing
+    "pytest>=9.0.0,<10.0",
+    "pytest-cov>=7.0.0,<8.0",
+    "packaging>=24.0",
+
+    # API/Web (for SGLang serving tests)
+    "fastapi>=0.128.0,<1.0",
+    "uvicorn>=0.40.0,<1.0",
+    "openai>=2.6.0,<3.0",
+    "aiohttp>=3.13.0,<4.0",
+    "requests>=2.32.0,<3.0",
+    "pydantic>=2.12.0,<3.0",
+    "pillow>=12.0.0,<13.0",
+
+    # Dev tools
+    "ipython>=9.0.0,<10.0",
+]
+
+# Minimal test dependencies (no SGLang serving)
+test = [
+    "pytest>=9.0.0,<10.0",
+    "pytest-cov>=7.0.0,<8.0",
+    "packaging>=24.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["nmoe*"]
@@ -21,3 +65,96 @@ namespaces = true
 
 [tool.setuptools.package-data]
 "nmoe.data" = ["*.pt", "*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "-ra",
+    "--strict-markers",
+]
+markers = [
+    "gpu: marks tests as requiring GPU (deselect with '-m \"not gpu\"')",
+    "multi_gpu: marks tests as requiring multiple GPUs",
+    "distributed: marks tests as requiring distributed setup",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "nvshmem: marks tests as requiring NVSHMEM",
+    "benchmark: marks performance/benchmark tests (run with '-m benchmark')",
+    "integration: marks integration tests (run with '-m integration')",
+    "e2e: marks end-to-end pipeline tests (run with '-m e2e')",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:cutlass.*",
+    "ignore::DeprecationWarning:nvidia_cutlass_dsl.*",
+]
+
+[tool.coverage.run]
+source = ["nmoe"]
+branch = true
+omit = [
+    "tests/*",
+    "nmoe/csrc/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # function call in default argument (common in torch)
+    "B905",   # zip without strict (Python 3.10+ feature)
+    "E402",   # module level import not at top (common in torch for cuda init)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nmoe"]
+force-single-line = false
+lines-after-imports = 2
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.uv.sources]
+sglang = { path = "../sglang/python", editable = true }
+
+[dependency-groups]
+dev = [
+    "duckdb>=1.4.4",
+    "pytest-forked>=1.6.0",
+    "sglang",
+]

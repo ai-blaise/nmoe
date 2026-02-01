@@ -1,0 +1,38 @@
+{{- if and .Values.sglang.enabled .Values.sglang.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "nmoe.sglang.fullname" . }}-models
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nmoe.sglang.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.sglang.persistence.accessMode }}
+  {{- if .Values.sglang.persistence.storageClass }}
+  storageClassName: {{ .Values.sglang.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.sglang.persistence.size }}
+{{- end }}
+---
+{{- if and .Values.skyrl.enabled .Values.skyrl.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "nmoe.skyrl.fullname" . }}-checkpoints
+  namespace: {{ .Values.global.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "nmoe.skyrl.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.skyrl.persistence.accessMode }}
+  {{- if .Values.skyrl.persistence.storageClass }}
+  storageClassName: {{ .Values.skyrl.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.skyrl.persistence.size }}
+{{- end }}
