@@ -15,6 +15,55 @@ instead of NCCL all-to-all collectives on the expert path.
 
 ## Quick start
 
+### Bare-metal B200 installation
+
+For development on B200 nodes without containers:
+
+```bash
+# Clone repos (assuming sglang is sibling to nmoe)
+cd /path/to/workspace
+git clone https://github.com/ai-blaise/sglang
+git clone https://github.com/ai-blaise/nmoe
+
+# Create venv and install
+cd nmoe
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+uv pip install -e "../sglang/python"
+
+# Build sgl-kernel from source (required for B200/SM100)
+uv pip install pip
+CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5" MAX_JOBS=$(nproc) pip install ../sglang/sgl-kernel --no-build-isolation
+
+# Build nmoe C extensions
+cd nmoe/csrc
+if [ ! -f "../../third_party/flashmla/csrc/cutlass/include/cutlass/cutlass.h" ]; then
+    git clone --recursive https://github.com/deepseek-ai/FlashMLA ../../third_party/flashmla
+fi
+make -j$(nproc)
+cd ../..
+
+# Verify
+python -c "
+import torch; print(f'torch: {torch.__version__}')
+import torchao; print(f'torchao: {torchao.__version__}')
+from sgl_kernel import silu_and_mul; print('sgl_kernel: OK')
+from nmoe import Rdep, Config, Transformer; print('nmoe: OK')
+print(f'GPU: {torch.cuda.get_device_name(0)}')
+"
+```
+
+Or use the install script:
+
+```bash
+./install-b200.sh
+```
+
+**Requirements:** B200 GPU, CUDA 13.0+, Python 3.12+, uv, numactl-devel
+
+### Container installation (recommended for production)
+
 This repository is **container-first**. The supported way to build and run is via the Dockerfiles in `docker/`.
 
 Boot a machine with B200 GPUs and run a minimal single-GPU smoke test (`moonlet`) inside the training image:
@@ -185,6 +234,11 @@ One hardware target. One distribution strategy. B200 or bust.
 | `sm_100a` errors | You need B200. No workarounds. |
 | NVSHMEM init fails | Use IPC mode for single-node, or check bootstrap config |
 | OOM | Reduce `batch_size` or `seq_len` |
+| `numa.h` not found | `sudo dnf install numactl-devel` (RHEL) or `sudo apt install libnuma-dev` (Debian) |
+| CMake policy errors (CMP0169) | Use `CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"` |
+| torchao warning | Ensure torchao is from pytorch-nightly index (same date as torch) |
+| sgl-kernel build slow | Normal - 5800+ CUDA files take 15-20 min with MAX_JOBS=$(nproc) |
+| torch version mismatch | All torch packages must come from pytorch-nightly index with matching dates |
 
 ## License
 

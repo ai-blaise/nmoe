@@ -11,24 +11,41 @@ requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "The NMoE Authors" }]
 
-# Container-first: the supported install path is via the Dockerfiles in `docker/`.
-# Core dependencies with pinned versions for reproducibility.
+# Core dependencies - torch packages come from pytorch-nightly index (see [tool.uv])
 dependencies = [
     "numpy>=2.4.0,<3.0",
     "safetensors>=0.7.0,<1.0",
+    # PyTorch B200/SM100 nightly - pinned versions
+    "torch==2.11.0.dev20260202+cu128",
+    "torchvision==0.25.0.dev20260202+cu128",
+    "torchaudio==2.11.0.dev20260202+cu128",
+    "torchao==0.16.0.dev20260202+cu128",
+    "triton==3.6.0+git9844da95",
 ]
 
 [project.optional-dependencies]
+# Build dependencies for C extensions
+build = [
+    "pybind11>=2.13.0,<3.0",
+    "ninja>=1.11.0",
+    "cmake>=3.26",
+    "scikit-build-core>=0.9.0",
+]
+
 # Dev/test dependencies
-# NOTE: torch/triton must be installed separately from PyTorch nightly index:
-#   uv pip install torch==2.11.0.dev20260130+cu128 triton==3.6.0+git9844da95 \
-#     --index-url https://download.pytorch.org/whl/nightly/cu128
-# Or use: uv pip install -r requirements-dev.txt
 dev = [
+    # Build tools
+    "pybind11>=2.13.0,<3.0",
+    "ninja>=1.11.0",
+    "cmake>=3.26",
+    "scikit-build-core>=0.9.0",
+
     # NVIDIA CUDA libraries
     "nvidia-cutlass-dsl>=4.3.1,<5.0",
-    "cuda-python>=13.1.0,<14.0",
-    "cuda-bindings>=13.1.0,<14.0",
+    # cuda-python and cuda-bindings come from torch nightly (12.9.4)
+
+    # Database
+    "duckdb>=1.4.0,<2.0",
 
     # ML libraries
     "transformers>=4.57.0,<5.0",
@@ -66,6 +83,37 @@ namespaces = true
 [tool.setuptools.package-data]
 "nmoe.data" = ["*.pt", "*.json"]
 
+# uv configuration for PyTorch nightly index
+[tool.uv]
+# Use unsafe-best-match to allow packages from any index
+index-strategy = "unsafe-best-match"
+
+[tool.uv.sources]
+sglang = { path = "../sglang/python", editable = true }
+# Force torch packages from pytorch-nightly index
+torch = { index = "pytorch-nightly" }
+torchvision = { index = "pytorch-nightly" }
+torchaudio = { index = "pytorch-nightly" }
+torchao = { index = "pytorch-nightly" }
+triton = { index = "pytorch-nightly" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-nightly"
+url = "https://download.pytorch.org/whl/nightly/cu128"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "duckdb>=1.4.4",
+    "pytest-forked>=1.6.0",
+    "sglang",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
@@ -90,6 +138,7 @@ markers = [
 filterwarnings = [
     "ignore::DeprecationWarning:cutlass.*",
     "ignore::DeprecationWarning:nvidia_cutlass_dsl.*",
+    "ignore::SyntaxWarning",
 ]
 
 [tool.coverage.run]
@@ -148,13 +197,3 @@ quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
-
-[tool.uv.sources]
-sglang = { path = "../sglang/python", editable = true }
-
-[dependency-groups]
-dev = [
-    "duckdb>=1.4.4",
-    "pytest-forked>=1.6.0",
-    "sglang",
-]
