@@ -1,5 +1,5 @@
 # nmoe
-(this is was a private fork from https://github.com/Noumena-Network/nmoe)
+(This is a private fork from https://github.com/Noumena-Network/nmoe)
 ```
    _ __   _ __ ___   ___   ___
   | '_ \ | '_ ` _ \ / _ \ / _ \
