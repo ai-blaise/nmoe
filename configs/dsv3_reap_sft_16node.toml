@@ -1,0 +1,116 @@
+# DSv3 REAP-345B: 16-Node SFT Config (128 GPUs = 16 × 8 B200)
+#
+# Architecture: 128 routed experts, 8 activated, 1 shared
+#               61 layers (3 dense + 58 MoE), dim=7168, moe_inter_dim=2048
+#
+# Training: NVFP4 primary expert weights + FP8 optimizer states + ECO
+#           EP=8 / DP=16 across 128 GPUs (16 nodes × 8 B200)
+#
+# Source model: BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4A16 (NVFP4, passthrough import)
+#
+# Usage:
+#   # 1. Import NVFP4 weights (zero-loss passthrough, no re-quantization):
+#   python -m nmoe.tools.import_from_hf \
+#       --model BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4A16 \
+#       --output /home/nourdine/nmoe_checkpoints/reap345b_nvfp4_ep8/iteration_00000 \
+#       --ep-size 8
+#
+#   # 2. Distribute checkpoint to all 16 nodes:
+#   ./orchestrate.py distribute --checkpoint reap345b_nvfp4_ep8/iteration_00000
+#
+#   # 3. Launch 16-node training:
+#   ./orchestrate.py launch 10000 --config configs/dsv3_reap_sft_16node.toml
+
+preset = "dsv3_reap"
+experiment_id = "dsv3_reap_sft_16node"
+
+# =============================================================================
+# Model Architecture (REAP-345B specific)
+# =============================================================================
+vocab_size = 129280              # DeepSeek V3.2 / REAP native vocab (NOT 163840)
+eos_token_id = 1                # DeepSeek V3.2: <｜end▁of▁sentence｜> = token 1
+tokenizer = "deepseek_v3.2"     # DeepSeek V3.2 tokenizer
+dim = 7168
+inter_dim = 18432
+moe_inter_dim = 2048
+n_layers = 61
+n_dense_layers = 3              # first_k_dense_replace=3
+n_heads = 128
+n_routed_experts = 128          # REAP has 128 (NOT 256 like base V3.2)
+n_shared_experts = 1
+n_activated_experts = 8
+route_scale = 2.5
+
+# MLA (Multi-head Latent Attention)
+q_lora_rank = 1536
+kv_lora_rank = 512
+qk_nope_head_dim = 128
+qk_rope_head_dim = 64
+v_head_dim = 128
+
+# RoPE
+max_position_embeddings = 163840
+rope_theta = 10000.0
+rms_norm_eps = 1e-6
+
+# =============================================================================
+# Parallelism (EP=8 intra-node NVLink, DP=16 inter-node Ethernet)
+# =============================================================================
+ep_size = 8                      # Expert Parallelism: 128 experts / 8 = 16 per GPU
+dp_size = 16                     # Data Parallelism: 128 GPUs / 8 EP = 16 replicas
+
+# =============================================================================
+# Data
+# =============================================================================
+data_path = "/home/nourdine/nmoe_data/interactive-agent-rerolled"
+
+# =============================================================================
+# Optimizer (differentiated LR for SFT stability)
+# =============================================================================
+lr_dense = 5e-6                  # Conservative for pretrained attention/embedding weights
+lr_router = 1e-5                 # Moderate for routing decisions
+lr_expert = 2e-5                 # Higher for sparse expert FFN updates
+decay_floor = 5e-7               # Absolute LR floor (WSD scheduler decays to this)
+weight_decay = 0.01
+adam_beta1 = 0.9
+adam_beta2 = 0.98
+adam_eps = 1e-9
+
+# LR Schedule (WSD: Warmup-Sustain-Decay)
+warmup_steps = 200               # Linear warmup over 200 steps (~2% of total)
+
+# =============================================================================
+# ECO Optimizer — NVFP4 Primary + FP8 States
+# =============================================================================
+eco_enabled = true
+eco_primary_format = "nvfp4"     # NVFP4 primary weights (no BF16 master copy)
+eco_quant_format = "fp8"         # FP8 optimizer states (m=E5M2, v=E4M3)
+eco_error_feedback = true        # Error correction feedback into momentum
+eco_stochastic_rounding = true   # SR for NVFP4 E2M1 quantization
+gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a time
+
+# =============================================================================
+# Training
+# =============================================================================
+steps = 10000
+dtype = "nvfp4"
+batch_size = 256                 # Global batch size (256 / DP=16 = 16 per rank)
+seq_len = 4096
+resume = false
+grad_clip = 1.0
+
+# =============================================================================
+# Checkpointing
+# =============================================================================
+checkpoint_dir = "/home/nourdine/nmoe_checkpoints/reap345b_nvfp4_ep8"
+checkpoint_every = 250           # Every 250 steps (~60-100 min between saves)
+checkpoint_keep_last_n = 5       # Keep last 5 checkpoints, purge older
+
+# =============================================================================
+# SFT
+# =============================================================================
+sft_enabled = true
+sft_data_path = "/home/nourdine/nmoe_data/interactive-agent-rerolled"
+sft_mask_prompt_loss = true      # Only compute loss on assistant response tokens
+sft_prompt_format = "deepseekv32"
+sft_packing_enabled = false      # No packing implementation yet in nmoe
