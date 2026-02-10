@@ -154,6 +154,23 @@ extern "C" {
                                          const int32_t* offs,
                                          int E, int M_e_stride,
                                          int M_pad, int K, cudaStream_t stream);
+  cudaError_t ct_nvfp4_to_blockscaled_mma(
+      const void* ct_packed, const void* ct_scale, const void* ct_gs,
+      void* out, void* sf_mma,
+      int E, int M_ct, int K_in, int M_stride, int group_size,
+      cudaStream_t stream);
+  cudaError_t ct_nvfp4_to_blockscaled_mma_interleaved(
+      const void* ct_packed_a, const void* ct_scale_a, const void* ct_gs_a,
+      const void* ct_packed_b, const void* ct_scale_b, const void* ct_gs_b,
+      void* out, void* sf_mma,
+      int E, int M_ct, int K_in, int M_stride, int group_size,
+      cudaStream_t stream);
+  cudaError_t ct_nvfp4_to_bf16(
+      const void* ct_packed, const void* ct_scale, const void* ct_gs,
+      void* out,
+      int M, int K, int group_size,
+      int gs_stride, int expert_rows, int transpose,
+      cudaStream_t stream);
   cudaError_t swiglu_bwd_bf16(const void* h1, int ld_h1,
                               const void* h3, int ld_h3,
                               const void* dA, int ld_dA,
@@ -206,6 +223,31 @@ extern "C" {
       float lr, float beta1, float beta2,
       float weight_decay, float eps,
       float step_size, float inv_bias_correction2_sqrt,
+      cudaStream_t stream);
+  cudaError_t eco_adam_nvfp4_update(
+      void* W_packed, void* W_scale, void* W_gs,
+      void* m_data, void* m_scale, void* v_data, void* v_scale,
+      const void* grad,
+      int E, int out_dim, int in_dim, int group_size,
+      float lr, float beta1, float beta2,
+      float weight_decay, float eps,
+      float step_size, float inv_bc2_sqrt,
+      float eco_alpha,
+      int stochastic_rounding, int error_feedback,
+      unsigned int prng_seed0, unsigned int prng_seed1,
+      cudaStream_t stream);
+  cudaError_t eco_adam_nvfp4_fv_update(
+      void* W_packed, void* W_scale, void* W_gs,
+      void* m_data, void* m_scale,
+      void* v_row, void* v_col, void* v_rms,
+      const void* grad,
+      int E, int out_dim, int in_dim, int group_size,
+      float lr, float beta1, float beta2,
+      float weight_decay, float eps,
+      float step_size, float inv_bc2_sqrt,
+      float eco_alpha,
+      int stochastic_rounding, int error_feedback,
+      unsigned int prng_seed0, unsigned int prng_seed1,
       cudaStream_t stream);
 	  cudaError_t build_grouped_gemm_metadata(
 	      const int32_t* offs, int E,
@@ -673,6 +715,113 @@ PYBIND11_MODULE(rdep, m) {
       py::arg("stream") = py::none(),
       "Fused expert AdamW update + packed weight cache emission (FP8/NVFP4)");
 
+  // ========== ECO Adam NVFP4 Update (fused optimizer for NVFP4 primary weights) ==========
+  m.def(
+      "eco_adam_nvfp4_update",
+      [](uintptr_t W_packed_ptr, uintptr_t W_scale_ptr, uintptr_t W_gs_ptr,
+         uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_data_ptr, uintptr_t v_scale_ptr,
+         uintptr_t grad_ptr,
+         int E, int out_dim, int in_dim, int group_size,
+         float lr, float beta1, float beta2,
+         float weight_decay, float eps,
+         float step_size, float inv_bc2_sqrt,
+         float eco_alpha,
+         int stochastic_rounding, int error_feedback,
+         unsigned int prng_seed0, unsigned int prng_seed1,
+         py::object stream) {
+        if (E <= 0 || out_dim <= 0 || in_dim <= 0 || group_size <= 0)
+            throw std::invalid_argument("eco_adam: E, out_dim, in_dim, group_size must be positive");
+        if ((out_dim & 31) != 0 || (in_dim & 31) != 0)
+            throw std::invalid_argument("eco_adam: out_dim and in_dim must be multiples of 32");
+        if (in_dim % group_size != 0)
+            throw std::invalid_argument("eco_adam: in_dim must be divisible by group_size");
+        auto err = eco_adam_nvfp4_update(
+            reinterpret_cast<void*>(W_packed_ptr),
+            reinterpret_cast<void*>(W_scale_ptr),
+            reinterpret_cast<void*>(W_gs_ptr),
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_data_ptr),
+            reinterpret_cast<void*>(v_scale_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps,
+            step_size, inv_bc2_sqrt, eco_alpha,
+            stochastic_rounding, error_feedback,
+            prng_seed0, prng_seed1,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_adam_nvfp4_update failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("W_packed"), py::arg("W_scale"), py::arg("W_gs"),
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_data"), py::arg("v_scale"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("out_dim"), py::arg("in_dim"), py::arg("group_size"),
+      py::arg("lr"), py::arg("beta1"), py::arg("beta2"),
+      py::arg("weight_decay"), py::arg("eps"),
+      py::arg("step_size"), py::arg("inv_bc2_sqrt"),
+      py::arg("eco_alpha"),
+      py::arg("stochastic_rounding"), py::arg("error_feedback"),
+      py::arg("prng_seed0"), py::arg("prng_seed1"),
+      py::arg("stream") = py::none(),
+      "Fused ECO AdamW update for NVFP4 primary weights with FP8 optimizer states. "
+      "Zero FP32 global memory materialization — all computation in registers/shared.");
+
+  // ========== ECO Adam NVFP4 Factored-V Update (factored second moment) ==========
+  m.def(
+      "eco_adam_nvfp4_fv_update",
+      [](uintptr_t W_packed_ptr, uintptr_t W_scale_ptr, uintptr_t W_gs_ptr,
+         uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_row_ptr, uintptr_t v_col_ptr, uintptr_t v_rms_ptr,
+         uintptr_t grad_ptr,
+         int E, int out_dim, int in_dim, int group_size,
+         float lr, float beta1, float beta2,
+         float weight_decay, float eps,
+         float step_size, float inv_bc2_sqrt,
+         float eco_alpha,
+         int stochastic_rounding, int error_feedback,
+         unsigned int prng_seed0, unsigned int prng_seed1,
+         py::object stream) {
+        if (E <= 0 || out_dim <= 0 || in_dim <= 0 || group_size <= 0)
+            throw std::invalid_argument("eco_adam_fv: E, out_dim, in_dim, group_size must be positive");
+        if ((out_dim & 31) != 0 || (in_dim & 31) != 0)
+            throw std::invalid_argument("eco_adam_fv: out_dim and in_dim must be multiples of 32");
+        if (in_dim % group_size != 0)
+            throw std::invalid_argument("eco_adam_fv: in_dim must be divisible by group_size");
+        auto err = eco_adam_nvfp4_fv_update(
+            reinterpret_cast<void*>(W_packed_ptr),
+            reinterpret_cast<void*>(W_scale_ptr),
+            reinterpret_cast<void*>(W_gs_ptr),
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_row_ptr),
+            reinterpret_cast<void*>(v_col_ptr),
+            reinterpret_cast<void*>(v_rms_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps,
+            step_size, inv_bc2_sqrt, eco_alpha,
+            stochastic_rounding, error_feedback,
+            prng_seed0, prng_seed1,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_adam_nvfp4_fv_update failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("W_packed"), py::arg("W_scale"), py::arg("W_gs"),
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_row"), py::arg("v_col"), py::arg("v_rms"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("out_dim"), py::arg("in_dim"), py::arg("group_size"),
+      py::arg("lr"), py::arg("beta1"), py::arg("beta2"),
+      py::arg("weight_decay"), py::arg("eps"),
+      py::arg("step_size"), py::arg("inv_bc2_sqrt"),
+      py::arg("eco_alpha"),
+      py::arg("stochastic_rounding"), py::arg("error_feedback"),
+      py::arg("prng_seed0"), py::arg("prng_seed1"),
+      py::arg("stream") = py::none(),
+      "Fused ECO AdamW update with Adafactor-style factored second moment (v_row/v_col). "
+      "Runs factored-v reduction kernels + modified main kernel in a single call.");
+
   // ========== Quantization + Swizzle (dense / weight cache only) ==========
   m.def("quant_fp8", [](uintptr_t x_ptr, int ldx,
                         uintptr_t out_ptr, int ld_out,
@@ -743,6 +892,75 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("M_pad"), py::arg("K"),
      py::arg("stream") = py::none(),
      "BF16 -> NVFP4 (packed u16) with SFA written directly to per-expert MMA layout");
+
+  // Direct CT NVFP4 → blockscaled MMA (single source, no interleave)
+  m.def("ct_nvfp4_to_blockscaled_mma", [](
+      uintptr_t ct_packed_ptr, uintptr_t ct_scale_ptr, uintptr_t ct_gs_ptr,
+      uintptr_t out_ptr, uintptr_t sf_mma_ptr,
+      int E, int M_ct, int K_in, int M_stride, int group_size,
+      py::object stream) {
+    auto err = ct_nvfp4_to_blockscaled_mma(
+        reinterpret_cast<const void*>(ct_packed_ptr),
+        reinterpret_cast<const void*>(ct_scale_ptr),
+        reinterpret_cast<const void*>(ct_gs_ptr),
+        reinterpret_cast<void*>(out_ptr),
+        reinterpret_cast<void*>(sf_mma_ptr),
+        E, M_ct, K_in, M_stride, group_size,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("ct_nvfp4_to_blockscaled_mma failed");
+  }, py::arg("ct_packed"), py::arg("ct_scale"), py::arg("ct_gs"),
+     py::arg("out"), py::arg("sf_mma"),
+     py::arg("E"), py::arg("M_ct"), py::arg("K_in"), py::arg("M_stride"), py::arg("group_size"),
+     py::arg("stream") = py::none(),
+     "Direct compressed_tensors NVFP4 -> blockscaled MMA (single source)");
+
+  // Direct CT NVFP4 → blockscaled MMA (dual source, interleaved W1/W3)
+  m.def("ct_nvfp4_to_blockscaled_mma_interleaved", [](
+      uintptr_t ct_packed_a_ptr, uintptr_t ct_scale_a_ptr, uintptr_t ct_gs_a_ptr,
+      uintptr_t ct_packed_b_ptr, uintptr_t ct_scale_b_ptr, uintptr_t ct_gs_b_ptr,
+      uintptr_t out_ptr, uintptr_t sf_mma_ptr,
+      int E, int M_ct, int K_in, int M_stride, int group_size,
+      py::object stream) {
+    auto err = ct_nvfp4_to_blockscaled_mma_interleaved(
+        reinterpret_cast<const void*>(ct_packed_a_ptr),
+        reinterpret_cast<const void*>(ct_scale_a_ptr),
+        reinterpret_cast<const void*>(ct_gs_a_ptr),
+        reinterpret_cast<const void*>(ct_packed_b_ptr),
+        reinterpret_cast<const void*>(ct_scale_b_ptr),
+        reinterpret_cast<const void*>(ct_gs_b_ptr),
+        reinterpret_cast<void*>(out_ptr),
+        reinterpret_cast<void*>(sf_mma_ptr),
+        E, M_ct, K_in, M_stride, group_size,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("ct_nvfp4_to_blockscaled_mma_interleaved failed");
+  }, py::arg("ct_packed_a"), py::arg("ct_scale_a"), py::arg("ct_gs_a"),
+     py::arg("ct_packed_b"), py::arg("ct_scale_b"), py::arg("ct_gs_b"),
+     py::arg("out"), py::arg("sf_mma"),
+     py::arg("E"), py::arg("M_ct"), py::arg("K_in"), py::arg("M_stride"), py::arg("group_size"),
+     py::arg("stream") = py::none(),
+     "Direct compressed_tensors NVFP4 -> blockscaled MMA (dual source W1/W3 interleaved)");
+
+  // Direct CT NVFP4 → BF16 dequantization on GPU
+  m.def("ct_nvfp4_to_bf16", [](
+      uintptr_t ct_packed_ptr, uintptr_t ct_scale_ptr, uintptr_t ct_gs_ptr,
+      uintptr_t out_ptr,
+      int M, int K, int group_size,
+      int gs_stride, int expert_rows, int transpose,
+      py::object stream) {
+    auto err = ct_nvfp4_to_bf16(
+        reinterpret_cast<const void*>(ct_packed_ptr),
+        reinterpret_cast<const void*>(ct_scale_ptr),
+        reinterpret_cast<const void*>(ct_gs_ptr),
+        reinterpret_cast<void*>(out_ptr),
+        M, K, group_size, gs_stride, expert_rows, transpose,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("ct_nvfp4_to_bf16 failed");
+  }, py::arg("ct_packed"), py::arg("ct_scale"), py::arg("ct_gs"),
+     py::arg("out"),
+     py::arg("M"), py::arg("K"), py::arg("group_size"),
+     py::arg("gs_stride") = 0, py::arg("expert_rows") = 0, py::arg("transpose") = 0,
+     py::arg("stream") = py::none(),
+     "Direct compressed_tensors NVFP4 -> BF16 on GPU (no CPU dequant)");
 
   m.def("swiglu_bwd_bf16", [](uintptr_t h1_ptr, int ld_h1,
                               uintptr_t h3_ptr, int ld_h3,

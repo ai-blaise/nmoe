@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from nmoe.attention.rope import RotaryEmbedding
 from nmoe.rdep import Rdep
-from nmoe.blockscaled.grouped import quantize_weights
+from nmoe.blockscaled.grouped import quantize_weights, quantize_weights_from_nvfp4
 from nmoe.norm import RMSNorm
 from nmoe.fused_router import FusedRouterTopKDispatch
 
@@ -24,43 +24,60 @@ ATTN = {
 }
 
 
-def _validate_moe_config(config, world: int) -> None:
+def _validate_moe_config(config, ep_size: int) -> None:
   """Validate MoE configuration parameters.
 
   Args:
       config: Model configuration with MoE parameters
-      world: World size for expert parallelism
+      ep_size: Expert parallelism group size (number of GPUs sharing experts)
 
   Raises:
       ValueError: If MoE configuration is invalid
   """
   if config.n_routed_experts is None or config.n_activated_experts is None:
     raise ValueError("MoE requires n_routed_experts and n_activated_experts")
-  if config.n_routed_experts % max(1, world) != 0:
+  if config.n_routed_experts % max(1, ep_size) != 0:
     raise ValueError(
-      f"n_routed_experts ({config.n_routed_experts}) must be divisible by world_size ({world})"
+      f"n_routed_experts ({config.n_routed_experts}) must be divisible by ep_size ({ep_size})"
     )
 
 
-def _create_rdep(config, world: int) -> Rdep:
+def _get_ep_group():
+  """Get EP process group, or None if not initialized or EP=1."""
+  try:
+    from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_ep_group
+    if is_nmoe_parallel_initialized():
+      return get_ep_group()
+  except ImportError:
+    pass
+  return None
+
+
+def _create_rdep(config, ep_size: int) -> Rdep:
   """Create RDEP dispatcher for MoE layers.
+
+  Uses ep_size (not world_size) to determine local expert count. With EP=8 and
+  128 routed experts, each GPU gets 128/8 = 16 local experts.
 
   Args:
       config: Model configuration with MoE parameters
-      world: World size for expert parallelism
+      ep_size: Expert parallelism group size
 
   Returns:
       Configured Rdep instance
   """
-  _validate_moe_config(config, world)
-  n_local = config.n_routed_experts // max(1, world)
-  capacity = int(config.batch_size * config.seq_len * config.n_activated_experts)
+  _validate_moe_config(config, ep_size)
+  n_local = config.n_routed_experts // max(1, ep_size)
+  # Worst-case: every token's K experts land on a single rank after all-to-all
+  capacity = int(config.batch_size * config.seq_len * config.n_activated_experts * max(1, ep_size))
+  ep_group = _get_ep_group()
   return Rdep(
     config.dim,
     n_local,
     config.n_activated_experts,
     profile=config.dtype,
     capacity=capacity,
+    ep_group=ep_group,
   )
 
 
@@ -154,6 +171,24 @@ class MoE(nn.Module):
     self._dtype = getattr(cfg, 'dtype', 'nvfp4')
     self._use_blockscaled = self._dtype in ('fp8', 'nvfp4')
     self._W_cache = None  # QuantizedWeightsFused cache, refreshed after each optimizer step
+    self._nvfp4_primary = False  # True when NVFP4 buffers are the primary weight storage
+    self._fused_eco = None  # FusedBackwardECO controller, set by attach()
+
+    # NVFP4 compressed_tensors buffers (Option C: NVFP4 primary, no BF16 master)
+    # These are populated by checkpoint load or ECO optimizer.
+    # When _nvfp4_primary is True, these buffers ARE the weights.
+    # W1/W3/W2 nn.Parameters become transient (for autograd only).
+    self.register_buffer('_W1_packed', None, persistent=False)
+    self.register_buffer('_W1_scale', None, persistent=False)
+    self.register_buffer('_W1_gs', None, persistent=False)
+    self.register_buffer('_W3_packed', None, persistent=False)
+    self.register_buffer('_W3_scale', None, persistent=False)
+    self.register_buffer('_W3_gs', None, persistent=False)
+    self.register_buffer('_W2_packed', None, persistent=False)
+    self.register_buffer('_W2_scale', None, persistent=False)
+    self.register_buffer('_W2_gs', None, persistent=False)
+    self._nvfp4_group_size = 16
+
     n_shared = getattr(cfg, 'n_shared_experts', 0)
     self._shared = MLP(self.dim, n_shared * self.moe_inter_dim) if n_shared else None
     self.last_loads = None
@@ -173,6 +208,34 @@ class MoE(nn.Module):
     if self._use_blockscaled:
       self.refresh_weight_cache()
 
+  def has_nvfp4_buffers(self) -> bool:
+    """Check if NVFP4 primary buffers are populated."""
+    return self._nvfp4_primary and self._W1_packed is not None
+
+  def set_nvfp4_buffers(
+    self,
+    W1_packed: torch.Tensor, W1_scale: torch.Tensor, W1_gs: torch.Tensor,
+    W3_packed: torch.Tensor, W3_scale: torch.Tensor, W3_gs: torch.Tensor,
+    W2_packed: torch.Tensor, W2_scale: torch.Tensor, W2_gs: torch.Tensor,
+    group_size: int = 16,
+  ) -> None:
+    """Set NVFP4 compressed_tensors buffers as primary weights.
+
+    After calling this, refresh_weight_cache() will use these buffers
+    to build the blockscaled cache (no BF16 master weights needed).
+    """
+    self._W1_packed = W1_packed
+    self._W1_scale = W1_scale
+    self._W1_gs = W1_gs
+    self._W3_packed = W3_packed
+    self._W3_scale = W3_scale
+    self._W3_gs = W3_gs
+    self._W2_packed = W2_packed
+    self._W2_scale = W2_scale
+    self._W2_gs = W2_gs
+    self._nvfp4_group_size = group_size
+    self._nvfp4_primary = True
+
   @torch.no_grad()
   def refresh_weight_cache(self):
     """Refresh quantized weight cache. Call after optimizer step."""
@@ -181,7 +244,19 @@ class MoE(nn.Module):
       if self._W_cache is not None:
         del self._W_cache
         self._W_cache = None
-      self._W_cache = quantize_weights(self.W1, self.W3, self.W2, profile=self._dtype)
+
+      if self._nvfp4_primary and self._W1_packed is not None:
+        # Option C: Build cache from NVFP4 buffers directly (no BF16 master)
+        self._W_cache = quantize_weights_from_nvfp4(
+          self._W1_packed, self._W1_scale, self._W1_gs,
+          self._W3_packed, self._W3_scale, self._W3_gs,
+          self._W2_packed, self._W2_scale, self._W2_gs,
+          group_size=self._nvfp4_group_size,
+          profile=self._dtype,
+        )
+      else:
+        # Standard path: quantize from BF16 parameters
+        self._W_cache = quantize_weights(self.W1, self.W3, self.W2, profile=self._dtype)
 
   def _compute_aux_loss(self, gates: torch.Tensor, expert_ids: torch.Tensor, T: int) -> torch.Tensor:
     """Compute auxiliary load balancing loss.
@@ -263,9 +338,26 @@ class MoE(nn.Module):
 
     if self._use_blockscaled:
       if self._W_cache is None:
-        self._W_cache = quantize_weights(self.W1, self.W3, self.W2, profile=self._dtype)
+        self.refresh_weight_cache()
 
-      out = self._rdep.moe_blockscaled(X.bfloat16(), eid, g, self.W1, self.W3, self.W2, self._W_cache)
+      # NVFP4 primary mode: transiently populate W1/W3/W2 data from NVFP4 buffers
+      # for backward pass (STE: forward uses blockscaled cache, backward uses BF16).
+      # When fused_eco is active, skip this — backward will dequant per-layer on-the-fly
+      # from moe_ref's NVFP4 buffers, avoiding 76 GiB of simultaneous BF16 allocations.
+      if self._nvfp4_primary and self._W1_packed is not None and self._fused_eco is None:
+        from nmoe.moe import dequant_nvfp4_to_bf16_transient
+        gs = self._nvfp4_group_size
+        # W1/W3: HF [E, moe_inter_dim, dim//2] → nmoe [E, dim, moe_inter_dim]
+        self.W1.data = dequant_nvfp4_to_bf16_transient(
+          self._W1_packed, self._W1_scale, self._W1_gs, gs, transpose=True)
+        self.W3.data = dequant_nvfp4_to_bf16_transient(
+          self._W3_packed, self._W3_scale, self._W3_gs, gs, transpose=True)
+        # W2: HF [E, dim, moe_inter_dim//2] → nmoe [E, moe_inter_dim, dim]
+        self.W2.data = dequant_nvfp4_to_bf16_transient(
+          self._W2_packed, self._W2_scale, self._W2_gs, gs, transpose=True)
+
+      out = self._rdep.moe_blockscaled(X.bfloat16(), eid, g, self.W1, self.W3, self.W2, self._W_cache,
+                                        fused_eco=self._fused_eco, moe_ref=self)
     else:
       out = self._rdep.moe_bf16(X.bfloat16(), eid, g, self.W1, self.W3, self.W2)
 
@@ -352,10 +444,15 @@ class Transformer(nn.Module):
     self.config = config
     self._use_fused_router = use_fused_router
     self._gradient_checkpointing_kwargs = {"use_reentrant": False}  # Default kwargs
-    world = dist.get_world_size() if dist.is_initialized() else 1
+    # Use ep_size for expert partitioning (not world_size).
+    # With EP=8 on 128 GPUs: 128/8 = 16 local experts per GPU.
+    # With EP=1 (default): falls back to world_size for backward compatibility.
+    ep_size = getattr(config, 'ep_size', 1)
+    if ep_size <= 1:
+      # Backward compat: if no ep_size configured, use world_size (EP = world)
+      ep_size = dist.get_world_size() if dist.is_initialized() else 1
     has_moe = config.n_layers > config.n_dense_layers
-    # P3.15: Refactored MoE validation and RDEP creation into clean helper functions
-    rdep: Rdep | None = _create_rdep(config, world) if has_moe else None
+    rdep: Rdep | None = _create_rdep(config, ep_size) if has_moe else None
     self.embedding = nn.Embedding(config.vocab_size, config.dim, dtype=torch.bfloat16)
     self.rope = RotaryEmbedding(
       head_dim=config.qk_rope_head_dim,
@@ -450,7 +547,11 @@ class Transformer(nn.Module):
       if moe_layers:
         loads = torch.stack([m.last_loads for m in moe_layers], dim=0)
         if dist.is_available() and dist.is_initialized():
-          dist.all_reduce(loads, op=dist.ReduceOp.SUM)
+          # Use EP group for load balancing AllReduce (not WORLD).
+          # Load counts should be aggregated across EP ranks that share
+          # the same expert partition, not across DP replicas.
+          ep_group = _get_ep_group()
+          dist.all_reduce(loads, op=dist.ReduceOp.SUM, group=ep_group)
         loads = loads / loads.sum(dim=-1, keepdim=True).clamp_min(1.0)
         for m, l in zip(moe_layers, loads):
           m.last_loads = l

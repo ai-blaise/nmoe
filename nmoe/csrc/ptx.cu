@@ -202,6 +202,202 @@ __device__ __forceinline__ void e2m1x4_packed_to_f32x4(uint16_t, float& x0, floa
 #endif // NMOE_ENABLE_PTX_E2M1
 
 // ============================================================================
+// FP8 E5M2 Conversion
+// ============================================================================
+// E5M2: 5 exponent + 2 mantissa bits. Max = 57344.0 (2^15 * 1.75).
+// bias = 15, subnormal threshold at exponent 0.
+// Used for ECO momentum (exp_avg) storage.
+
+#if NMOE_HAS_CUDA_FP8
+
+__device__ __forceinline__ uint8_t f32_to_e5m2_byte(float x) {
+    __nv_fp8_e5m2 v = __nv_fp8_e5m2(x);
+    return *reinterpret_cast<uint8_t*>(&v);
+}
+
+__device__ __forceinline__ float e5m2_byte_to_f32(uint8_t b) {
+    __nv_fp8_e5m2 v = *reinterpret_cast<__nv_fp8_e5m2*>(&b);
+    return static_cast<float>(v);
+}
+
+#else
+
+__device__ __forceinline__ uint8_t f32_to_e5m2_byte(float) {
+    __trap();
+    return 0;
+}
+
+__device__ __forceinline__ float e5m2_byte_to_f32(uint8_t) {
+    __trap();
+    return 0.0f;
+}
+
+#endif // NMOE_HAS_CUDA_FP8
+
+// ============================================================================
+// Philox-4x32-10 PRNG
+// ============================================================================
+// Minimal implementation for stochastic rounding in CUDA kernels.
+// Philox is a counter-based RNG: given (counter, key), produces 4 uint32 outputs.
+// Properties:
+//   - Stateless: just increment counter for next batch of randoms
+//   - Parallel-safe: different threads use different counters
+//   - Quality: passes BigCrush (TestU01) and PractRand
+//
+// Reference: Salmon et al., "Parallel Random Numbers: As Easy as 1, 2, 3"
+//            (SC 2011), Section 3.3.
+
+struct Philox4x32 {
+    uint32_t ctr[4];
+    uint32_t key[2];
+};
+
+// Philox round function: multiply-then-xor with Weyl sequence key schedule.
+__device__ __forceinline__ void philox_round(uint32_t* ctr, const uint32_t* key) {
+    // Philox multiplier constants (from the paper)
+    constexpr uint32_t M0 = 0xD2511F53u;
+    constexpr uint32_t M1 = 0xCD9E8D57u;
+
+    uint32_t hi0, lo0, hi1, lo1;
+    lo0 = ctr[0] * M0;
+    hi0 = __umulhi(ctr[0], M0);
+    lo1 = ctr[2] * M1;
+    hi1 = __umulhi(ctr[2], M1);
+
+    ctr[0] = hi1 ^ ctr[1] ^ key[0];
+    ctr[1] = lo1;
+    ctr[2] = hi0 ^ ctr[3] ^ key[1];
+    ctr[3] = lo0;
+}
+
+// Generate 4 uniform uint32 values from (counter, seed).
+// counter: 4x32 counter (typically {element_idx, thread_id, step, param_offset})
+// seed: 2x32 key
+__device__ __forceinline__ void philox4x32_10(
+    uint32_t out[4],
+    const uint32_t counter[4],
+    uint32_t seed0, uint32_t seed1)
+{
+    // Weyl sequence constants for key schedule
+    constexpr uint32_t W0 = 0x9E3779B9u;  // golden ratio
+    constexpr uint32_t W1 = 0xBB67AE85u;  // sqrt(3)-1
+
+    uint32_t ctr[4] = {counter[0], counter[1], counter[2], counter[3]};
+    uint32_t key[2] = {seed0, seed1};
+
+    // 10 rounds
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key); key[0] += W0; key[1] += W1;
+    philox_round(ctr, key);
+
+    out[0] = ctr[0];
+    out[1] = ctr[1];
+    out[2] = ctr[2];
+    out[3] = ctr[3];
+}
+
+// Convert uint32 to uniform float in [0, 1)
+__device__ __forceinline__ float uint32_to_uniform(uint32_t x) {
+    // Divide by 2^32 using the standard method
+    return __uint_as_float((x >> 9) | 0x3F800000u) - 1.0f;
+}
+
+// ============================================================================
+// NVFP4 E2M1 Stochastic Rounding Helpers
+// ============================================================================
+// E2M1 grid: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+// For stochastic rounding, we need floor/ceil on this grid.
+
+// E2M1 grid as device constant (indexed by unsigned 3-bit code)
+// Code: 0=0.0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
+__device__ __forceinline__ float e2m1_grid(int idx) {
+    constexpr float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    return grid[idx & 7];
+}
+
+// Find floor grid index for |x_scaled| (already divided by block scale).
+// Returns index in [0,7] such that grid[idx] <= |x_scaled| < grid[idx+1].
+// For x >= 6.0, returns 7 (saturated).
+__device__ __forceinline__ int e2m1_floor_idx(float ax) {
+    // Binary search over 8-element grid
+    if (ax < 1.0f) {
+        return (ax < 0.5f) ? 0 : 1;
+    } else if (ax < 2.0f) {
+        return (ax < 1.5f) ? 2 : 3;
+    } else if (ax < 4.0f) {
+        return (ax < 3.0f) ? 4 : 5;
+    } else {
+        return (ax < 6.0f) ? 6 : 7;
+    }
+}
+
+// Stochastic-round a single scaled float to E2M1 nibble (4-bit, sign+3bit mag).
+// ax = |x_scaled| (already divided by block scale)
+// sign_bit = (x < 0) ? 0x8 : 0x0
+// rand_u = uniform random in [0, 1)
+// Returns: 4-bit E2M1 code (sign in bit 3, magnitude in bits 0-2)
+__device__ __forceinline__ uint8_t e2m1_stochastic_round(float ax, uint8_t sign_bit, float rand_u) {
+    ax = fminf(ax, 6.0f);  // clamp to E2M1 max
+    int floor_i = e2m1_floor_idx(ax);
+    float floor_v = e2m1_grid(floor_i);
+
+    if (floor_i >= 7) {
+        // Saturated at max
+        return sign_bit | 7;
+    }
+
+    int ceil_i = floor_i + 1;
+    float ceil_v = e2m1_grid(ceil_i);
+    float gap = ceil_v - floor_v;
+
+    // Probability of rounding up = (ax - floor) / gap
+    // If gap is 0 (shouldn't happen with distinct grid), just use floor
+    float frac = (gap > 0.0f) ? (ax - floor_v) / gap : 0.0f;
+    int idx = (rand_u < frac) ? ceil_i : floor_i;
+
+    return sign_bit | static_cast<uint8_t>(idx);
+}
+
+// Round-to-nearest a single scaled float to E2M1 nibble.
+__device__ __forceinline__ uint8_t e2m1_round_nearest(float ax, uint8_t sign_bit) {
+    ax = fminf(ax, 6.0f);
+    int floor_i = e2m1_floor_idx(ax);
+    float floor_v = e2m1_grid(floor_i);
+
+    if (floor_i >= 7) return sign_bit | 7;
+
+    int ceil_i = floor_i + 1;
+    float ceil_v = e2m1_grid(ceil_i);
+
+    float dist_floor = ax - floor_v;
+    float dist_ceil = ceil_v - ax;
+    int idx = (dist_ceil < dist_floor) ? ceil_i : floor_i;
+
+    return sign_bit | static_cast<uint8_t>(idx);
+}
+
+// Pack two 4-bit E2M1 nibbles into one uint8 byte.
+// lo goes in bits [3:0], hi goes in bits [7:4].
+__device__ __forceinline__ uint8_t pack_e2m1_2x4(uint8_t lo, uint8_t hi) {
+    return (hi << 4) | (lo & 0xF);
+}
+
+// Dequant E2M1 nibble to float (for error computation in ECO).
+// nibble: 4-bit code (sign in bit 3, magnitude in bits 0-2)
+// Returns: signed float value (before scaling by block scale)
+__device__ __forceinline__ float e2m1_nibble_to_f32(uint8_t nibble) {
+    float val = e2m1_grid(nibble & 0x7);
+    return (nibble & 0x8) ? -val : val;
+}
+
+// ============================================================================
 // Pack Helpers
 // ============================================================================
 

@@ -741,6 +741,565 @@ class Checkpointer:
 """Split‑format checkpointing utilities (no legacy paths)."""
 
 
+# =============================================================================
+# NVFP4 Compressed-Tensors Dequantization (for imported checkpoints)
+# =============================================================================
+# The HuggingFace NVFP4 compressed_tensors format stores each quantized weight
+# as a triplet:
+#   - weight_packed:       [*, out_features, in_features // 2]  uint8  (2 E2M1 nibbles per byte)
+#   - weight_scale:        [*, out_features, in_features // 16] float8_e4m3fn  (group_size=16)
+#   - weight_global_scale: [*, 1]                               float32
+#
+# Dequantization formula:
+#   bf16_weight = unpack_e2m1(weight_packed) * weight_scale * weight_global_scale
+#
+# E2M1 nibble encoding (4 bits: 1 sign + 2 exponent + 1 mantissa):
+#   Positive values: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
+#   nibble -> value lookup table (unsigned):
+#     0b0000=0, 0b0001=0.5, 0b0010=1.0, 0b0011=1.5,
+#     0b0100=2.0, 0b0101=3.0, 0b0110=4.0, 0b0111=6.0
+#   High bit is sign: 0b1xxx = negative
+
+# E2M1 unsigned lookup table (nibble value 0-7 -> float)
+_E2M1_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+
+
+def _unpack_e2m1_to_float(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 packed NVFP4 E2M1 nibbles to float32.
+
+    Each uint8 byte contains 2 FP4 values:
+      - Low nibble  (bits 0-3): first value
+      - High nibble (bits 4-7): second value
+
+    Within each nibble: bit 3 is sign, bits 0-2 are unsigned magnitude index.
+
+    Args:
+        packed: [..., N] uint8 tensor with 2 FP4 values per byte.
+
+    Returns:
+        [..., 2*N] float32 tensor with dequantized values.
+    """
+    lut = _E2M1_LUT.to(packed.device)
+
+    # Extract nibbles
+    lo = (packed & 0x0F).to(torch.int32)  # low nibble: first value
+    hi = ((packed >> 4) & 0x0F).to(torch.int32)  # high nibble: second value
+
+    # Separate sign (bit 3) and magnitude (bits 0-2)
+    lo_sign = ((lo >> 3) & 1).float() * (-2.0) + 1.0  # 0 -> +1, 1 -> -1
+    lo_mag = lo & 0x07
+    hi_sign = ((hi >> 3) & 1).float() * (-2.0) + 1.0
+    hi_mag = hi & 0x07
+
+    # Look up magnitude values
+    lo_val = lut[lo_mag.long()] * lo_sign
+    hi_val = lut[hi_mag.long()] * hi_sign
+
+    # Interleave: [lo_0, hi_0, lo_1, hi_1, ...]
+    out_shape = list(packed.shape)
+    out_shape[-1] *= 2
+    out = torch.empty(out_shape, dtype=torch.float32, device=packed.device)
+    out[..., 0::2] = lo_val
+    out[..., 1::2] = hi_val
+
+    return out
+
+
+def dequantize_compressed_tensors_nvfp4(
+    weight_packed: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    group_size: int = 16,
+) -> torch.Tensor:
+    """Dequantize an NVFP4 compressed_tensors triplet to BF16.
+
+    Formula (from compressed_tensors library):
+        effective_scale = weight_scale / weight_global_scale
+        bf16 = unpack_e2m1(packed) * effective_scale
+
+    The global_scale is a divisor of the per-group scale (not a multiplier).
+    This matches the compressed_tensors _dequantize() implementation:
+        scale = scale / global_scale
+        dequant_value = x_q * scale
+
+    The scale is per-group (group_size elements share one E4M3 scale factor).
+    The global_scale is a single FP32 scalar per tensor.
+
+    Args:
+        weight_packed: [..., out_dim, in_dim // 2] uint8 (2 FP4 per byte).
+        weight_scale:  [..., out_dim, in_dim // group_size] float8_e4m3fn.
+        weight_global_scale: [..., 1] float32.
+        group_size: Number of elements per scale group (default 16).
+
+    Returns:
+        [..., out_dim, in_dim] bfloat16 weight tensor.
+    """
+    # Step 1: Unpack E2M1 nibbles to float32
+    # packed shape: [..., out_dim, in_dim//2]
+    # unpacked shape: [..., out_dim, in_dim]
+    unpacked = _unpack_e2m1_to_float(weight_packed)
+
+    # Step 2: Compute effective scale = weight_scale / weight_global_scale
+    # weight_scale is float8_e4m3fn — convert to float32
+    scale_f32 = weight_scale.float()  # [..., out_dim, in_dim // group_size]
+
+    # Apply global scale as divisor (compressed_tensors convention)
+    global_scale = weight_global_scale.float()
+    # Broadcast global_scale to match scale dimensions
+    while global_scale.ndim < scale_f32.ndim:
+        global_scale = global_scale.unsqueeze(-1)
+    effective_scale = scale_f32 / global_scale.clamp(min=1e-10)
+
+    # Step 3: Apply per-group effective scales
+    # Reshape unpacked into groups: [..., out_dim, n_groups, group_size]
+    orig_shape = unpacked.shape
+    n_groups = effective_scale.shape[-1]
+    grouped = unpacked.reshape(*orig_shape[:-1], n_groups, group_size)
+    # effective_scale: [..., out_dim, n_groups] -> [..., out_dim, n_groups, 1]
+    scaled = grouped * effective_scale.unsqueeze(-1)
+    # Reshape back: [..., out_dim, in_dim]
+    dequantized = scaled.reshape(orig_shape)
+
+    return dequantized.to(torch.bfloat16)
+
+
+def dequantize_nvfp4_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+    group_size: int = 16,
+    print_fn=print,
+) -> Dict[str, torch.Tensor]:
+    """Dequantize all NVFP4 triplets in a state dict to BF16 parameters.
+
+    DEPRECATED: CPU fallback path. Use dequantize_nvfp4_to_model_gpu() for
+    GPU-native dequantization that avoids CPU float32 intermediates.
+
+    Scans for keys ending in '.weight_packed', finds matching '.weight_scale'
+    and '.weight_global_scale', dequantizes the triplet, and replaces with
+    a single BF16 tensor under the base key (with '.weight' suffix for Linear
+    layers, or without suffix for Parameter-style expert weights).
+
+    Args:
+        state_dict: State dict potentially containing NVFP4 triplets.
+        group_size: NVFP4 group size (default 16).
+        print_fn: Logging function.
+
+    Returns:
+        New state dict with NVFP4 triplets replaced by BF16 tensors.
+    """
+    # Find all weight_packed keys
+    packed_keys = [k for k in state_dict if k.endswith('.weight_packed')]
+    if not packed_keys:
+        return state_dict  # No NVFP4 data
+
+    result = {}
+    consumed = set()
+    dequant_count = 0
+
+    for pk in packed_keys:
+        base = pk[:-len('.weight_packed')]
+        sk = base + '.weight_scale'
+        gk = base + '.weight_global_scale'
+
+        if sk not in state_dict or gk not in state_dict:
+            print_fn(f"[nvfp4] WARNING: Incomplete triplet for {base}, "
+                     f"missing scale={sk not in state_dict} global_scale={gk not in state_dict}")
+            # Keep original keys
+            result[pk] = state_dict[pk]
+            continue
+
+        # Dequantize
+        bf16_weight = dequantize_compressed_tensors_nvfp4(
+            state_dict[pk], state_dict[sk], state_dict[gk], group_size,
+        )
+
+        # Determine output key and whether transpose is needed:
+        base_parts = base.split('.')
+        last_part = base_parts[-1] if base_parts else ''
+
+        if last_part in ('W1', 'W3', 'W2'):
+            out_key = base
+            if bf16_weight.ndim >= 2:
+                bf16_weight = bf16_weight.transpose(-1, -2).contiguous()
+        else:
+            out_key = base + '.weight'
+
+        result[out_key] = bf16_weight
+        consumed.add(pk)
+        consumed.add(sk)
+        consumed.add(gk)
+        dequant_count += 1
+
+    # Copy non-triplet keys
+    for k, v in state_dict.items():
+        if k not in consumed and k not in result:
+            result[k] = v
+
+    if dequant_count > 0:
+        print_fn(f"[nvfp4] Dequantized {dequant_count} NVFP4 triplets to BF16 (CPU fallback)")
+
+    return result
+
+
+def dequantize_nvfp4_to_model_gpu(
+    state_dict: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    group_size: int = 16,
+    print_fn=print,
+) -> Dict[str, torch.Tensor]:
+    """Dequantize NVFP4 triplets directly on GPU via CUDA kernel.
+
+    Instead of creating float32 intermediates on CPU, this function:
+    1. Moves each NVFP4 triplet (packed, scale, global_scale) to GPU
+    2. Runs ct_nvfp4_to_bf16 CUDA kernel to dequant in registers
+    3. Writes BF16 result directly to the model parameter on GPU
+    4. Returns remaining non-NVFP4 keys for standard load_state_dict
+
+    Zero CPU float32 intermediates. All arithmetic happens in GPU registers.
+
+    Args:
+        state_dict: State dict with NVFP4 triplets (from torch.load on CPU).
+        model: Model with parameters already on GPU (after .cuda()).
+        group_size: NVFP4 group size (default 16).
+        print_fn: Logging function.
+
+    Returns:
+        State dict with NVFP4 triplets removed (only non-NVFP4 keys remain).
+        These should be loaded via model.load_state_dict(result, strict=False).
+    """
+    from nmoe.csrc import rdep as _rdep_ext
+    if not hasattr(_rdep_ext, 'ct_nvfp4_to_bf16'):
+        raise RuntimeError(
+            "[nvfp4] ct_nvfp4_to_bf16 CUDA kernel not available in rdep extension. "
+            "Rebuild nmoe with NMOE_ENABLE_PTX_E2M1=1 and sm_100a target. "
+            "CPU dequant fallback has been removed."
+        )
+
+    packed_keys = [k for k in state_dict if k.endswith('.weight_packed')]
+    if not packed_keys:
+        return state_dict
+
+    # Build name → parameter mapping for direct GPU writes
+    param_map = {n: p for n, p in model.named_parameters()}
+    # Also include buffers (some weights might be registered as buffers)
+    for n, b in model.named_buffers():
+        if n not in param_map:
+            param_map[n] = b
+
+    result = {}
+    consumed = set()
+    gpu_count = 0
+    stream = torch.cuda.current_stream()
+
+    for pk in packed_keys:
+        base = pk[:-len('.weight_packed')]
+        sk = base + '.weight_scale'
+        gk = base + '.weight_global_scale'
+
+        if sk not in state_dict or gk not in state_dict:
+            print_fn(f"[nvfp4] WARNING: Incomplete triplet for {base}")
+            result[pk] = state_dict[pk]
+            continue
+
+        packed_cpu = state_dict[pk]    # [..., out_dim, in_dim//2] uint8
+        scale_cpu = state_dict[sk]     # [..., out_dim, n_groups] float8_e4m3fn
+        gs_cpu = state_dict[gk]        # scalar or [...] float32
+
+        # Determine output key and transpose requirement
+        base_parts = base.split('.')
+        last_part = base_parts[-1] if base_parts else ''
+
+        if last_part in ('W1', 'W3', 'W2'):
+            out_key = base
+            need_transpose = True
+        else:
+            out_key = base + '.weight'
+            need_transpose = False
+
+        # Get target device from model parameter
+        target_param = param_map.get(out_key)
+        if target_param is None:
+            # Parameter not found in model — skip (might be pruned or renamed)
+            print_fn(f"[nvfp4] WARNING: No model parameter for {out_key}, skipping GPU dequant")
+            result[pk] = state_dict[pk]
+            result[sk] = state_dict[sk]
+            result[gk] = state_dict[gk]
+            continue
+
+        device = target_param.device
+        if not device.type == 'cuda':
+            raise RuntimeError(
+                f"[nvfp4] Model parameter {out_key} is on {device}, not CUDA. "
+                f"Model must be on GPU before loading NVFP4 checkpoint. "
+                f"CPU dequant fallback has been removed."
+            )
+
+        # Move triplet to GPU (small: NVFP4 is 4x compressed)
+        packed_gpu = packed_cpu.to(device=device, non_blocking=True)
+        scale_gpu = scale_cpu.to(device=device, non_blocking=True)
+        gs_gpu = gs_cpu.to(device=device, dtype=torch.float32, non_blocking=True)
+
+        # Determine dimensions
+        # packed shape: [..., M, K/2] where M = out_dim, K = in_dim
+        M = packed_gpu.shape[-2] if packed_gpu.ndim >= 2 else packed_gpu.shape[0]
+        K = packed_gpu.shape[-1] * 2  # Each byte holds 2 elements
+
+        # For batched tensors (e.g. expert weights [E, M, K/2])
+        if packed_gpu.ndim == 3:
+            E = packed_gpu.shape[0]
+            total_M = E * M
+            # Flatten to [E*M, K/2] for the kernel
+            packed_flat = packed_gpu.reshape(total_M, K // 2).contiguous()
+            n_groups = K // group_size
+            scale_flat = scale_gpu.view(torch.uint8).reshape(total_M, n_groups).contiguous()
+            # Per-expert global scale
+            gs_flat = gs_gpu.reshape(E).contiguous()
+            gs_stride = 1
+            expert_rows = M
+        elif packed_gpu.ndim == 2:
+            total_M = M
+            packed_flat = packed_gpu.contiguous()
+            n_groups = K // group_size
+            scale_flat = scale_gpu.view(torch.uint8).reshape(total_M, n_groups).contiguous()
+            gs_flat = gs_gpu.reshape(1).contiguous()
+            gs_stride = 0
+            expert_rows = 0
+        else:
+            raise RuntimeError(
+                f"[nvfp4] Unexpected tensor shape for {out_key}: packed.ndim={packed_gpu.ndim}. "
+                f"Expected 2D [M, K/2] or 3D [E, M, K/2]. CPU dequant fallback has been removed."
+            )
+
+        # Allocate BF16 output on GPU
+        if need_transpose:
+            # Output transposed: [K, total_M] then reshape
+            out_bf16 = torch.empty(K, total_M, dtype=torch.bfloat16, device=device)
+        else:
+            out_bf16 = torch.empty(total_M, K, dtype=torch.bfloat16, device=device)
+
+        # Run GPU kernel
+        stream = torch.cuda.current_stream(device)
+        _rdep_ext.ct_nvfp4_to_bf16(
+            packed_flat.data_ptr(), scale_flat.data_ptr(), gs_flat.data_ptr(),
+            out_bf16.data_ptr(),
+            total_M, K, group_size,
+            gs_stride, expert_rows, 1 if need_transpose else 0,
+            stream,
+        )
+
+        # Reshape output to match model parameter shape
+        if packed_gpu.ndim == 3 and need_transpose:
+            # [K, E*M] → [E, K, M] → matches model [E, in_dim, out_dim]
+            out_bf16 = out_bf16.reshape(K, E, M).permute(1, 0, 2).contiguous()
+        elif packed_gpu.ndim == 3 and not need_transpose:
+            out_bf16 = out_bf16.reshape(E, M, K)
+        # For 2D: already [M, K] or [K, M]
+
+        # Write directly to model parameter
+        if target_param.shape == out_bf16.shape:
+            target_param.data.copy_(out_bf16)
+        else:
+            # Shape mismatch — try to reshape
+            try:
+                target_param.data.copy_(out_bf16.reshape(target_param.shape))
+            except RuntimeError:
+                print_fn(f"[nvfp4] WARNING: Shape mismatch for {out_key}: "
+                         f"kernel output {out_bf16.shape} vs param {target_param.shape}")
+                result[out_key] = out_bf16.cpu()
+
+        # Free GPU temporaries
+        del packed_gpu, scale_gpu, gs_gpu, packed_flat, scale_flat, gs_flat, out_bf16
+
+        consumed.update([pk, sk, gk])
+        gpu_count += 1
+
+    # Copy non-NVFP4 keys for standard load_state_dict
+    for k, v in state_dict.items():
+        if k not in consumed and k not in result:
+            result[k] = v
+
+    if gpu_count > 0:
+        print_fn(f"[nvfp4] GPU dequantized {gpu_count} NVFP4 triplets → BF16 (CUDA kernel, zero CPU intermediates)")
+
+    return result
+
+
+def _is_nvfp4_checkpoint(state: dict) -> bool:
+    """Check if a checkpoint contains NVFP4 compressed_tensors data."""
+    return state.get('nvfp4_format') == 'compressed_tensors'
+
+
+def _has_nvfp4_triplets(state_dict: dict) -> bool:
+    """Check if state dict contains NVFP4 triplets (weight_packed keys)."""
+    return any(k.endswith('.weight_packed') for k in state_dict)
+
+
+def _get_nvfp4_group_size(state: dict) -> int:
+    """Get NVFP4 group size from checkpoint metadata."""
+    return int(state.get('nvfp4_group_size', 16))
+
+
+def load_nvfp4_expert_buffers(
+    expert_sd: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+    group_size: int = 16,
+    print_fn=print,
+) -> bool:
+    """Load NVFP4 triplets directly into MoE module buffers (no dequant).
+
+    This is the Option C path: NVFP4 primary weights with no BF16 master.
+    Expert NVFP4 triplets are loaded to GPU and assigned as registered buffers.
+    The blockscaled weight cache is built from these buffers directly.
+
+    Args:
+        expert_sd: State dict containing NVFP4 triplets (weight_packed/scale/global_scale)
+        model: Model with MoE modules
+        group_size: NVFP4 group size
+        print_fn: Logging function
+
+    Returns:
+        True if NVFP4 buffers were loaded, False if no NVFP4 data found
+    """
+    from nmoe.model import MoE
+
+    # Find NVFP4 triplets for expert weights
+    packed_keys = [k for k in expert_sd if k.endswith('.weight_packed')]
+    if not packed_keys:
+        return False
+
+    # Build mapping: base_name -> (packed, scale, global_scale)
+    triplets = {}
+    for pk in packed_keys:
+        base = pk[:-len('.weight_packed')]
+        sk = base + '.weight_scale'
+        gk = base + '.weight_global_scale'
+        if sk in expert_sd and gk in expert_sd:
+            triplets[base] = (expert_sd[pk], expert_sd[sk], expert_sd[gk])
+
+    if not triplets:
+        return False
+
+    # Map base names to MoE modules
+    # Key format: blocks.{layer_id}.ffn.{W1|W3|W2}
+    moe_modules = {}
+    for block in getattr(model, 'blocks', []):
+        ffn = getattr(block, 'ffn', None)
+        if ffn is not None and isinstance(ffn, MoE):
+            moe_modules[block.layer_id] = ffn
+
+    loaded_count = 0
+    for base, (packed, scale, gs) in triplets.items():
+        parts = base.split('.')
+        # Expected: blocks.{N}.ffn.{W1|W3|W2}
+        try:
+            layer_idx = int(parts[1])
+            param_name = parts[3]  # W1, W3, or W2
+        except (IndexError, ValueError):
+            continue
+
+        if param_name not in ('W1', 'W3', 'W2'):
+            continue
+
+        moe = moe_modules.get(layer_idx)
+        if moe is None:
+            continue
+
+        # Move triplet to GPU
+        device = moe.W1.device
+        packed_gpu = packed.to(device=device, non_blocking=True)
+        scale_gpu = scale.to(device=device, non_blocking=True)
+        gs_gpu = gs.to(device=device, dtype=torch.float32, non_blocking=True)
+
+        # Set buffer on MoE module
+        setattr(moe, f'_{param_name}_packed', packed_gpu)
+        setattr(moe, f'_{param_name}_scale', scale_gpu)
+        setattr(moe, f'_{param_name}_gs', gs_gpu)
+        loaded_count += 1
+
+    if loaded_count > 0:
+        # Enable NVFP4 primary mode, free BF16 expert params, defer cache build.
+        #
+        # During checkpoint load, GPU holds ~76 GiB of BF16 expert params + ~32 GiB
+        # dense + ~5 GiB RDEP = ~113 GiB.  Building the blockscaled weight cache
+        # (refresh_weight_cache) requires ~1.4 GiB transient per layer for the
+        # NVFP4 → BF16 → MMA conversion, which can cause GPU OOM/Xid 43 crashes.
+        #
+        # Instead: free BF16 expert params immediately (reclaiming ~76 GiB), and
+        # let the cache be built lazily on the first forward pass via model.py's
+        # `if self._W_cache is None: self.refresh_weight_cache()`.  By forward time,
+        # the freed BF16 memory provides ample headroom for cache construction.
+        freed_bytes = 0
+        for moe in moe_modules.values():
+            if moe._W1_packed is not None:
+                moe._nvfp4_primary = True
+                moe._nvfp4_group_size = group_size
+                # Do NOT call refresh_weight_cache() here — defer to first forward
+                # pass when GPU memory pressure is much lower.
+                moe._W_cache = None
+
+                # Free BF16 expert parameters — they're redundant with NVFP4 buffers.
+                # Forward uses _W_cache (blockscaled MMA). Backward dequants from NVFP4
+                # buffers on-the-fly. Gradients are consumed by fused_eco directly.
+                # Replace parameter data with empty placeholder to preserve the
+                # nn.Parameter object (needed for optimizer param groups) while freeing
+                # the ~76 GiB of BF16 expert weight data.
+                dev = moe.W1.device
+                for param_name in ('W1', 'W3', 'W2'):
+                    param = getattr(moe, param_name)
+                    freed_bytes += param.data.nelement() * param.data.element_size()
+                    param.data = torch.empty(0, dtype=torch.bfloat16, device=dev)
+                    param.requires_grad_(False)
+
+        freed_gib = freed_bytes / (1024 ** 3)
+        print_fn(f"[nvfp4] Loaded {loaded_count} NVFP4 triplets directly to GPU buffers "
+                 f"(Option C: NVFP4 primary, no BF16 master)")
+        if freed_bytes > 0:
+            print_fn(f"[nvfp4] Freed {freed_gib:.1f} GiB of redundant BF16 expert parameters")
+        print_fn(f"[nvfp4] Weight cache deferred to first forward pass (lazy build)")
+        return True
+
+    return False
+
+
+def extract_nvfp4_expert_buffers(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """Extract NVFP4 buffer triplets from MoE modules for checkpointing.
+
+    When MoE modules are in NVFP4 primary mode, the NVFP4 buffers are the
+    authoritative weights. This function extracts them in compressed_tensors
+    format for saving.
+
+    Args:
+        model: Model with MoE modules in NVFP4 primary mode
+
+    Returns:
+        State dict with NVFP4 triplets, or empty dict if not in NVFP4 primary mode
+    """
+    from nmoe.model import MoE
+
+    result = {}
+    for block in getattr(model, 'blocks', []):
+        ffn = getattr(block, 'ffn', None)
+        if ffn is None or not isinstance(ffn, MoE):
+            continue
+        if not getattr(ffn, '_nvfp4_primary', False):
+            continue
+
+        layer_id = block.layer_id
+        for param_name in ('W1', 'W3', 'W2'):
+            packed = getattr(ffn, f'_{param_name}_packed', None)
+            scale = getattr(ffn, f'_{param_name}_scale', None)
+            gs = getattr(ffn, f'_{param_name}_gs', None)
+            if packed is None:
+                continue
+            prefix = f'blocks.{layer_id}.ffn.{param_name}'
+            result[f'{prefix}.weight_packed'] = packed
+            result[f'{prefix}.weight_scale'] = scale
+            result[f'{prefix}.weight_global_scale'] = gs
+
+    return result
+
+
 def _split_param_names(model: torch.nn.Module) -> Tuple[Set[str], Set[str]]:
     """Return (dense_names, expert_names) using model.param_sets(), if available."""
     dense_names: Set[str] = set()
@@ -789,9 +1348,18 @@ def build_states(
     full_sd = model.state_dict()
     dense_names, expert_names = _split_param_names(model)
 
+    # Check if model is in NVFP4 primary mode
+    # If so, save NVFP4 buffers instead of BF16 expert parameters
+    nvfp4_expert_sd = extract_nvfp4_expert_buffers(model)
+    if nvfp4_expert_sd:
+        # Option C: Save NVFP4 buffers as expert state (compressed_tensors format)
+        expert_sd = nvfp4_expert_sd
+    else:
+        # Standard: Save BF16 expert parameters
+        expert_sd = {k: v for k, v in full_sd.items() if k in expert_names}
+
     # Keep all non-expert state (including buffers) in rd.pt for correctness.
     # Only expert weights are sharded across ranks.
-    expert_sd = {k: v for k, v in full_sd.items() if k in expert_names}
     dense_sd = {k: v for k, v in full_sd.items() if k not in expert_names}
 
     # Run metadata (immutable) for rd.pt
@@ -847,8 +1415,30 @@ def build_states(
         },
         'config_fingerprint': config_fingerprint,
     }
+    # Mark as NVFP4 compressed_tensors format for round-trip load
+    if nvfp4_expert_sd:
+        dp_state['nvfp4_format'] = 'compressed_tensors'
+        dp_state['nvfp4_group_size'] = 16
     if zero2_state is not None:
         dp_state['zero2'] = zero2_state
+
+    # Save FusedBackwardECO state if active (fused backward-optimizer FP8 m/v).
+    # All MoE layers share the same FusedBackwardECO instance (set by attach()),
+    # so we save it once from the first MoE layer found.
+    _fused_eco_ref = None
+    for blk in getattr(model, 'blocks', []):
+        ffn = getattr(blk, 'ffn', None)
+        feco = getattr(ffn, '_fused_eco', None) if ffn is not None else None
+        if feco is not None:
+            if _fused_eco_ref is None:
+                _fused_eco_ref = feco
+            else:
+                assert feco is _fused_eco_ref, (
+                    "Multiple FusedBackwardECO instances found — checkpoint save assumes "
+                    "all MoE layers share one instance. This is a bug."
+                )
+    if _fused_eco_ref is not None and hasattr(_fused_eco_ref, 'state_dict'):
+        dp_state['fused_eco'] = _fused_eco_ref.state_dict()
 
     # Add EP sharding info for resharding support (version 3+)
     if ep_shard_info is not None:
@@ -910,38 +1500,60 @@ def load_state(
     optimizer: torch.optim.Optimizer,
     loader=None,
     print_fn=print,
+    nvfp4_direct: bool = False,
 ) -> tuple[int, int, Optional[dict[str, Any]]]:
     """Load split checkpoint and restore state. Returns (step, tokens, zero2_state).
 
     Expects rd.pt (replicated dense/router) in the same iteration directory,
     and dp_rank_XXX.pt for the calling rank.
+
+    Args:
+        nvfp4_direct: If True, load NVFP4 expert triplets directly to GPU buffers
+            (Option C: NVFP4 primary, no BF16 master weights). If False, dequantize
+            NVFP4 triplets to BF16 on CPU and load via load_state_dict (legacy path).
     """
     it_dir = os.path.dirname(path)
     rd_path = os.path.join(it_dir, 'rd.pt')
 
-    map_location = 'cpu'
-    if torch.cuda.is_available():
-        map_location = f'cuda:{torch.cuda.current_device()}'
-
-    # Load replicated dense/router weights
-    rd = torch.load(rd_path, map_location=map_location, weights_only=False)
+    # Load rd.pt to CPU. For NVFP4 checkpoints, dequantize on GPU via CUDA
+    # kernel (no CPU float32 intermediates). Non-NVFP4 keys go through standard
+    # load_state_dict path.
+    rd = torch.load(rd_path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(rd)  # Fail early if checkpoint is too new
     dense_sd = rd['model_dense']
+
+    # Detect NVFP4 compressed_tensors format and dequantize on GPU
+    is_nvfp4 = _is_nvfp4_checkpoint(rd)
+    if is_nvfp4:
+        group_size = _get_nvfp4_group_size(rd)
+        print_fn(f"[nvfp4] Detected NVFP4 compressed_tensors checkpoint (group_size={group_size})")
+        # GPU-native dequant: moves NVFP4 triplets to GPU, dequants via kernel,
+        # writes BF16 directly to model parameters. Returns only non-NVFP4 keys.
+        dense_sd = dequantize_nvfp4_to_model_gpu(dense_sd, model, group_size, print_fn)
+
+    # Load remaining (non-NVFP4) keys via standard path
     model.load_state_dict(dense_sd, strict=False)
+    del dense_sd  # Free memory before loading expert shard
     tokens = int(rd.get('tokens', 0))
     step = int(rd.get('step', 0))
     # Validate config hash against current model config (best-effort)
-    try:
-        from nmoe.config import fingerprint as _fingerprint
-        current_fp = _fingerprint(getattr(model, 'config', None))
-        saved_fp = str(rd.get('config_fingerprint', ''))
-        if saved_fp and current_fp and saved_fp != current_fp:
-            raise RuntimeError(
-                f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
-                "Refusing to resume with a different config."
-            )
-    except Exception:
-        raise
+    # Skip fingerprint validation for imported checkpoints (empty fingerprint)
+    saved_fp = str(rd.get('config_fingerprint', ''))
+    if saved_fp:
+        try:
+            from nmoe.config import fingerprint as _fingerprint
+            current_fp = _fingerprint(getattr(model, 'config', None))
+            if current_fp and saved_fp != current_fp:
+                raise RuntimeError(
+                    f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
+                    "Refusing to resume with a different config."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # Best effort: import errors, missing config module, etc.
+    else:
+        print_fn("[checkpoint] Skipping fingerprint validation for imported checkpoint (no stored fingerprint)")
 
     # Check plan bundle if loader expects one
     if loader is not None and hasattr(loader, 'plan') and 'plan_bundle' in rd:
@@ -956,12 +1568,47 @@ def load_state(
             )
         print_fn(f"[resume] Plan hash match: {current_plan.plan_hash[:8]}")
 
-    # Load rank-local shard
+    del rd  # Free ~12 GB CPU RAM before loading expert shard
+
+    # Load rank-local shard — always to CPU for NVFP4 (same OOM reason as rd.pt)
     print_fn(f'Loading checkpoint: {path}')
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(ckpt)  # Validate dp_rank checkpoint version too
-    model.load_state_dict(ckpt['model_expert'], strict=False)
-    optimizer.load_state_dict(ckpt['optimizer'])
+
+    # Load expert weights: either direct NVFP4 buffers or dequant to BF16
+    expert_sd = ckpt['model_expert']
+    ckpt_is_nvfp4 = is_nvfp4 or _is_nvfp4_checkpoint(ckpt)
+    # Auto-detect Option C: if checkpoint was saved with nvfp4_format metadata, use direct path
+    nvfp4_direct_load = nvfp4_direct or ckpt.get('nvfp4_format') == 'compressed_tensors'
+
+    if ckpt_is_nvfp4 and nvfp4_direct_load:
+        gs = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else group_size
+        print_fn(f"[nvfp4] Loading expert NVFP4 triplets directly to GPU buffers (Option C)...")
+        loaded = load_nvfp4_expert_buffers(expert_sd, model, gs, print_fn)
+        if not loaded:
+            raise RuntimeError(
+                "[nvfp4] No NVFP4 triplets found in expert state dict but checkpoint "
+                "is marked as nvfp4_format=compressed_tensors. The checkpoint may be "
+                "corrupted or incompatible. CPU dequant fallback has been removed."
+            )
+    elif ckpt_is_nvfp4:
+        # NVFP4 checkpoint but not in direct mode — still use GPU dequant
+        gs = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else group_size
+        print_fn(f"[nvfp4] Dequantizing expert NVFP4 triplets via GPU kernel...")
+        expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, gs, print_fn)
+        model.load_state_dict(expert_sd, strict=False)
+    else:
+        model.load_state_dict(expert_sd, strict=False)
+    del expert_sd
+
+    # Restore optimizer state if available (imported checkpoints may have empty optimizer)
+    opt_state = ckpt.get('optimizer')
+    if opt_state and isinstance(opt_state, dict) and 'param_groups' in opt_state:
+        optimizer.load_state_dict(opt_state)
+    elif step == 0:
+        print_fn('[resume] Imported checkpoint (step=0): skipping optimizer state restore')
+    else:
+        print_fn(f'[resume] WARNING: No valid optimizer state in checkpoint at step={step}')
 
     if loader is not None and ckpt.get('loader'):
         loader.load_state_dict(ckpt['loader'])
@@ -979,6 +1626,12 @@ def load_state(
                     state = torch.as_tensor(state, dtype=torch.uint8).cpu()
                     torch.cuda.set_rng_state(state, dev)
 
+    # Stash FusedBackwardECO state on model for later restoration by training loop
+    fused_eco_sd = ckpt.get('fused_eco')
+    if fused_eco_sd is not None:
+        model._pending_fused_eco_state = fused_eco_sd
+        print_fn(f'[resume] Found FusedBackwardECO state (step={fused_eco_sd.get("step_count", "?")})')
+
     return int(step), tokens, ckpt.get('zero2')
 
 
@@ -992,6 +1645,7 @@ def load_state_with_ep_check(
     loader=None,
     print_fn=print,
     strict_ep: bool = True,
+    nvfp4_direct: bool = False,
 ) -> tuple[int, int, Optional[dict[str, Any]], Optional[EPShardInfo]]:
     """Load checkpoint with EP sharding compatibility check.
 
@@ -1008,6 +1662,8 @@ def load_state_with_ep_check(
         loader: Optional data loader.
         print_fn: Print function for logging.
         strict_ep: If True, raise error on EP mismatch. If False, warn only.
+        nvfp4_direct: If True, load NVFP4 expert triplets directly to GPU buffers
+            (Option C: NVFP4 primary, no BF16 master weights).
 
     Returns:
         (step, tokens, zero2_state, saved_ep_info) tuple.
@@ -1018,13 +1674,13 @@ def load_state_with_ep_check(
     it_dir = os.path.dirname(path)
     rd_path = os.path.join(it_dir, 'rd.pt')
 
-    map_location = 'cpu'
-    if torch.cuda.is_available():
-        map_location = f'cuda:{torch.cuda.current_device()}'
+    # Always load to CPU first — NVFP4 dequantization creates large float32
+    # intermediates that would OOM on GPU.  load_state_dict() copies BF16
+    # tensors to GPU parameters one-by-one which is memory-safe.
 
     # Load dp_rank checkpoint first to check EP sharding
     print_fn(f'Loading checkpoint: {path}')
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(ckpt)
 
     # Check EP sharding compatibility
@@ -1047,31 +1703,70 @@ def load_state_with_ep_check(
         )
 
     # Load replicated dense/router weights
-    rd = torch.load(rd_path, map_location=map_location, weights_only=False)
+    rd = torch.load(rd_path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(rd)
     dense_sd = rd['model_dense']
+
+    # Detect NVFP4 compressed_tensors and dequantize on GPU
+    is_nvfp4 = _is_nvfp4_checkpoint(rd) or _is_nvfp4_checkpoint(ckpt)
+    if is_nvfp4:
+        group_size = _get_nvfp4_group_size(rd) if _is_nvfp4_checkpoint(rd) else _get_nvfp4_group_size(ckpt)
+        print_fn(f"[nvfp4] Detected NVFP4 compressed_tensors checkpoint (group_size={group_size})")
+        dense_sd = dequantize_nvfp4_to_model_gpu(dense_sd, model, group_size, print_fn)
+
     model.load_state_dict(dense_sd, strict=False)
+    del dense_sd
     tokens = int(rd.get('tokens', 0))
     step = int(rd.get('step', 0))
 
-    # Validate config hash
-    try:
-        from nmoe.config import fingerprint as _fingerprint
-        current_fp = _fingerprint(getattr(model, 'config', None))
-        saved_fp = str(rd.get('config_fingerprint', ''))
-        if saved_fp and current_fp and saved_fp != current_fp:
-            raise RuntimeError(
-                f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
-                "Refusing to resume with a different config."
-            )
-    except RuntimeError:
-        raise
-    except Exception:
-        pass  # Best effort
+    # Validate config hash (skip for imported checkpoints with empty fingerprint)
+    saved_fp = str(rd.get('config_fingerprint', ''))
+    if saved_fp:
+        try:
+            from nmoe.config import fingerprint as _fingerprint
+            current_fp = _fingerprint(getattr(model, 'config', None))
+            if current_fp and saved_fp != current_fp:
+                raise RuntimeError(
+                    f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
+                    "Refusing to resume with a different config."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # Best effort
+    else:
+        print_fn("[checkpoint] Skipping fingerprint validation for imported checkpoint (no stored fingerprint)")
 
-    # Load expert weights
-    model.load_state_dict(ckpt['model_expert'], strict=False)
-    optimizer.load_state_dict(ckpt['optimizer'])
+    # Load expert weights: either direct NVFP4 buffers or dequant to BF16
+    expert_sd = ckpt['model_expert']
+    ckpt_is_nvfp4 = is_nvfp4 or _is_nvfp4_checkpoint(ckpt)
+    nvfp4_direct_load = nvfp4_direct or ckpt.get('nvfp4_format') == 'compressed_tensors'
+
+    if ckpt_is_nvfp4 and nvfp4_direct_load:
+        gs = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else group_size
+        print_fn(f"[nvfp4] Loading expert NVFP4 triplets directly to GPU buffers (Option C)...")
+        loaded = load_nvfp4_expert_buffers(expert_sd, model, gs, print_fn)
+        if not loaded:
+            print_fn("[nvfp4] WARNING: No NVFP4 triplets found in expert state, falling back to dequant")
+            expert_sd = dequantize_nvfp4_state_dict(expert_sd, gs, print_fn)
+            model.load_state_dict(expert_sd, strict=False)
+    elif ckpt_is_nvfp4:
+        group_size_dp = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else group_size
+        print_fn(f"[nvfp4] Dequantizing expert NVFP4 triplets on CPU...")
+        expert_sd = dequantize_nvfp4_state_dict(expert_sd, group_size_dp, print_fn)
+        model.load_state_dict(expert_sd, strict=False)
+    else:
+        model.load_state_dict(expert_sd, strict=False)
+    del expert_sd
+
+    # Restore optimizer state if available (imported checkpoints may have empty optimizer)
+    opt_state = ckpt.get('optimizer')
+    if opt_state and isinstance(opt_state, dict) and 'param_groups' in opt_state:
+        optimizer.load_state_dict(opt_state)
+    elif step == 0:
+        print_fn('[resume] Imported checkpoint (step=0): skipping optimizer state restore')
+    else:
+        print_fn(f'[resume] WARNING: No valid optimizer state in checkpoint at step={step}')
 
     if loader is not None and ckpt.get('loader'):
         loader.load_state_dict(ckpt['loader'])
@@ -1259,21 +1954,53 @@ def load_with_resharding(
     it_dir = os.path.dirname(path)
     rd_path = os.path.join(it_dir, 'rd.pt')
 
-    map_location = 'cpu'
-    if torch.cuda.is_available():
-        map_location = f'cuda:{torch.cuda.current_device()}'
+    # Always load to CPU first — NVFP4 dequantization creates large float32
+    # intermediates that would OOM on GPU.  load_state_dict() copies BF16
+    # tensors to GPU parameters one-by-one which is memory-safe.
 
     # Load rd.pt (dense weights)
-    rd = torch.load(rd_path, map_location=map_location, weights_only=False)
+    rd = torch.load(rd_path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(rd)
     dense_sd = rd['model_dense']
+
+    # Detect NVFP4 and dequantize
+    is_nvfp4 = _is_nvfp4_checkpoint(rd)
+    if is_nvfp4:
+        group_size = _get_nvfp4_group_size(rd)
+        print_fn(f"[reshard/nvfp4] Dequantizing dense NVFP4 triplets on CPU (group_size={group_size})")
+        dense_sd = dequantize_nvfp4_state_dict(dense_sd, group_size, print_fn)
+
     model.load_state_dict(dense_sd, strict=False)
+    del dense_sd
     tokens = int(rd.get('tokens', 0))
     step = int(rd.get('step', 0))
 
+    # Validate config hash (skip for imported checkpoints with empty fingerprint)
+    saved_fp = str(rd.get('config_fingerprint', ''))
+    if saved_fp:
+        try:
+            from nmoe.config import fingerprint as _fingerprint
+            current_fp = _fingerprint(getattr(model, 'config', None))
+            if current_fp and saved_fp != current_fp:
+                raise RuntimeError(
+                    f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
+                    "Refusing to resume with a different config."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # Best effort
+    else:
+        print_fn("[reshard] Skipping fingerprint validation for imported checkpoint (no stored fingerprint)")
+
     # Load the specified dp_rank checkpoint to check EP info
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(ckpt)
+
+    # Also check dp checkpoint for NVFP4
+    if not is_nvfp4:
+        is_nvfp4 = _is_nvfp4_checkpoint(ckpt)
+    nvfp4_group_size = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else (group_size if is_nvfp4 else 16)
 
     saved_ep_info = get_ep_shard_info_from_checkpoint(ckpt)
 
@@ -1290,8 +2017,16 @@ def load_with_resharding(
     if compatible:
         # No resharding needed - load directly
         print_fn(f"[reshard] EP config matches, loading directly")
-        model.load_state_dict(ckpt['model_expert'], strict=False)
-        optimizer.load_state_dict(ckpt['optimizer'])
+        expert_sd = ckpt['model_expert']
+        if is_nvfp4:
+            print_fn(f"[reshard/nvfp4] Dequantizing expert NVFP4 triplets...")
+            expert_sd = dequantize_nvfp4_state_dict(expert_sd, nvfp4_group_size, print_fn)
+        model.load_state_dict(expert_sd, strict=False)
+        del expert_sd
+        # Restore optimizer state if available
+        opt_state = ckpt.get('optimizer')
+        if opt_state and isinstance(opt_state, dict) and 'param_groups' in opt_state:
+            optimizer.load_state_dict(opt_state)
     else:
         # Resharding needed
         print_fn(f"[reshard] EP config mismatch: {msg}")
@@ -1300,6 +2035,8 @@ def load_with_resharding(
         if saved_ep_info.ep_size == 1:
             # Single shard contains all experts - can reshard directly
             expert_sd = ckpt['model_expert']
+            if is_nvfp4:
+                expert_sd = dequantize_nvfp4_state_dict(expert_sd, nvfp4_group_size, print_fn)
             resharded = reshard_expert_weights(
                 expert_sd, saved_ep_info, target_ep_size, target_ep_rank, print_fn
             )
@@ -1327,9 +2064,12 @@ def load_with_resharding(
                 if not os.path.exists(src_path):
                     raise FileNotFoundError(f"Missing shard for resharding: {src_path}")
 
-                src_ckpt = torch.load(src_path, map_location=map_location, weights_only=False)
+                src_ckpt = torch.load(src_path, map_location='cpu', weights_only=False)
+                src_expert_sd = src_ckpt['model_expert']
+                if is_nvfp4:
+                    src_expert_sd = dequantize_nvfp4_state_dict(src_expert_sd, nvfp4_group_size, print_fn)
                 resharded = reshard_expert_weights(
-                    src_ckpt['model_expert'], src_info, target_ep_size, target_ep_rank, print_fn
+                    src_expert_sd, src_info, target_ep_size, target_ep_rank, print_fn
                 )
 
                 # Merge into final dict
@@ -1390,7 +2130,11 @@ def load_checkpoint(
     if getattr(cfg, 'resume', True):
         step, path = checkpointer.find_latest()
         if path is not None:
-            start_step, tokens_seen, z2 = load_state(path, model, optimizer, loader, print_fn)
+            nvfp4_direct = getattr(cfg, 'eco_enabled', False) or getattr(cfg, 'eco_fused_backward', False)
+            start_step, tokens_seen, z2 = load_state(
+                path, model, optimizer, loader, print_fn,
+                nvfp4_direct=nvfp4_direct,
+            )
             if z2 is not None:
                 zero2_state = z2
             if rank == 0:

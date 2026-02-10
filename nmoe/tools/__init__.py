@@ -16,6 +16,15 @@ from .reshard_checkpoint import (
     detect_n_experts,
 )
 
+from .import_from_hf import (
+    import_hf_to_nmoe,
+    validate_import,
+    build_hf_to_nmoe_mapping,
+    parse_expert_weight_name,
+    stack_expert_weights_for_layer,
+    shard_expert_tensor,
+)
+
 __all__ = [
     # Config converter
     "nmoe_to_hf_weight_mapping",
@@ -29,4 +38,11 @@ __all__ = [
     "shard_experts_for_rank",
     "detect_ep_size",
     "detect_n_experts",
+    # HF import
+    "import_hf_to_nmoe",
+    "validate_import",
+    "build_hf_to_nmoe_mapping",
+    "parse_expert_weight_name",
+    "stack_expert_weights_for_layer",
+    "shard_expert_tensor",
 ]

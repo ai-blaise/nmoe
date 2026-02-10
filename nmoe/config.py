@@ -171,6 +171,7 @@ class Config:
   seq_len: int = 4096
   seed: int = 42
   log_every: int = 10
+  grad_clip: float = 0.0           # Max gradient norm (0 = disabled); 1.0 recommended for SFT
 
   # Checkpointing
   checkpoint_dir: str = "/data/checkpoints"
@@ -207,10 +208,27 @@ class Config:
   # SFT (optional)
   # =============================================================================
   sft_enabled: bool = False
-  sft_prompt_format: str = "chatml"  # chatml | llama3 | custom
+  sft_prompt_format: str = "chatml"  # chatml | llama3 | deepseekv32 | custom
   sft_mask_prompt_loss: bool = True
   sft_packing_enabled: bool = False
   sft_data_path: Optional[str] = None
+
+  # =============================================================================
+  # EP/DP Parallelism
+  # =============================================================================
+  ep_size: int = 1                     # Expert parallelism group size
+  dp_size: Optional[int] = None        # Data parallelism (inferred as world/ep_size if None)
+
+  # =============================================================================
+  # ECO Optimizer -- NVFP4 Primary + FP8 States
+  # =============================================================================
+  eco_enabled: bool = False
+  eco_primary_format: str = "nvfp4"    # "nvfp4" for NVFP4 primary weights
+  eco_quant_format: str = "fp8"        # "fp8" for FP8 optimizer states (m=E5M2, v=E4M3)
+  eco_error_feedback: bool = True      # Error correction feedback into momentum
+  eco_stochastic_rounding: bool = True # SR for NVFP4 E2M1 quantization
+  eco_fused_backward: bool = False     # Fuse optimizer step into backward (eliminates 152 GiB of BF16 params + grads)
+  gradient_checkpointing: bool = False # Required for NVFP4 primary (1 layer BF16 scratch)
 
   # =============================================================================
   # RL (optional)

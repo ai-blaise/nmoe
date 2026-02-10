@@ -2787,3 +2787,245 @@ def expert_blockscaled(
     )
 
     return Y_pad.squeeze(-1)
+
+
+def _dequant_nvfp4_triplet_to_bf16(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    group_size: int = 16,
+) -> torch.Tensor:
+    """Dequantize a single NVFP4 compressed_tensors triplet to BF16 on GPU.
+
+    Uses ct_nvfp4_to_bf16 CUDA kernel — all arithmetic in GPU registers,
+    zero FP32 intermediates in global memory.
+
+    Args:
+        packed: [E, out_dim, in_dim//2] uint8 (2 E2M1 nibbles per byte)
+        scale: [E, out_dim, in_dim//group_size] float8_e4m3fn per-group scales
+        global_scale: [E, 1] or [E] float32 global scale
+        group_size: Elements per scale group (default 16)
+
+    Returns:
+        [E, out_dim, in_dim] bfloat16 tensor
+    """
+    from nmoe.csrc import rdep
+
+    E = packed.shape[0]
+    M = packed.shape[1]       # out_dim
+    K = packed.shape[2] * 2   # in_dim (2 elements per byte)
+    total_M = E * M
+    device = packed.device
+    stream = torch.cuda.current_stream(device)
+
+    packed_flat = packed.reshape(total_M, K // 2).contiguous()
+    n_groups = K // group_size
+    scale_flat = scale.view(torch.uint8).reshape(total_M, n_groups).contiguous()
+    gs_flat = global_scale.reshape(E).contiguous().float()
+
+    out_bf16 = torch.empty(total_M, K, dtype=torch.bfloat16, device=device)
+
+    rdep.ct_nvfp4_to_bf16(
+        packed_flat.data_ptr(),
+        scale_flat.data_ptr(),
+        gs_flat.data_ptr(),
+        out_bf16.data_ptr(),
+        total_M, K, group_size,
+        1,  # gs_stride=1 (per-expert global scale)
+        M,  # expert_rows=M (rows per expert for indexing ct_gs)
+        0,  # transpose=0 (normal layout)
+        stream,
+    )
+
+    return out_bf16.reshape(E, M, K)
+
+
+def quantize_weights_from_nvfp4(
+    W1_packed: torch.Tensor,
+    W1_scale: torch.Tensor,
+    W1_gs: torch.Tensor,
+    W3_packed: torch.Tensor,
+    W3_scale: torch.Tensor,
+    W3_gs: torch.Tensor,
+    W2_packed: torch.Tensor,
+    W2_scale: torch.Tensor,
+    W2_gs: torch.Tensor,
+    group_size: int = 16,
+    profile: str = 'nvfp4',
+) -> QuantizedWeightsFused:
+    """Build blockscaled weight cache directly from NVFP4 compressed_tensors triplets.
+
+    Uses a fused CUDA kernel to convert compressed_tensors NVFP4 directly to
+    blockscaled MMA format without materializing any BF16 intermediates.
+    Peak transient memory is only the output tensors (~1/8 of BF16 size).
+
+    For W13 (interleaved W1/W3): uses dual-source kernel that reads from both
+    CT triplets and produces interleaved output rows [W1_row0, W3_row0, ...].
+
+    For W2: uses single-source kernel.
+
+    Falls back to BF16 dequant path for FP8 profile (which uses different
+    blockscaled format).
+
+    Args:
+        W1_packed: [E, Dff, H//2] uint8 (HF nn.Linear [out, in//2])
+        W1_scale: [E, Dff, H//group_size] float8_e4m3fn
+        W1_gs: [E, 1] or [E] float32
+        W3_packed, W3_scale, W3_gs: Same shapes as W1
+        W2_packed: [E, H, Dff//2] uint8 (HF nn.Linear [out, in//2])
+        W2_scale: [E, H, Dff//group_size] float8_e4m3fn
+        W2_gs: [E, 1] or [E] float32
+        group_size: NVFP4 group size (default 16)
+        profile: 'fp8' or 'nvfp4'
+
+    Returns:
+        QuantizedWeightsFused with interleaved W13 and W2 in MMA layout
+    """
+    from nmoe.csrc import rdep
+
+    # Extract dimensions from CT shapes:
+    # W1_packed: [E, Dff, H//2] → Dff = out_features, H = in_features
+    E = W1_packed.shape[0]
+    Dff = W1_packed.shape[1]      # out_features (moe_inter_dim)
+    H = W1_packed.shape[2] * 2    # in_features (dim)
+
+    # W2: [E, H, Dff//2] → H = out_features (dim), Dff = in_features
+    assert W2_packed.shape[1] == H, f"W2 out_dim {W2_packed.shape[1]} != H {H}"
+
+    stream = torch.cuda.current_stream(W1_packed.device)
+    device = W1_packed.device
+
+    if profile == "nvfp4":
+        # =====================================================================
+        # Direct CT NVFP4 → blockscaled MMA (zero BF16 intermediates)
+        # =====================================================================
+
+        # --- W13 interleaved (W1 + W3) ---
+        # CT rows = Dff (out_features), CT cols = H (in_features)
+        # Output MMA: [E*2*Dff, H/4] uint16 + [E, M13, sf_k13] E8M0
+        M13 = 2 * Dff
+        K13 = H
+        sf_k13 = K13 // 32
+        # M_stride must be multiple of 128 (validated by C API)
+        assert M13 % 128 == 0, f"M13={M13} must be multiple of 128"
+        assert sf_k13 % 4 == 0, f"sf_k13={sf_k13} must be multiple of 4"
+
+        W13_u16 = torch.empty((E * M13, K13 // 4), device=device, dtype=torch.uint16)
+        W13_sf_mma = torch.empty((E, M13, sf_k13), device=device, dtype=torch.uint8)
+
+        # Flatten global_scale to [E] contiguous float32
+        gs1 = W1_gs.reshape(E).contiguous().float()
+        gs3 = W3_gs.reshape(E).contiguous().float()
+
+        # Flatten scale to contiguous uint8 (E4M3 stored as uint8)
+        s1 = W1_scale.view(torch.uint8).contiguous()
+        s3 = W3_scale.view(torch.uint8).contiguous()
+
+        rdep.ct_nvfp4_to_blockscaled_mma_interleaved(
+            W1_packed.contiguous().data_ptr(),
+            s1.data_ptr(),
+            gs1.data_ptr(),
+            W3_packed.contiguous().data_ptr(),
+            s3.data_ptr(),
+            gs3.data_ptr(),
+            W13_u16.data_ptr(),
+            W13_sf_mma.data_ptr(),
+            E, Dff, K13, M13, group_size,
+            stream,
+        )
+
+        W13_q = W13_u16.view(torch.uint8).view(E, M13, K13 // 2, 1)
+        W13_sf_mma = W13_sf_mma.view(E, M13, sf_k13, 1)
+
+        # --- W2 single source ---
+        # CT rows = H (out_features = dim), CT cols = Dff (in_features)
+        # The GEMM uses N=H, K=Dff → MMA weight has H rows, Dff cols
+        # CT is [E, H, Dff/2] → M_ct=H, K_in=Dff — no transpose needed
+        M2 = H
+        K2 = Dff
+        sf_k2 = K2 // 32
+        assert M2 % 128 == 0, f"M2={M2} must be multiple of 128"
+        assert sf_k2 % 4 == 0, f"sf_k2={sf_k2} must be multiple of 4"
+
+        W2_u16 = torch.empty((E * M2, K2 // 4), device=device, dtype=torch.uint16)
+        W2_sf_mma = torch.empty((E, M2, sf_k2), device=device, dtype=torch.uint8)
+
+        gs2 = W2_gs.reshape(E).contiguous().float()
+        s2 = W2_scale.view(torch.uint8).contiguous()
+
+        rdep.ct_nvfp4_to_blockscaled_mma(
+            W2_packed.contiguous().data_ptr(),
+            s2.data_ptr(),
+            gs2.data_ptr(),
+            W2_u16.data_ptr(),
+            W2_sf_mma.data_ptr(),
+            E, M2, K2, M2, group_size,
+            stream,
+        )
+
+        W2_q = W2_u16.view(torch.uint8).view(E, M2, K2 // 2, 1)
+        W2_sf_mma = W2_sf_mma.view(E, M2, sf_k2, 1)
+
+    else:
+        # FP8 profile: fall back to BF16 dequant path (FP8 blockscaled uses
+        # different packed format, direct kernel not implemented)
+        W1_bf16 = _dequant_nvfp4_triplet_to_bf16(W1_packed, W1_scale, W1_gs, group_size)
+        W1_bf16 = W1_bf16.transpose(-1, -2).contiguous()
+        W3_bf16 = _dequant_nvfp4_triplet_to_bf16(W3_packed, W3_scale, W3_gs, group_size)
+        W3_bf16 = W3_bf16.transpose(-1, -2).contiguous()
+
+        M13 = 2 * Dff
+        K13 = H
+        sf_k13 = K13 // 32
+
+        W13_t = torch.stack((W1_bf16, W3_bf16), dim=-1).view(E, H, M13).transpose(1, 2).contiguous()
+        del W1_bf16, W3_bf16
+
+        W13_x = W13_t.view(E * M13, K13)
+        offs13 = torch.arange(0, (E + 1) * M13, step=M13, device=device, dtype=torch.int32)
+        W13_u16 = torch.empty((E * M13, K13 // 2), device=device, dtype=torch.uint16)
+        W13_sf_mma = torch.empty((E, M13, sf_k13), device=device, dtype=torch.uint8)
+
+        rdep.quant_fp8_sf_strided_mma(
+            W13_x.data_ptr(), K13,
+            W13_u16.data_ptr(), K13 // 2,
+            W13_sf_mma.data_ptr(),
+            offs13.data_ptr(),
+            E, M13, E * M13, K13, stream,
+        )
+        W13_q = W13_u16.view(torch.uint8).view(E, M13, K13, 1).view(torch.float8_e4m3fn)
+        W13_sf_mma = W13_sf_mma.view(E, M13, sf_k13, 1)
+        del W13_t, W13_x, offs13, W13_u16
+
+        W2_bf16 = _dequant_nvfp4_triplet_to_bf16(W2_packed, W2_scale, W2_gs, group_size)
+        W2_bf16 = W2_bf16.transpose(-1, -2).contiguous()
+        M2 = H
+        K2 = Dff
+        sf_k2 = K2 // 32
+        W2_t = W2_bf16.transpose(1, 2).contiguous()
+        del W2_bf16
+        W2_x = W2_t.view(E * M2, K2)
+        offs2 = torch.arange(0, (E + 1) * M2, step=M2, device=device, dtype=torch.int32)
+        W2_u16 = torch.empty((E * M2, K2 // 2), device=device, dtype=torch.uint16)
+        W2_sf_mma = torch.empty((E, M2, sf_k2), device=device, dtype=torch.uint8)
+        rdep.quant_fp8_sf_strided_mma(
+            W2_x.data_ptr(), K2,
+            W2_u16.data_ptr(), K2 // 2,
+            W2_sf_mma.data_ptr(),
+            offs2.data_ptr(),
+            E, M2, E * M2, K2, stream,
+        )
+        W2_q = W2_u16.view(torch.uint8).view(E, M2, K2, 1).view(torch.float8_e4m3fn)
+        W2_sf_mma = W2_sf_mma.view(E, M2, sf_k2, 1)
+        del W2_t, W2_x, offs2, W2_u16
+
+    return QuantizedWeightsFused(
+        W13_q=W13_q,
+        W13_sf_mma=W13_sf_mma,
+        W2_q=W2_q,
+        W2_sf_mma=W2_sf_mma,
+        E=E,
+        H=H,
+        Dff=Dff,
+        profile=profile,
+    )

@@ -128,6 +128,37 @@ def _get_or_init_flat_group(
 
 
 @torch.no_grad()
+def eager_init(
+  param_groups: list[dict],
+  *,
+  pg: dist.ProcessGroup | None = None,
+) -> None:
+  """Pre-allocate ZeRO-2 flat buffers and re-point params before the first forward pass.
+
+  Must be called BEFORE any forward/backward to ensure the flat_param buffer
+  is allocated while GPU memory is still available (only model weights resident).
+  If called during the optimizer step (lazy), the buffer competes with activations
+  and gradients, causing OOM on high-utilization setups (e.g., 345B NVFP4 on 8×B200).
+
+  Re-entrancy safe: if buffers are already initialized, this is a no-op.
+  """
+  world = dist.get_world_size(pg) if (dist.is_available() and dist.is_initialized()) else 1
+  rank = dist.get_rank(pg) if (dist.is_available() and dist.is_initialized()) else 0
+
+  for group in param_groups:
+    params = list(group['params'])
+    if not params:
+      continue
+    by_dtype: dict[torch.dtype, list[torch.nn.Parameter]] = {}
+    for p in params:
+      if p.dtype not in by_dtype:
+        by_dtype[p.dtype] = []
+      by_dtype[p.dtype].append(p)
+    for dtype, group_params in by_dtype.items():
+      _get_or_init_flat_group(group, params=group_params, rank=rank, world=world, dtype=dtype)
+
+
+@torch.no_grad()
 def step_dense_adamw(
   param_groups: list[dict],
   *,

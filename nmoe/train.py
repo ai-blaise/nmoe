@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from nmoe.config import Config, fingerprint
 from nmoe.model import Transformer
 from nmoe.data.loader import build_loader
+from nmoe.data.sft_loader import build_sft_loader
 from nmoe.opt import build_optimizer, update_lr, step
 from nmoe.checkpoint import Checkpointer, load_checkpoint, save_checkpoint
 from nmoe.metrics import init_metrics, start_metrics, log_training_step, stop_metrics, register_model_timers, cuda_time
@@ -45,11 +46,29 @@ def _validate_training_config(cfg: Config, world: int) -> None:
   """
   if cfg.batch_size <= 0:
     raise ValueError(f"batch_size must be > 0 (got {cfg.batch_size})")
-  if world > 1 and (cfg.batch_size % world) != 0:
+
+  # For SFT with EP/DP, batch_size must be divisible by dp_size (not world).
+  # Example: EP=8, DP=16, world=128, batch_size=256 => 256 % 16 = 0
+  sft_mode = getattr(cfg, 'sft_enabled', False)
+  if sft_mode:
+    ep_size = getattr(cfg, 'ep_size', 1)
+    dp_size = getattr(cfg, 'dp_size', None) or max(1, world // ep_size)
+    if dp_size > 1 and (cfg.batch_size % dp_size) != 0:
+      raise ValueError(
+        f"batch_size ({cfg.batch_size}) must be divisible by dp_size ({dp_size}) in SFT mode. "
+        f"With EP={ep_size}, each DP replica gets batch_size/dp_size microbatch."
+      )
+    if ep_size > 1 and world % ep_size != 0:
+      raise ValueError(
+        f"world_size ({world}) must be divisible by ep_size ({ep_size}). "
+        f"Cannot split {world} GPUs into groups of {ep_size}."
+      )
+  elif world > 1 and (cfg.batch_size % world) != 0:
     raise ValueError(
       f"batch_size ({cfg.batch_size}) must be divisible by world_size ({world}). "
       "Uneven per-rank microbatches break ZeRO-2 AVG semantics and exact token accounting."
     )
+
   if cfg.seq_len <= 0:
     raise ValueError(f"seq_len must be > 0 (got {cfg.seq_len})")
   if cfg.n_activated_experts is not None and cfg.n_routed_experts is not None:
@@ -63,7 +82,8 @@ def _validate_training_config(cfg: Config, world: int) -> None:
 
 def train(cfg: Config):
   """Train MoE model. One clear path: forward → loss → backward → step → log → checkpoint."""
-  rank, world = runtime.init(cfg.seed)
+  ep_size = getattr(cfg, 'ep_size', 1)
+  rank, world = runtime.init(cfg.seed, ep_size=ep_size)
   _validate_training_config(cfg, world)
   timers_on = os.getenv('NMOE_TIMERS', '1') not in ('0', 'false', 'False')
   time_ctx = cuda_time if timers_on else (lambda _tag: nullcontext())
@@ -85,16 +105,73 @@ def train(cfg: Config):
   )
 
   # Build components
-  loader, plan = build_loader(cfg, rank, world)
+  sft_mode = getattr(cfg, 'sft_enabled', False)
+  if sft_mode:
+    # SFT mode: use SFT loader with EP/DP-aware rank computation
+    ep_size = getattr(cfg, 'ep_size', 1)
+    dp_size = getattr(cfg, 'dp_size', None)
+    if dp_size is None:
+      dp_size = max(1, world // ep_size)
+    dp_rank = rank // ep_size  # EP ranks are contiguous; DP rank = rank / ep_size
+    if rank == 0:
+      print(f"[SFT] ep_size={ep_size} dp_size={dp_size} dp_rank={dp_rank} world={world}")
+    loader = build_sft_loader(cfg, dp_rank=dp_rank, dp_world_size=dp_size, print_fn=print)
+    plan = None  # SFT has no MixturePlan
+  else:
+    loader, plan = build_loader(cfg, rank, world)
+
   model = Transformer(cfg).cuda()
   model.init_weights()
   model.train()
+
+  # Enable gradient checkpointing if configured (required for NVFP4 primary weights:
+  # only 1 layer's BF16 scratch activations in GPU memory at a time)
+  if getattr(cfg, 'gradient_checkpointing', False):
+    model.gradient_checkpointing_enable()
+    if rank == 0:
+      print("[nmoe] Gradient checkpointing enabled")
+
   register_model_timers(model)
   optimizer, dense_groups = build_optimizer(model, cfg)
   metrics_state = init_metrics(model, cfg.seq_len)
   metrics_ctx = start_metrics(run_id=run_id, metrics_dir=cfg.metrics_dir)
   zero2_state = {}
   start_step, tokens_seen, zero2_state = load_checkpoint(checkpointer, model, optimizer, loader, plan, cfg, rank, print)
+
+  # Eagerly allocate ZeRO-2 flat buffers and re-point dense params into them.
+  # This must happen BEFORE the first forward pass: at this point only model weights
+  # are on GPU, leaving ~30+ GiB free.  If deferred to the optimizer step (lazy),
+  # the allocation competes with activations and gradients, causing OOM.
+  if world > 1 and dense_groups:
+    from nmoe import zero2
+    from nmoe.opt import _get_dp_group
+    zero2.eager_init(dense_groups, pg=_get_dp_group())
+    if rank == 0:
+      print(f"[nmoe] ZeRO-2 flat buffers eagerly initialized for {len(dense_groups)} dense groups")
+
+  # Fused backward-optimizer: create and attach after checkpoint load
+  fused_eco = None
+  if getattr(cfg, 'eco_fused_backward', False):
+    from nmoe.eco import FusedBackwardECO
+    fused_eco = FusedBackwardECO(model, cfg)
+    # Set DP group for gradient AllReduce inside backward
+    try:
+      from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_data_parallel_group, get_dp_size
+      if is_nmoe_parallel_initialized():
+        fused_eco.set_dp_group(get_data_parallel_group(), get_dp_size())
+    except ImportError:
+      pass
+    # Restore FusedBackwardECO state from checkpoint if available
+    pending_state = getattr(model, '_pending_fused_eco_state', None)
+    if pending_state is not None:
+      fused_eco.load_state_dict(pending_state)
+      del model._pending_fused_eco_state
+      if rank == 0:
+        print(f"[nmoe] Restored FusedBackwardECO state from checkpoint")
+    fused_eco.attach(model)
+    if rank == 0:
+      print(f"[nmoe] FusedBackwardECO attached: {len(fused_eco._moes)} MoE modules")
+
   last_loss: torch.Tensor | None = None
   config_fingerprint = fingerprint(cfg)
   checkpoint_every = getattr(cfg, 'checkpoint_every', 100)
@@ -105,7 +182,11 @@ def train(cfg: Config):
         lr = update_lr(optimizer, dense_groups, step_num, tokens_seen, cfg)
 
         t0 = time.perf_counter()
-        inputs, targets = loader.next()
+        if sft_mode:
+          inputs, targets, loss_mask = loader.next()
+        else:
+          inputs, targets = loader.next()
+          loss_mask = None
         loader_wait_ms = (time.perf_counter() - t0) * 1000.0
 
         with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
@@ -113,12 +194,36 @@ def train(cfg: Config):
 
         with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
           loss_unreduced = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
-          mask = (targets != cfg.eos_token_id).reshape(-1).float()
+          if loss_mask is not None:
+            # SFT: use per-token loss mask from chat template (0=prompt, 1=response)
+            mask = loss_mask.reshape(-1)
+          else:
+            # Pre-training: mask out EOS tokens
+            mask = (targets != cfg.eos_token_id).reshape(-1).float()
           loss = (loss_unreduced * mask).sum() / mask.sum().clamp(min=1.0)
 
         model.zero_grad(set_to_none=True)
+        if fused_eco is not None:
+          # update_lr() already set optimizer.param_groups[0]['lr'] to scheduled lr_expert
+          lr_expert = float(optimizer.param_groups[0]['lr'])
+          fused_eco.set_lr(lr_expert)
+          fused_eco.pre_backward(step_num)
         with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
           loss.backward()
+        if fused_eco is not None:
+          fused_eco.post_backward()
+
+        # Gradient clipping (important for SFT stability with quantized training)
+        # When fused_eco is active, expert grads are already consumed — only clip dense params.
+        grad_clip = getattr(cfg, 'grad_clip', 0.0)
+        if grad_clip > 0:
+          if fused_eco is not None:
+            # Only clip dense parameters (expert grads already consumed in backward)
+            dense_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+            if dense_params:
+              torch.nn.utils.clip_grad_norm_(dense_params, grad_clip)
+          else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         with nvtx_ctx('train/opt_step'), time_ctx('time_ms/opt_step'):
           step(model, optimizer, dense_groups, zero2_state, cfg, world)

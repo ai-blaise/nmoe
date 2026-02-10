@@ -143,6 +143,44 @@ class ExpertAdamW(torch.optim.Optimizer):
     return None
 
 
+class _NullExpertOptimizer(torch.optim.Optimizer):
+  """No-op optimizer placeholder for fused backward-optimizer mode.
+
+  When FusedBackwardECO is active, expert optimization happens inside the
+  backward pass. This placeholder satisfies the interface expected by step()
+  and update_lr() without doing any work.
+
+  Uses a single-element Parameter to satisfy Optimizer's param_groups
+  requirement with minimal overhead. The 'lr' key is read/written by
+  update_lr() to communicate the scheduled expert LR to FusedBackwardECO.
+  """
+  emits_weight_cache = True  # Suppress post-step refresh (fused_eco refreshes in backward)
+
+  _DUMMY = None  # Shared across instances to avoid repeated allocation
+
+  def __init__(self):
+    if _NullExpertOptimizer._DUMMY is None:
+      _NullExpertOptimizer._DUMMY = torch.nn.Parameter(
+        torch.zeros(1), requires_grad=False,
+      )
+    super().__init__([_NullExpertOptimizer._DUMMY], {"lr": 0.0})
+
+  @torch.no_grad()
+  def step(self, closure=None):  # type: ignore[override]
+    return None
+
+  def state_dict(self) -> dict:
+    # Minimal state — nothing to save for a no-op optimizer
+    return {"param_groups": self.param_groups}
+
+  def load_state_dict(self, state_dict: dict) -> None:
+    # Accept any state dict gracefully (migration from real optimizer)
+    if "param_groups" in state_dict and state_dict["param_groups"]:
+      # Only restore lr (the only value we care about)
+      for saved_g, g in zip(state_dict["param_groups"], self.param_groups):
+        g["lr"] = saved_g.get("lr", g["lr"])
+
+
 def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Optimizer, list[dict]]:
   """Build optimizer for experts and return dense groups for AdamW/ZeRO-2.
 
@@ -206,9 +244,23 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
       'weight_decay': 0.0,
     })
 
-  # Expert optimizer: AdamW (benchmark proxy for Muon ceiling).
+  # Expert optimizer selection:
+  # 0. Fused backward-optimizer (eco_fused_backward=True): optimization happens in backward pass
+  # 1. ECO mode (eco_enabled=True): NVFP4 primary weights + FP8 opt states + error feedback
+  # 2. Blockscaled mode (fp8/nvfp4): Fused ExpertAdamW with CUDA kernel
+  # 3. Standard mode: PyTorch AdamW
+  eco_fused = getattr(cfg, "eco_fused_backward", False)
+  eco_enabled = getattr(cfg, "eco_enabled", False)
   use_blockscaled = getattr(cfg, "dtype", "nvfp4") in ("fp8", "nvfp4")
-  if use_blockscaled and expert_params:
+
+  if eco_fused:
+    # Expert optimization is handled by FusedBackwardECO inside backward pass.
+    # Use a null optimizer as placeholder — no expert params need tracking here.
+    expert_optimizer = _NullExpertOptimizer()
+  elif eco_enabled and expert_params:
+    from nmoe.eco import build_eco_optimizer
+    expert_optimizer = build_eco_optimizer(model, cfg)
+  elif use_blockscaled and expert_params:
     moes: list[torch.nn.Module] = []
     for blk in getattr(model, "blocks", []):
       ffn = getattr(blk, "ffn", None)
@@ -287,27 +339,67 @@ def update_lr(optimizer: torch.optim.Optimizer, dense_groups: list[dict], step: 
   return float(lr_dense)
 
 
+def _get_dp_group():
+  """Get DP process group, or None if not initialized or DP=1."""
+  try:
+    from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_data_parallel_group
+    if is_nmoe_parallel_initialized():
+      return get_data_parallel_group()
+  except ImportError:
+    pass
+  return None
+
+
+def _get_dp_size() -> int:
+  """Get DP world size (1 if not initialized)."""
+  try:
+    from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_dp_size
+    if is_nmoe_parallel_initialized():
+      return get_dp_size()
+  except ImportError:
+    pass
+  return 1
+
+
 def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups: list[dict], zero2_state: dict, cfg: Config, world: int) -> None:
   """Optimizer step with ZeRO-2 and post-step hooks.
 
   Handles:
-  - ZeRO-2 AdamW stepping for dense params (if world > 1)
-  - Muon stepping for expert params
+  - ZeRO-2 AdamW stepping for dense params (scoped to DP group when EP+DP)
+  - Expert gradient AllReduce over DP group (when DP > 1)
+  - Expert optimizer stepping
   - Post-step model updates (quantization rebuild, router bias)
   """
-  # ZeRO-2 AdamW step for dense params
+  dp_group = _get_dp_group()
+  dp_size = _get_dp_size()
+
+  # ZeRO-2 AdamW step for dense params.
+  # When EP+DP is active, ZeRO-2 uses the DP group (not WORLD).
+  # Dense params are replicated across DP ranks; ZeRO-2 shards within DP group.
   if world > 1:
+    pg = dp_group if dp_group is not None else dist.group.WORLD
     zero2.step_dense_adamw(
       dense_groups,
       state=zero2_state,
-      pg=dist.group.WORLD,
+      pg=pg,
       betas=(cfg.adam_beta1, cfg.adam_beta2),
       eps=cfg.adam_eps,
     )
   else:
     zero2.step_dense_adamw(dense_groups, state=zero2_state)
 
-  # Muon step for expert params (no ZeRO-2, params already sharded via RDEP)
+  # Expert gradient AllReduce over DP group.
+  # With EP+DP, each expert is replicated across dp_size ranks.
+  # Their gradients must be averaged before the optimizer step.
+  # Skip when fused backward-optimizer is active (AllReduce done inside backward).
+  is_fused_eco = isinstance(optimizer, _NullExpertOptimizer)
+  if not is_fused_eco and dp_size > 1 and dp_group is not None:
+    for p in optimizer.param_groups[0]['params']:
+      if p.grad is not None:
+        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=dp_group)
+
+  # Expert optimizer step (params already sharded via RDEP across EP group).
+  # _NullExpertOptimizer.step() is a no-op (fused backward-optimizer already ran).
   optimizer.step()
 
   # Post-step hooks (quantization rebuild, router bias update)
@@ -318,6 +410,7 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups:
         continue
 
       # Refresh quantized weight cache (FP8/NVFP4)
+      # Skip when fused backward-optimizer is active (refresh done inside backward).
       if (not getattr(optimizer, "emits_weight_cache", False)) and hasattr(ffn, 'refresh_weight_cache'):
         try:
           ffn.refresh_weight_cache()

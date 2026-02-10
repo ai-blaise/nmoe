@@ -265,14 +265,14 @@ class Rdep:
 
     def moe_blockscaled(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                         W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor,
-                        W_cache) -> torch.Tensor:
+                        W_cache, fused_eco=None, moe_ref=None) -> torch.Tensor:
         if self.profile == 'bf16':
             raise RuntimeError("moe_blockscaled() requires profile in {'fp8','nvfp4'}")
-        return _MoEBlockscaledFused.apply(self, x, eid, gates, W1, W3, W2, W_cache)
+        return _MoEBlockscaledFused.apply(self, x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
 
     def dispatch(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                  W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor,
-                 W_cache=None) -> torch.Tensor:
+                 W_cache=None, fused_eco=None, moe_ref=None) -> torch.Tensor:
         """Unified dispatch method that routes to moe_bf16 or moe_blockscaled.
 
         This method provides a single entry point for CUDA graph capture/replay,
@@ -286,6 +286,8 @@ class Rdep:
             W3: [E, H, Dff] up projection weights
             W2: [E, Dff, H] down projection weights
             W_cache: Pre-computed weight cache for blockscaled mode (optional)
+            fused_eco: FusedBackwardECO controller (optional, for fused backward-optimizer)
+            moe_ref: MoE module reference (optional, for fused backward-optimizer)
 
         Returns:
             [T, H] BF16 output tensor
@@ -311,7 +313,7 @@ class Rdep:
                 raise ValueError(
                     f"Blockscaled profile '{self.profile}' requires W_cache argument"
                 )
-            return self.moe_blockscaled(x, eid, gates, W1, W3, W2, W_cache)
+            return self.moe_blockscaled(x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
 
 
 class CudaGraphDispatch:

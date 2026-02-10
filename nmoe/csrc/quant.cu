@@ -439,6 +439,425 @@ __global__ void k_quantize_pack_tilewise_nvfp4_sf_strided_mma(
 }
 
 // ============================================================================
+// Direct compressed_tensors NVFP4 → blockscaled MMA conversion
+// ============================================================================
+// Converts NVFP4 compressed_tensors format (uint8 packed + E4M3 group scales +
+// F32 global_scale) directly to blockscaled MMA format (uint16 packed + E8M0
+// MMA-swizzled scales) without materializing BF16 intermediates.
+//
+// For W13 (interleaved): reads from two separate CT sources (W1, W3) and
+// produces interleaved output rows: [W1_row0, W3_row0, W1_row1, W3_row1, ...]
+//
+// CT packed format: byte = (hi_nibble << 4) | lo_nibble
+//   Element[2k] in lo nibble (bits 0-3), element[2k+1] in hi nibble (bits 4-7)
+//   E2M1 nibble: sign in bit 3, magnitude in bits 0-2
+//
+// Each row of CT input has K_in elements packed into K_in/2 bytes.
+// Each row of MMA output has K_in elements packed into K_in/4 uint16.
+// E8M0 scale factors: one per 32 elements, MMA-swizzled.
+
+// Single-source kernel: converts one CT triplet → MMA format.
+// Grid: (ceil(K_in, TILE_K) * ceil(M_out, QUANT_WARPS)), where M_out = E * M_per_expert
+// Each warp processes one output row.
+__global__ void k_ct_nvfp4_to_blockscaled_mma(
+    const uint8_t* __restrict__ ct_packed,   // [E, M_ct, K_in/2] compressed_tensors packed
+    const uint8_t* __restrict__ ct_scale,    // [E, M_ct, K_in/group_size] E4M3 per-group scales
+    const float*   __restrict__ ct_gs,       // [E] global scale per expert
+    uint16_t*      __restrict__ out_u16,     // [E*M_ct, K_in/4] MMA-packed output
+    uint8_t*       __restrict__ sf_mma,      // [E, M_stride, sf_k] E8M0 MMA-swizzled scales
+    int E, int M_ct, int K_in,              // Dimensions
+    int M_stride,                            // Per-expert MMA stride (must be multiple of 128)
+    int group_size,                          // CT group size (typically 16)
+    int sf_k)                                // K_in / 32
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if NMOE_ENABLE_PTX_E2M1
+    // Linearized grid: tile_k varies fastest
+    int tile_k_block = static_cast<int>(blockIdx.x);
+    const int grid_k = ceil_div(K_in, TILE_K);
+    const int m_block = tile_k_block / grid_k;
+    tile_k_block -= m_block * grid_k;
+    const int tile_k = tile_k_block * TILE_K;
+
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int m = m_block * QUANT_WARPS + warp_id;  // Global output row
+    const int M_total = E * M_ct;
+    if (m >= M_total) return;
+
+    // Determine expert and local row
+    const int e = m / M_ct;
+    const int m_local = m - e * M_ct;
+
+    // Expert-local SF base
+    const size_t expert_sf_base = static_cast<size_t>(e) * static_cast<size_t>(M_stride) * static_cast<size_t>(sf_k);
+
+    // Global scale for this expert
+    const float global_scale = ct_gs[e];
+    const float inv_gs = (global_scale > 0.0f) ? (1.0f / global_scale) : 0.0f;
+
+    // Row pointers into CT packed data and scales
+    const size_t ct_row_packed = (static_cast<size_t>(e) * M_ct + m_local) * (K_in / 2);
+    const size_t ct_row_scale = (static_cast<size_t>(e) * M_ct + m_local) * (K_in / group_size);
+
+    // Output row pointer
+    uint16_t* out_row = out_u16 + static_cast<size_t>(m) * (K_in / 4) + tile_k / 4;
+
+    const int k_end = min(tile_k + TILE_K, K_in);
+    const int k_span = k_end - tile_k;
+
+    const unsigned mask = 0xffffffffu;
+    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP4) {
+        const int k_abs = tile_k + k0 + lane;  // Absolute element index
+        float v = 0.0f;
+
+        if (lane < k_span - k0) {
+            // Unpack E2M1 nibble from CT format
+            const int byte_idx = k_abs / 2;
+            const uint8_t packed_byte = ct_packed[ct_row_packed + byte_idx];
+            const uint8_t nibble = (k_abs & 1) ? (packed_byte >> 4) : (packed_byte & 0x0F);
+
+            // Dequant nibble to float: sign * LUT[magnitude]
+            v = ptx::e2m1_nibble_to_f32(nibble);
+
+            // Apply per-group scale: effective_scale = E4M3_scale / global_scale
+            const int group_idx = k_abs / group_size;
+            const uint8_t scale_byte = ct_scale[ct_row_scale + group_idx];
+            const float group_scale_f32 = ptx::e4m3_byte_to_f32(scale_byte);
+            v *= group_scale_f32 * inv_gs;
+        }
+
+        // Warp-reduce amax over 32 elements
+        float amax = fabsf(v);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
+        }
+
+        // Lane 0 computes E8M0 scale and writes MMA-swizzled
+        int scale_i = 0;
+        if (lane == 0) {
+            float scale = amax / FP4_MAX;
+            if (!(scale > 0.0f)) scale = 1.0f;
+            const uint8_t scale_byte = ptx::e8m0_encode_from_pos_f32(scale);
+            const int k_sf = (tile_k + k0) / SF_VEC_FP4;
+            const size_t dst_offset = cutlass_sf_swizzle_offset(
+                static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
+                static_cast<uint32_t>(M_stride), static_cast<uint32_t>(sf_k));
+            sf_mma[expert_sf_base + dst_offset] = scale_byte;
+            scale_i = static_cast<int>(scale_byte);
+        }
+        scale_i = __shfl_sync(mask, scale_i, 0);
+        const uint8_t e8m0_byte = static_cast<uint8_t>(scale_i);
+        const float inv_scale = ptx::e8m0_inv_decode_to_f32(e8m0_byte);
+        const float af = v * inv_scale;
+
+        // Pack 4 E2M1 values per uint16 using PTX
+        const int g = lane & ~3;
+        const float v0 = __shfl_sync(mask, af, g + 0);
+        const float v1 = __shfl_sync(mask, af, g + 1);
+        const float v2 = __shfl_sync(mask, af, g + 2);
+        const float v3 = __shfl_sync(mask, af, g + 3);
+        if ((lane == g) && (g < k_span - k0)) {
+            out_row[(k0 >> 2) + (g >> 2)] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
+        }
+    }
+#else
+    (void)ct_packed; (void)ct_scale; (void)ct_gs; (void)out_u16; (void)sf_mma;
+    (void)E; (void)M_ct; (void)K_in; (void)M_stride; (void)group_size; (void)sf_k;
+    __trap();
+#endif
+#endif
+}
+
+// Dual-source interleaved kernel: converts two CT triplets (W1, W3) → interleaved MMA format.
+// Output rows: [W1_row0, W3_row0, W1_row1, W3_row1, ...]
+// M_out = 2 * M_ct per expert.
+__global__ void k_ct_nvfp4_to_blockscaled_mma_interleaved(
+    const uint8_t* __restrict__ ct_packed_a,  // [E, M_ct, K_in/2] W1 compressed_tensors packed
+    const uint8_t* __restrict__ ct_scale_a,   // [E, M_ct, K_in/group_size] W1 E4M3 scales
+    const float*   __restrict__ ct_gs_a,      // [E] W1 global scale
+    const uint8_t* __restrict__ ct_packed_b,  // [E, M_ct, K_in/2] W3 compressed_tensors packed
+    const uint8_t* __restrict__ ct_scale_b,   // [E, M_ct, K_in/group_size] W3 E4M3 scales
+    const float*   __restrict__ ct_gs_b,      // [E] W3 global scale
+    uint16_t*      __restrict__ out_u16,      // [E*2*M_ct, K_in/4] MMA-packed interleaved output
+    uint8_t*       __restrict__ sf_mma,       // [E, M_stride, sf_k] E8M0 MMA-swizzled scales
+    int E, int M_ct, int K_in,               // Dimensions (M_ct = Dff)
+    int M_stride,                             // Per-expert MMA stride for 2*M_ct (must be multiple of 128)
+    int group_size,
+    int sf_k)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+#if NMOE_ENABLE_PTX_E2M1
+    int tile_k_block = static_cast<int>(blockIdx.x);
+    const int grid_k = ceil_div(K_in, TILE_K);
+    const int m_block = tile_k_block / grid_k;
+    tile_k_block -= m_block * grid_k;
+    const int tile_k = tile_k_block * TILE_K;
+
+    const int warp_id = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int m = m_block * QUANT_WARPS + warp_id;  // Global output row
+    const int M_out = 2 * M_ct;
+    const int M_total = E * M_out;
+    if (m >= M_total) return;
+
+    // Determine expert and local output row
+    const int e = m / M_out;
+    const int m_local = m - e * M_out;  // [0, 2*M_ct)
+
+    // Determine source (W1 or W3) and source row
+    const int src_row = m_local / 2;  // Source row in W1 or W3
+    const int is_b = m_local & 1;     // 0 = W1, 1 = W3
+
+    // Select source pointers
+    const uint8_t* ct_packed = is_b ? ct_packed_b : ct_packed_a;
+    const uint8_t* ct_scale  = is_b ? ct_scale_b  : ct_scale_a;
+    const float    global_scale = is_b ? ct_gs_b[e] : ct_gs_a[e];
+    const float    inv_gs = (global_scale > 0.0f) ? (1.0f / global_scale) : 0.0f;
+
+    // Expert-local SF base
+    const size_t expert_sf_base = static_cast<size_t>(e) * static_cast<size_t>(M_stride) * static_cast<size_t>(sf_k);
+
+    // Row pointers into CT packed data and scales
+    const size_t ct_row_packed = (static_cast<size_t>(e) * M_ct + src_row) * (K_in / 2);
+    const size_t ct_row_scale  = (static_cast<size_t>(e) * M_ct + src_row) * (K_in / group_size);
+
+    // Output row pointer
+    uint16_t* out_row = out_u16 + static_cast<size_t>(m) * (K_in / 4) + tile_k / 4;
+
+    const int k_end = min(tile_k + TILE_K, K_in);
+    const int k_span = k_end - tile_k;
+
+    const unsigned mask = 0xffffffffu;
+    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP4) {
+        const int k_abs = tile_k + k0 + lane;
+        float v = 0.0f;
+
+        if (lane < k_span - k0) {
+            const int byte_idx = k_abs / 2;
+            const uint8_t packed_byte = ct_packed[ct_row_packed + byte_idx];
+            const uint8_t nibble = (k_abs & 1) ? (packed_byte >> 4) : (packed_byte & 0x0F);
+
+            v = ptx::e2m1_nibble_to_f32(nibble);
+
+            const int group_idx = k_abs / group_size;
+            const uint8_t scale_byte = ct_scale[ct_row_scale + group_idx];
+            const float group_scale_f32 = ptx::e4m3_byte_to_f32(scale_byte);
+            v *= group_scale_f32 * inv_gs;
+        }
+
+        float amax = fabsf(v);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
+        }
+
+        int scale_i = 0;
+        if (lane == 0) {
+            float scale = amax / FP4_MAX;
+            if (!(scale > 0.0f)) scale = 1.0f;
+            const uint8_t scale_byte = ptx::e8m0_encode_from_pos_f32(scale);
+            const int k_sf = (tile_k + k0) / SF_VEC_FP4;
+            const size_t dst_offset = cutlass_sf_swizzle_offset(
+                static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
+                static_cast<uint32_t>(M_stride), static_cast<uint32_t>(sf_k));
+            sf_mma[expert_sf_base + dst_offset] = scale_byte;
+            scale_i = static_cast<int>(scale_byte);
+        }
+        scale_i = __shfl_sync(mask, scale_i, 0);
+        const uint8_t e8m0_byte = static_cast<uint8_t>(scale_i);
+        const float inv_scale = ptx::e8m0_inv_decode_to_f32(e8m0_byte);
+        const float af = v * inv_scale;
+
+        const int g = lane & ~3;
+        const float v0 = __shfl_sync(mask, af, g + 0);
+        const float v1 = __shfl_sync(mask, af, g + 1);
+        const float v2 = __shfl_sync(mask, af, g + 2);
+        const float v3 = __shfl_sync(mask, af, g + 3);
+        if ((lane == g) && (g < k_span - k0)) {
+            out_row[(k0 >> 2) + (g >> 2)] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
+        }
+    }
+#else
+    (void)ct_packed_a; (void)ct_scale_a; (void)ct_gs_a;
+    (void)ct_packed_b; (void)ct_scale_b; (void)ct_gs_b;
+    (void)out_u16; (void)sf_mma;
+    (void)E; (void)M_ct; (void)K_in; (void)M_stride; (void)group_size; (void)sf_k;
+    __trap();
+#endif
+#endif
+}
+
+// Launch helpers
+inline cudaError_t launch_ct_nvfp4_to_blockscaled_mma(
+    const uint8_t* ct_packed, const uint8_t* ct_scale, const float* ct_gs,
+    uint16_t* out_u16, uint8_t* sf_mma,
+    int E, int M_ct, int K_in, int M_stride, int group_size, int sf_k,
+    cudaStream_t stream = 0)
+{
+#if NMOE_ENABLE_PTX_E2M1
+    const int M_total = E * M_ct;
+    const int grid_k = ceil_div(K_in, TILE_K);
+    const int grid_m = ceil_div(M_total, QUANT_WARPS);
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    dim3 block(QUANT_THREADS);
+    k_ct_nvfp4_to_blockscaled_mma<<<grid, block, 0, stream>>>(
+        ct_packed, ct_scale, ct_gs, out_u16, sf_mma,
+        E, M_ct, K_in, M_stride, group_size, sf_k);
+    return cudaGetLastError();
+#else
+    (void)ct_packed; (void)ct_scale; (void)ct_gs; (void)out_u16; (void)sf_mma;
+    (void)E; (void)M_ct; (void)K_in; (void)M_stride; (void)group_size; (void)sf_k; (void)stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+inline cudaError_t launch_ct_nvfp4_to_blockscaled_mma_interleaved(
+    const uint8_t* ct_packed_a, const uint8_t* ct_scale_a, const float* ct_gs_a,
+    const uint8_t* ct_packed_b, const uint8_t* ct_scale_b, const float* ct_gs_b,
+    uint16_t* out_u16, uint8_t* sf_mma,
+    int E, int M_ct, int K_in, int M_stride, int group_size, int sf_k,
+    cudaStream_t stream = 0)
+{
+#if NMOE_ENABLE_PTX_E2M1
+    const int M_total = E * 2 * M_ct;
+    const int grid_k = ceil_div(K_in, TILE_K);
+    const int grid_m = ceil_div(M_total, QUANT_WARPS);
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    dim3 block(QUANT_THREADS);
+    k_ct_nvfp4_to_blockscaled_mma_interleaved<<<grid, block, 0, stream>>>(
+        ct_packed_a, ct_scale_a, ct_gs_a,
+        ct_packed_b, ct_scale_b, ct_gs_b,
+        out_u16, sf_mma,
+        E, M_ct, K_in, M_stride, group_size, sf_k);
+    return cudaGetLastError();
+#else
+    (void)ct_packed_a; (void)ct_scale_a; (void)ct_gs_a;
+    (void)ct_packed_b; (void)ct_scale_b; (void)ct_gs_b;
+    (void)out_u16; (void)sf_mma;
+    (void)E; (void)M_ct; (void)K_in; (void)M_stride; (void)group_size; (void)sf_k; (void)stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// ============================================================================
+// Direct compressed_tensors NVFP4 → BF16 dequantization (GPU kernel)
+// ============================================================================
+// Converts NVFP4 compressed_tensors format directly to BF16 on GPU.
+// No float32 intermediates in global memory — all arithmetic in registers.
+//
+// CT packed: byte = (hi_nibble << 4) | lo_nibble
+//   element[2k] in lo nibble, element[2k+1] in hi nibble
+//   E2M1 nibble: sign bit 3, magnitude bits 0-2
+//
+// Supports optional transpose: when transpose=true, output[k][m] = dequant(input[m][k])
+//   Used for expert W1/W3/W2 where HF stores [E, out_features, in_features]
+//   but nmoe model expects [E, in_features, out_features].
+//
+// Grid: linear, each thread handles one BF16 output element.
+
+__global__ void k_ct_nvfp4_to_bf16(
+    const uint8_t* __restrict__ ct_packed,   // [M, K/2] compressed_tensors packed
+    const uint8_t* __restrict__ ct_scale,    // [M, n_groups] E4M3 per-group scales
+    const float*   __restrict__ ct_gs,       // [1] or [E] global scale
+    __nv_bfloat16* __restrict__ out,         // [M, K] BF16 output (or [K, M] if transpose)
+    int M, int K,                            // Input dimensions (rows × cols unpacked)
+    int group_size,                          // CT group size (typically 16)
+    int gs_stride,                           // 0 = single global_scale, 1 = per-expert
+    int expert_rows,                         // Rows per expert (0 = no expert dimension)
+    int transpose)                           // 1 = write transposed [K, M]
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * K;
+    if (idx >= total) return;
+
+    const int m = idx / K;
+    const int k = idx % K;
+
+    // Read the packed byte containing this element's nibble
+    const int byte_idx = m * (K / 2) + k / 2;
+    const uint8_t byte_val = ct_packed[byte_idx];
+
+    // Extract nibble: even k → lo nibble, odd k → hi nibble
+    const uint8_t nibble = (k & 1) ? ((byte_val >> 4) & 0x0F) : (byte_val & 0x0F);
+
+    // E2M1 dequant: sign in bit 3, magnitude LUT in bits 0-2
+    const int sign_bit = (nibble >> 3) & 1;
+    const int mag_idx = nibble & 0x07;
+
+    // E2M1 magnitude LUT: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+    // Encoded as float constants — compiler will keep in registers
+    float val;
+    switch (mag_idx) {
+        case 0: val = 0.0f; break;
+        case 1: val = 0.5f; break;
+        case 2: val = 1.0f; break;
+        case 3: val = 1.5f; break;
+        case 4: val = 2.0f; break;
+        case 5: val = 3.0f; break;
+        case 6: val = 4.0f; break;
+        default: val = 6.0f; break;
+    }
+    if (sign_bit) val = -val;
+
+    // Apply per-group E4M3 scale / global_scale
+    const int n_groups = K / group_size;
+    const int group_idx = k / group_size;
+    const int scale_idx = m * n_groups + group_idx;
+    const float group_scale = ptx::e4m3_byte_to_f32(ct_scale[scale_idx]);
+
+    // Global scale: single value or per-expert
+    float global_scale;
+    if (gs_stride == 0) {
+        global_scale = ct_gs[0];
+    } else {
+        const int expert_idx = (expert_rows > 0) ? (m / expert_rows) : 0;
+        global_scale = ct_gs[expert_idx];
+    }
+
+    val *= group_scale / fmaxf(global_scale, 1e-10f);
+
+    // Write output
+    if (transpose) {
+        // Transposed write: out[k, m] = val
+        out[k * M + m] = __float2bfloat16(val);
+    } else {
+        // Normal write: out[m, k] = val
+        out[idx] = __float2bfloat16(val);
+    }
+#else
+    (void)ct_packed; (void)ct_scale; (void)ct_gs;
+    (void)out; (void)M; (void)K; (void)group_size;
+    (void)gs_stride; (void)expert_rows; (void)transpose;
+#endif
+}
+
+inline cudaError_t launch_ct_nvfp4_to_bf16(
+    const uint8_t* ct_packed,
+    const uint8_t* ct_scale,
+    const float* ct_gs,
+    __nv_bfloat16* out,
+    int M, int K, int group_size,
+    int gs_stride, int expert_rows, int transpose,
+    cudaStream_t stream = 0)
+{
+    const int total = M * K;
+    if (total <= 0) return cudaSuccess;
+    constexpr int BLOCK = 256;
+    const int grid = ceil_div(total, BLOCK);
+    k_ct_nvfp4_to_bf16<<<grid, BLOCK, 0, stream>>>(
+        ct_packed, ct_scale, ct_gs, out,
+        M, K, group_size, gs_stride, expert_rows, transpose);
+    return cudaGetLastError();
+}
+
+// ============================================================================
 // SwiGLU + Quantization (fused) for expert MLP
 // ============================================================================
 // Input:  h13 [M, 2*K] BF16 interleaved columns: [gate0, up0, gate1, up1, ...]
@@ -2263,4 +2682,80 @@ extern "C" cudaError_t fused_dense_quant_fp8_gemm_bf16(
         reinterpret_cast<const __nv_bfloat16*>(bias),
         reinterpret_cast<__nv_bfloat16*>(Y), ldy,
         M, N, K, stream);
+}
+
+// ============================================================================
+// C API: Direct compressed_tensors NVFP4 → blockscaled MMA
+// ============================================================================
+
+extern "C" cudaError_t ct_nvfp4_to_blockscaled_mma(
+    const void* ct_packed, const void* ct_scale, const void* ct_gs,
+    void* out, void* sf_mma,
+    int E, int M_ct, int K_in, int M_stride, int group_size,
+    cudaStream_t stream)
+{
+    if ((K_in & 31) != 0) return cudaErrorInvalidValue;
+    if ((M_stride & 127) != 0) return cudaErrorInvalidValue;
+    const int sf_k = K_in / 32;
+    if ((sf_k & 3) != 0) return cudaErrorInvalidValue;
+    if (group_size <= 0 || (K_in % group_size) != 0) return cudaErrorInvalidValue;
+
+    return nmoe::quant::launch_ct_nvfp4_to_blockscaled_mma(
+        reinterpret_cast<const uint8_t*>(ct_packed),
+        reinterpret_cast<const uint8_t*>(ct_scale),
+        reinterpret_cast<const float*>(ct_gs),
+        reinterpret_cast<uint16_t*>(out),
+        reinterpret_cast<uint8_t*>(sf_mma),
+        E, M_ct, K_in, M_stride, group_size, sf_k,
+        stream);
+}
+
+extern "C" cudaError_t ct_nvfp4_to_blockscaled_mma_interleaved(
+    const void* ct_packed_a, const void* ct_scale_a, const void* ct_gs_a,
+    const void* ct_packed_b, const void* ct_scale_b, const void* ct_gs_b,
+    void* out, void* sf_mma,
+    int E, int M_ct, int K_in, int M_stride, int group_size,
+    cudaStream_t stream)
+{
+    if ((K_in & 31) != 0) return cudaErrorInvalidValue;
+    if ((M_stride & 127) != 0) return cudaErrorInvalidValue;
+    const int sf_k = K_in / 32;
+    if ((sf_k & 3) != 0) return cudaErrorInvalidValue;
+    if (group_size <= 0 || (K_in % group_size) != 0) return cudaErrorInvalidValue;
+
+    return nmoe::quant::launch_ct_nvfp4_to_blockscaled_mma_interleaved(
+        reinterpret_cast<const uint8_t*>(ct_packed_a),
+        reinterpret_cast<const uint8_t*>(ct_scale_a),
+        reinterpret_cast<const float*>(ct_gs_a),
+        reinterpret_cast<const uint8_t*>(ct_packed_b),
+        reinterpret_cast<const uint8_t*>(ct_scale_b),
+        reinterpret_cast<const float*>(ct_gs_b),
+        reinterpret_cast<uint16_t*>(out),
+        reinterpret_cast<uint8_t*>(sf_mma),
+        E, M_ct, K_in, M_stride, group_size, sf_k,
+        stream);
+}
+
+// ============================================================================
+// C API: Direct compressed_tensors NVFP4 → BF16
+// ============================================================================
+
+extern "C" cudaError_t ct_nvfp4_to_bf16(
+    const void* ct_packed, const void* ct_scale, const void* ct_gs,
+    void* out,
+    int M, int K, int group_size,
+    int gs_stride, int expert_rows, int transpose,
+    cudaStream_t stream)
+{
+    if (K <= 0 || M <= 0) return cudaSuccess;
+    if ((K & 1) != 0) return cudaErrorInvalidValue;  // K must be even (packed pairs)
+    if (group_size <= 0 || (K % group_size) != 0) return cudaErrorInvalidValue;
+
+    return nmoe::quant::launch_ct_nvfp4_to_bf16(
+        reinterpret_cast<const uint8_t*>(ct_packed),
+        reinterpret_cast<const uint8_t*>(ct_scale),
+        reinterpret_cast<const float*>(ct_gs),
+        reinterpret_cast<__nv_bfloat16*>(out),
+        M, K, group_size, gs_stride, expert_rows, transpose,
+        stream);
 }

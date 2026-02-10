@@ -23,6 +23,8 @@ from nmoe.distributed.init_groups import (
     get_ep_rank,
     get_tp_rank,
     get_data_parallel_group,
+    get_dp_size,
+    get_dp_rank,
 )
 
 from nmoe.distributed.ep_tp_shard import (
@@ -53,6 +55,8 @@ __all__ = [
     "get_ep_rank",
     "get_tp_rank",
     "get_data_parallel_group",
+    "get_dp_size",
+    "get_dp_rank",
     # EP+TP Weight Sharding
     "ShardInfo",
     "get_shard_info",
