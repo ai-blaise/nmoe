@@ -60,9 +60,8 @@ ep_size = 8                      # Expert Parallelism: 128 experts / 8 = 16 per 
 dp_size = 16                     # Data Parallelism: 128 GPUs / 8 EP = 16 replicas
 
 # =============================================================================
-# Data
+# Data (SFT uses sft_data_path below; data_path not needed for SFT mode)
 # =============================================================================
-data_path = "/home/nourdine/nmoe_data/interactive-agent-rerolled"
 
 # =============================================================================
 # Optimizer (differentiated LR for SFT stability)
@@ -83,10 +82,10 @@ warmup_steps = 200               # Linear warmup over 200 steps (~2% of total)
 # ECO Optimizer — NVFP4 Primary + FP8 States
 # =============================================================================
 eco_enabled = true
-eco_primary_format = "nvfp4"     # NVFP4 primary weights (no BF16 master copy)
-eco_quant_format = "fp8"         # FP8 optimizer states (m=E5M2, v=E4M3)
 eco_error_feedback = true        # Error correction feedback into momentum
 eco_stochastic_rounding = true   # SR for NVFP4 E2M1 quantization
+eco_fused_backward = true        # Fuse optimizer into backward — CUDA kernel path, no Python fallback
+eco_factored_v = true            # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
 gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a time
 
 # =============================================================================
@@ -94,8 +93,9 @@ gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a tim
 # =============================================================================
 steps = 10000
 dtype = "nvfp4"
-batch_size = 256                 # Global batch size (256 / DP=16 = 16 per rank)
+batch_size = 256                 # Global batch size (256 / DP=16 / accum=8 = 2 per micro-batch)
 seq_len = 4096
+gradient_accumulation_steps = 8  # B=2 micro-batch per GPU (8.7 GiB activation headroom)
 resume = false
 grad_clip = 1.0
 
@@ -110,7 +110,7 @@ checkpoint_keep_last_n = 5       # Keep last 5 checkpoints, purge older
 # SFT
 # =============================================================================
 sft_enabled = true
-sft_data_path = "/home/nourdine/nmoe_data/interactive-agent-rerolled"
+sft_data_path = "BlaiseAI/interactive-agent-rerolled"
 sft_mask_prompt_loss = true      # Only compute loss on assistant response tokens
 sft_prompt_format = "deepseekv32"
-sft_packing_enabled = false      # No packing implementation yet in nmoe
+sft_packing_enabled = true       # FFD bin-packing: 2-3x throughput, zero memory cost
