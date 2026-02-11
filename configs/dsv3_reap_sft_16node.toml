@@ -103,7 +103,7 @@ dtype = "nvfp4"
 batch_size = 256                 # Global batch size (256 / DP=16 / accum=8 = 2 per micro-batch)
 seq_len = 4096
 gradient_accumulation_steps = 8  # B=2 micro-batch per GPU (8.7 GiB activation headroom)
-resume = false
+resume = true
 grad_clip = 1.0
 
 # =============================================================================
