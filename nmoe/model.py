@@ -68,8 +68,11 @@ def _create_rdep(config, ep_size: int) -> Rdep:
   """
   _validate_moe_config(config, ep_size)
   n_local = config.n_routed_experts // max(1, ep_size)
-  # Worst-case: every token's K experts land on a single rank after all-to-all
-  capacity = int(config.batch_size * config.seq_len * config.n_activated_experts * max(1, ep_size))
+  # Capacity = max token-expert slots per GPU in one micro-batch.
+  # Global batch is split across DP ranks and gradient accumulation steps.
+  dp = config.dp_size if config.dp_size else 1
+  micro_batch = max(1, config.batch_size // (dp * config.gradient_accumulation_steps))
+  capacity = int(micro_batch * config.seq_len * config.n_activated_experts)
   ep_group = _get_ep_group()
   return Rdep(
     config.dim,
