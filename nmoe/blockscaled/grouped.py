@@ -2437,8 +2437,6 @@ def quantize_weights(
     Returns:
         QuantizedWeightsFused with interleaved W13 and W2
     """
-    # imports resolved at module top
-
     E, H, Dff = W1.shape
     if H % 128 != 0:
         raise ValueError(f"H must be a multiple of 128. Got H={H}.")
