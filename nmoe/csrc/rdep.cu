@@ -567,6 +567,25 @@ extern "C" void rdep_alloc_bf16(size_t capacity, int H, int n_local) {
 
     rdep_ensure_ipc_shared_buffer(total_size);
     g_bf16.buffer_ptrs[g_bf16.rank] = g_ipc_shared_buf;
+    // Blockscaled and BF16 payloads share the same base IPC allocation.
+    // If blockscaled was allocated first with a smaller buffer and we just
+    // grew the shared buffer, refresh blockscaled's pointer to the new one.
+    g_block.buffer_ptrs[g_block.rank] = g_ipc_shared_buf;
+    g_block.buffer_size = g_ipc_shared_bytes;
+    if (g_block.initialized) {
+        int block_Hp = g_block.Hp;
+        int block_Hsf = g_block.Hsf;
+        [[maybe_unused]] size_t bk_x_off, bk_sfa_off, bk_y_off, bk_meta_off, bk_counter_off, bk_dropped_off, bk_buf_ptrs_off, bk_sig_ptrs_off, bk_tok_y_off, bk_tok_gate_off;
+        size_t bk_barrier_off, bk_total_size;
+        blockscaled_buffer_offsets(g_block.capacity, g_block.H, block_Hp, block_Hsf, g_block.world,
+                                   &bk_x_off, &bk_sfa_off, &bk_y_off,
+                                   &bk_meta_off, &bk_counter_off, &bk_dropped_off,
+                                   &bk_barrier_off, &bk_buf_ptrs_off, &bk_sig_ptrs_off,
+                                   &bk_tok_y_off, &bk_tok_gate_off,
+                                   &bk_total_size);
+        char* bk_local = static_cast<char*>(g_block.buffer_ptrs[g_block.rank]);
+        g_block.barrier_signal_ptrs[g_block.rank] = reinterpret_cast<int*>(bk_local + bk_barrier_off);
+    }
 
     // Set local barrier signal pointer
     char* local_buf = static_cast<char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
