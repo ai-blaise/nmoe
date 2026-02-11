@@ -25,6 +25,13 @@ preset = "dsv3_reap"
 experiment_id = "dsv3_reap_sft_16node"
 
 # =============================================================================
+# Paths (must be writable on all training nodes)
+# =============================================================================
+metrics_dir = "/home/nourdine/nmoe_metrics"
+experiments_db = "/home/nourdine/nmoe_experiments.db"
+tokenizer_path = "BlaiseAI/DeepSeek-V3.2-REAP-345B-NVFP4A16"
+
+# =============================================================================
 # Model Architecture (REAP-345B specific)
 # =============================================================================
 vocab_size = 129280              # DeepSeek V3.2 / REAP native vocab (NOT 163840)
