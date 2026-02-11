@@ -23,7 +23,7 @@ from nmoe.model import Transformer, TransformerBlock, MoE, MLP, Router
 from nmoe.rdep import Rdep, CudaGraphDispatch
 
 # MoE autograd functions (internal use - exported for advanced users)
-from nmoe.moe import expert, _MoEBf16Fused, _MoEBlockscaledFused
+from nmoe.moe import _MoEBlockscaledFused
 
 # Optimization components
 from nmoe.fused_router import FusedRouterTopKDispatch
@@ -75,8 +75,6 @@ __all__ = [
     "MoE",
     "MLP",
     "Router",
-    "expert",
-    "_MoEBf16Fused",
     "_MoEBlockscaledFused",
     "Rdep",
     "CudaGraphDispatch",

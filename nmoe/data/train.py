@@ -7,6 +7,7 @@ removes the legacy single-source oracle training path.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import random
 import time
@@ -30,6 +31,7 @@ from .hydra_dataset import (
 )
 from .model import Transformer, pool_hidden
 
+logger = logging.getLogger(__name__)
 
 EOS_TOKEN_ID = 199999
 
@@ -431,14 +433,14 @@ def train_phase_a(cfg: PhaseAConfig) -> None:
 
     if rank == 0 and (step == 1 or (step % log_every == 0)):
       dt = (time.perf_counter() - t0) * 1000.0
-      print(f"[hydra][phase_a] step={step}/{cfg.max_steps} loss={float(loss.item()):.4f} ms/step={dt:.1f}")
+      logger.info("[phase_a] step=%d/%d loss=%.4f ms/step=%.1f", step, cfg.max_steps, float(loss.item()), dt)
 
     # Early stopping: if loss below threshold for patience steps, stop
     loss_val = float(loss.item())
     loss_history.append(loss_val)
     if len(loss_history) == early_stop_patience and max(loss_history) < early_stop_loss:
       if rank == 0:
-        print(f"[hydra][phase_a] early stop: loss < {early_stop_loss} for {early_stop_patience} steps")
+        logger.info("[phase_a] early stop: loss < %s for %d steps", early_stop_loss, early_stop_patience)
       break
 
     # Checkpoint every 5k steps
@@ -447,7 +449,7 @@ def train_phase_a(cfg: PhaseAConfig) -> None:
       out.mkdir(parents=True, exist_ok=True)
       ckpt_path = out / f"hydra_probe_phase_a_step{step}.pt"
       torch.save(probe.state_dict(), ckpt_path)
-      print(f"[hydra][phase_a] checkpoint saved: {ckpt_path}")
+      logger.info("[phase_a] checkpoint saved: %s", ckpt_path)
 
   if rank == 0:
     out = Path(cfg.out_dir)
@@ -538,9 +540,9 @@ def train_phase_b(cfg: PhaseBConfig) -> None:
     if rank == 0 and (step == 1 or (step % log_every == 0)):
       dt = (time.perf_counter() - t0) * 1000.0
       pair_str = f" pair={float(pair_loss.item()):.4f}" if pair_loss is not None else ""
-      print(
-        f"[hydra][phase_b] step={step}/{cfg.max_steps} loss={float(loss.item()):.4f} "
-        f"oracle={float(oracle_loss.item()):.4f}{pair_str} ms/step={dt:.1f}"
+      logger.info(
+        "[phase_b] step=%d/%d loss=%.4f oracle=%.4f%s ms/step=%.1f",
+        step, cfg.max_steps, float(loss.item()), float(oracle_loss.item()), pair_str, dt,
       )
 
     # Checkpoint every 2k steps (Phase B is shorter)
@@ -549,7 +551,7 @@ def train_phase_b(cfg: PhaseBConfig) -> None:
       out.mkdir(parents=True, exist_ok=True)
       ckpt_path = out / f"hydra_judge_step{step}.pt"
       torch.save(judge.export(), ckpt_path)
-      print(f"[hydra][phase_b] checkpoint saved: {ckpt_path}")
+      logger.info("[phase_b] checkpoint saved: %s", ckpt_path)
 
   if rank == 0:
     out = Path(cfg.out_dir)
@@ -653,7 +655,7 @@ def train_phase_c(cfg: PhaseCConfig) -> None:
 
     if rank == 0 and (step == 1 or (step % log_every == 0)):
       dt = (time.perf_counter() - t0) * 1000.0
-      print(f"[hydra][phase_c] step={step}/{cfg.max_steps} loss={float(loss.item()):.4f} ms/step={dt:.1f}")
+      logger.info("[phase_c] step=%d/%d loss=%.4f ms/step=%.1f", step, cfg.max_steps, float(loss.item()), dt)
 
     # Checkpoint every 10k steps (Phase C is longest)
     if rank == 0 and step % 10000 == 0:
@@ -661,7 +663,7 @@ def train_phase_c(cfg: PhaseCConfig) -> None:
       out.mkdir(parents=True, exist_ok=True)
       ckpt_path = out / f"hydra_probe_step{step}.pt"
       torch.save(probe.state_dict(), ckpt_path)
-      print(f"[hydra][phase_c] checkpoint saved: {ckpt_path}")
+      logger.info("[phase_c] checkpoint saved: %s", ckpt_path)
 
   if rank == 0:
     out = Path(cfg.out_dir)

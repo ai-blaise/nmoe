@@ -8,6 +8,7 @@ This module is intentionally small:
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -18,6 +19,7 @@ import torch
 try:
   import pyarrow.parquet as pq
 except ImportError:
+  logging.getLogger(__name__).debug("pyarrow not available, parquet support disabled")
   pq = None  # type: ignore
 
 

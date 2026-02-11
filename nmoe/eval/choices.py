@@ -9,15 +9,17 @@ Design constraints (Issue [07]):
 """
 
 import argparse
+import logging
 import math
-from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 import tiktoken
 
 from nmoe.eval.adapters import iter_choices
+
+logger = logging.getLogger(__name__)
 
 
 BASELINES: dict[str, float] = {
@@ -46,12 +48,6 @@ FULL_TASKS: list[tuple[str, str]] = DEFAULT_TASKS + [
     ("BoolQ", "hf:google/boolq:validation"),
     ("COPA", "hf:super_glue:copa:validation"),
 ]
-
-
-@dataclass(frozen=True)
-class ChoiceEvalStats:
-    correct: int
-    total: int
 
 
 def _centered_acc(acc: float, baseline: float) -> float:
@@ -305,8 +301,7 @@ def run_eval(
             )
         except Exception as e:
             out[task_name] = {"acc": 0.0, "centered_acc": 0.0, "n": 0.0, "error": str(e)}
-            if rank == 0:
-                print(f"[eval/choices] task '{task_name}' failed: {e}")
+            logger.warning("task '%s' failed: %s", task_name, e)
     return out
 
 

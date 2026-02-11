@@ -76,8 +76,3 @@ def humaneval_check(
     """Run HumanEval tests for a prompt+completion."""
     code = prompt + _strip_code_fences(completion) + "\n" + tests + "\n"
     return run_python(code, timeout_s=timeout_s)
-
-
-def execute_code(code: str, timeout: float = 5.0) -> ExecResult:
-    """Backward-compatible entrypoint for HumanEval task implementations."""
-    return run_python(code, timeout_s=float(timeout))

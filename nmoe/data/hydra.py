@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -16,9 +17,12 @@ from .train import ProbeHead, JudgeEncoder
 from .score import build_prompt, right_trim, grade_prompts, compute_aggregated
 from .docid import parse_doc_id, shard_path
 
+logger = logging.getLogger(__name__)
+
 try:
   from openai_harmony import HarmonyEncodingName, load_harmony_encoding
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+  logging.getLogger(__name__).debug("openai_harmony not available: %s", e)
   HarmonyEncodingName = None  # type: ignore
   load_harmony_encoding = None  # type: ignore
 
@@ -171,7 +175,7 @@ def cmd_oracle_label(args: argparse.Namespace) -> int:
                         json.dump(partial, pf)
                     print(f"wrote {wrote} (this run), total_seen={total_seen}, ok={ok_total}", flush=True)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Summary write failed", exc_info=True)
 
         # Stream results as each sequence finishes
         _ = grade_prompts(gen, enc, prompts, max_new=args.max_new, on_finish=on_finish)
@@ -372,7 +376,7 @@ def load_local_hydra_probe(*, model: Transformer, heads_dir: str | Path, device:
   if probe_path.exists():
     probe.load_state_dict(torch.load(probe_path, map_location=device))
   else:
-    print(f"[hydra] Warning: No probe checkpoint found in {ckpt_dir}, using random init")
+    logger.warning("No probe checkpoint found in %s, using random init", ckpt_dir)
   probe = probe.to(device=device, dtype=torch.bfloat16)
   probe.eval()
   return probe
@@ -703,7 +707,7 @@ def cmd_grade(args: argparse.Namespace) -> int:
       if total % (B * 10) == 0:
         elapsed = time.perf_counter() - t_start
         rate = total / elapsed if elapsed > 0 else 0
-        print(f"[hydra] processed {total} docs | kept={kept} dropped={dropped} band={band} early_exit={early_exits} | {rate:.1f} docs/s")
+        logger.info("processed %d docs | kept=%d dropped=%d band=%d early_exit=%d | %.1f docs/s", total, kept, dropped, band, early_exits, rate)
 
       chunk = []
 

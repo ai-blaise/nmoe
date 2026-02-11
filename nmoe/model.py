@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 from importlib import import_module
 
 import torch
@@ -417,20 +417,46 @@ class TransformerBlock(nn.Module):
     self.attn.init_weights(self.init_std)
     self.ffn.init_weights(self.init_std)
 
+  def _attn_supports_cu_seqlens(self) -> bool:
+    """Check if the attention module accepts a cu_seqlens parameter.
+
+    Cached after first call to avoid repeated introspection overhead.
+    """
+    if not hasattr(self, '_attn_has_cu_seqlens'):
+      import inspect
+      try:
+        sig = inspect.signature(self.attn.forward)
+        self._attn_has_cu_seqlens = 'cu_seqlens' in sig.parameters
+      except (ValueError, TypeError):
+        self._attn_has_cu_seqlens = False
+    return self._attn_has_cu_seqlens
+
   @record_function("block")
-  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+              cu_seqlens: list[torch.Tensor] | None = None) -> torch.Tensor:
+    pass_cu = cu_seqlens is not None and self._attn_supports_cu_seqlens()
+
     if self._use_gradient_checkpointing:
       # Checkpoint both attention and FFN/MoE for memory efficiency
       # Use configured kwargs (defaults to use_reentrant=False for modern PyTorch)
-      x = x + torch.utils.checkpoint.checkpoint(
-        self.attn, self.attn_norm(x), cos, sin, **self._gradient_checkpointing_kwargs
-      )
+      if pass_cu:
+        x = x + torch.utils.checkpoint.checkpoint(
+          self.attn, self.attn_norm(x), cos, sin, cu_seqlens, **self._gradient_checkpointing_kwargs
+        )
+      else:
+        x = x + torch.utils.checkpoint.checkpoint(
+          self.attn, self.attn_norm(x), cos, sin, **self._gradient_checkpointing_kwargs
+        )
       x = x + torch.utils.checkpoint.checkpoint(
         self.ffn, self.ffn_norm(x), **self._gradient_checkpointing_kwargs
       )
     else:
       # No checkpointing - faster but more memory
-      x = x + self.attn(self.attn_norm(x), cos, sin)
+      # Pass cu_seqlens to attention if supported (MLA, KDA)
+      if pass_cu:
+        x = x + self.attn(self.attn_norm(x), cos, sin, cu_seqlens=cu_seqlens)
+      else:
+        x = x + self.attn(self.attn_norm(x), cos, sin)
       x = x + self.ffn(self.ffn_norm(x))
     return x
 
@@ -444,9 +470,6 @@ class Transformer(nn.Module):
     self.config = config
     self._use_fused_router = use_fused_router
     self._gradient_checkpointing_kwargs = {"use_reentrant": False}  # Default kwargs
-    # Use ep_size for expert partitioning (not world_size).
-    # With EP=8 on 128 GPUs: 128/8 = 16 local experts per GPU.
-    # With EP=1 (default): falls back to world_size for backward compatibility.
     ep_size = getattr(config, 'ep_size', 1)
     if ep_size <= 1:
       # Backward compat: if no ep_size configured, use world_size (EP = world)
@@ -534,14 +557,51 @@ class Transformer(nn.Module):
     return self.blocks[0]._use_gradient_checkpointing
 
   @record_function("transformer")
-  def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+  def forward(self, tokens: torch.Tensor,
+              cu_seqlens: list[torch.Tensor] | None = None) -> torch.Tensor:
+    """Forward pass through the full transformer.
+
+    Args:
+      tokens: Input token IDs [B, S].
+      cu_seqlens: Optional list of B int32 tensors for packed sequence attention.
+                  When provided, attention layers use document-isolated causal masking
+                  so tokens from different packed documents cannot attend to each other.
+    """
     with record_function("embedding"):
       x = self.embedding(tokens) * self.mup_scale_factor
     seqlen = tokens.size(1)
-    cos = self.rope.cos[:seqlen]
-    sin = self.rope.sin[:seqlen]
+    if cu_seqlens is not None:
+      # Packed sequences: build per-document position IDs that reset to 0
+      # at each document boundary so RoPE encodes intra-document positions.
+      # Without this, documents packed at position 500+ would get RoPE
+      # frequencies as if they were at absolute positions 500+, which is wrong.
+      #
+      # Algorithm: seq_positions = [0,1,2,...,S-1] per row, then subtract the
+      # cumulative start of each document. E.g. cu_seqlens=[0,300,700,4096]:
+      #   positions 0-299   -> 0-299   (doc 0, subtract 0)
+      #   positions 300-699 -> 0-399   (doc 1, subtract 300)
+      #   positions 700+    -> 0-3395  (doc 2, subtract 700)
+      bsz = tokens.size(0)
+      position_ids = torch.arange(seqlen, device=tokens.device).unsqueeze(0).expand(bsz, -1)
+      # Build doc_starts: for each position, the cu_seqlen boundary that starts its document.
+      # Use searchsorted to find which document each position belongs to, then look up its start.
+      doc_starts = torch.zeros(bsz, seqlen, dtype=torch.long, device=tokens.device)
+      for b in range(bsz):
+        cu = cu_seqlens[b].to(dtype=torch.long, device=tokens.device)
+        # searchsorted(cu, positions, right=True) - 1 gives the document index for each position
+        doc_idx = torch.searchsorted(cu, position_ids[b], right=True) - 1
+        doc_idx = doc_idx.clamp(min=0, max=cu.shape[0] - 2)
+        doc_starts[b] = cu[doc_idx]
+      position_ids = position_ids - doc_starts
+      # Index into precomputed RoPE table: [B, S] -> [B, S, head_dim//2]
+      cos = self.rope.cos[position_ids]
+      sin = self.rope.sin[position_ids]
+    else:
+      # Standard sequential positions
+      cos = self.rope.cos[:seqlen]
+      sin = self.rope.sin[:seqlen]
     for block in self.blocks:
-      x = block(x, cos, sin)
+      x = block(x, cos, sin, cu_seqlens=cu_seqlens)
     with torch.no_grad():
       moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
       if moe_layers:

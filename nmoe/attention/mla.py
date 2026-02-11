@@ -87,6 +87,221 @@ def _mla_sdpa_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax
   return out.transpose(1, 2)
 
 
+def _mla_sdpa_packed_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    cu_seqlens_list: list[torch.Tensor],
+) -> torch.Tensor:
+  """MLA attention using FlexAttention with block_mask for packed sequences.
+
+  Builds a block-diagonal causal mask from cu_seqlens so that tokens from
+  different documents within a packed sequence cannot attend to each other.
+  Uses PyTorch's FlexAttention which compiles the mask into block-sparse
+  attention, avoiding O(S^2) mask materialization.
+
+  Args:
+    q: Query tensor [B, S, H, D_qk]
+    k: Key tensor [B, S, H, D_qk]
+    v: Value tensor [B, S, H, D_v]
+    softmax_scale: Softmax scaling factor
+    cu_seqlens_list: List of B int32 tensors, each [num_docs_i + 1] marking
+                     document boundaries within batch element i.
+
+  Returns:
+    Output tensor [B, S, H, D_v]
+  """
+  from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+
+  bsz, seqlen, n_heads, d_qk = q.shape
+  d_v = v.shape[-1]
+
+  # Build a document_id tensor: [B, S] where each position maps to its document index.
+  # Uses vectorized searchsorted instead of Python loops to avoid CPU-GPU sync overhead.
+  positions = torch.arange(seqlen, device=q.device)
+  doc_ids = torch.zeros(bsz, seqlen, dtype=torch.int32, device=q.device)
+  for b_idx in range(bsz):
+    cu = cu_seqlens_list[b_idx].to(dtype=torch.long, device=q.device)
+    doc_ids[b_idx] = (torch.searchsorted(cu, positions, right=True) - 1).clamp(min=0).to(torch.int32)
+
+  # Transpose to [B, H, S, D] for FlexAttention
+  Q = q.transpose(1, 2).contiguous()
+  K = k.transpose(1, 2).contiguous()
+  V = v.transpose(1, 2).contiguous()
+
+  def mask_mod(b, h, q_idx, kv_idx, _doc_ids=doc_ids):
+    # Document isolation: q and kv must be in the same document
+    same_doc = _doc_ids[b, q_idx] == _doc_ids[b, kv_idx]
+    # Causal: kv_idx <= q_idx
+    causal_ok = kv_idx <= q_idx
+    return same_doc & causal_ok
+
+  with _nvtx("attn/flex_packed_mask"):
+    block_mask = create_block_mask(
+        mask_mod, B=bsz, H=n_heads, Q_LEN=seqlen, KV_LEN=seqlen,
+        device=q.device, BLOCK_SIZE=(128, 128),
+    )
+
+  try:
+    _compiled_flex = torch.compile(flex_attention)
+  except Exception as _e:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "torch.compile(flex_attention) failed: %s. Using eager mode (slower).", _e)
+    _compiled_flex = flex_attention
+
+  with _nvtx("attn/flex_packed_fwd"):
+    out = _compiled_flex(
+        Q, K, V,
+        block_mask=block_mask,
+        scale=softmax_scale,
+        enable_gqa=False,
+        return_lse=False,
+    )
+
+  # Back to [B, S, H, D_v]
+  return out.transpose(1, 2)
+
+
+class _MlaFlashMlaVarlenPacked(torch.autograd.Function):
+  """MLA attention using FlashMLA varlen for packed sequences.
+
+  Uses the FlashMLA dense_prefill_fwd/bwd with per-document cu_seqlens
+  to achieve zero-mask-memory document-isolated causal attention.
+
+  This processes each batch element independently through the varlen API,
+  since each element may have a different number of packed documents.
+  """
+
+  @staticmethod
+  def forward(ctx, q, k, v, softmax_scale, cu_seqlens_list):
+    """Forward pass with FlashMLA varlen for packed sequences.
+
+    Args:
+      q: [B, S, H, D_qk] query tensor (BF16, CUDA)
+      k: [B, S, H, D_qk] key tensor
+      v: [B, S, H, D_v] value tensor
+      softmax_scale: float scaling factor
+      cu_seqlens_list: list of B int32 tensors, each [num_docs_i + 1]
+    """
+    from flash_mla import flash_attn_varlen_func
+
+    bsz, seqlen, n_heads, d_qk = q.shape
+    d_v = v.shape[-1]
+
+    # Process each batch element through varlen API
+    outputs = []
+    all_lse = []
+    all_cu = []
+    max_seqlens = []
+
+    for b in range(bsz):
+      cu = cu_seqlens_list[b]  # [num_docs + 1] int32
+      # Filter out zero-length padding "documents" at the end
+      # (the packer may add a padding region as the last segment)
+      num_docs = cu.shape[0] - 1
+      total_tokens = cu[-1].item()
+
+      # Extract this batch element's tokens
+      q_b = q[b, :total_tokens].contiguous()  # [total_tokens, H, D_qk]
+      k_b = k[b, :total_tokens].contiguous()
+      v_b = v[b, :total_tokens].contiguous()
+
+      # Compute max seqlen for this batch element
+      doc_lengths = cu[1:] - cu[:-1]
+      max_seqlen = int(doc_lengths.max().item()) if num_docs > 0 else 0
+
+      out_b, lse_b = flash_attn_varlen_func(
+          q_b, k_b, v_b,
+          cu_seqlens_qo=cu,
+          cu_seqlens_kv=cu,
+          max_seqlen_qo=max_seqlen,
+          max_seqlen_kv=max_seqlen,
+          causal=True,
+          softmax_scale=softmax_scale,
+          is_varlen=True,
+      )
+
+      # Pad output back to seqlen
+      if total_tokens < seqlen:
+        pad_out = torch.zeros(seqlen - total_tokens, n_heads, d_v,
+                              device=out_b.device, dtype=out_b.dtype)
+        out_b = torch.cat([out_b, pad_out], dim=0)
+
+      outputs.append(out_b)
+      all_lse.append(lse_b)
+      all_cu.append(cu)
+      max_seqlens.append(max_seqlen)
+
+    output = torch.stack(outputs, dim=0)  # [B, S, H, D_v]
+
+    # Save for backward
+    ctx.save_for_backward(q, k, v, output, *all_lse, *all_cu)
+    ctx.softmax_scale = softmax_scale
+    ctx.bsz = bsz
+    ctx.seqlen = seqlen
+    ctx.n_heads = n_heads
+    ctx.d_qk = d_qk
+    ctx.d_v = d_v
+    ctx.max_seqlens = max_seqlens
+    ctx.num_lse = bsz
+    ctx.num_cu = bsz
+
+    return output
+
+  @staticmethod
+  def backward(ctx, d_out):
+    from flash_mla.flash_mla_interface import _flash_attn_varlen_backward
+
+    saved = ctx.saved_tensors
+    q = saved[0]
+    k = saved[1]
+    v = saved[2]
+    output = saved[3]
+    all_lse = saved[4:4 + ctx.num_lse]
+    all_cu = saved[4 + ctx.num_lse:]
+
+    bsz = ctx.bsz
+    seqlen = ctx.seqlen
+    n_heads = ctx.n_heads
+    d_qk = ctx.d_qk
+    d_v = ctx.d_v
+    softmax_scale = ctx.softmax_scale
+    max_seqlens = ctx.max_seqlens
+
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+
+    for b in range(bsz):
+      cu = all_cu[b]
+      lse = all_lse[b]
+      total_tokens = cu[-1].item()
+      max_seqlen = max_seqlens[b]
+
+      if total_tokens == 0 or max_seqlen == 0:
+        continue
+
+      q_b = q[b, :total_tokens].contiguous()
+      k_b = k[b, :total_tokens].contiguous()
+      v_b = v[b, :total_tokens].contiguous()
+      out_b = output[b, :total_tokens].contiguous()
+      do_b = d_out[b, :total_tokens].contiguous()
+
+      dq_b, dk_b, dv_b = _flash_attn_varlen_backward(
+          do_b, q_b, k_b, v_b, out_b, lse,
+          cu, cu, max_seqlen, max_seqlen,
+          causal=True, softmax_scale=softmax_scale, is_varlen=True,
+      )
+
+      dq[b, :total_tokens] = dq_b
+      dk[b, :total_tokens] = dk_b
+      dv[b, :total_tokens] = dv_b
+
+    return dq, dk, dv, None, None
+
+
 class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
   """MLA attention using FA4 forward + FlashMLA backward.
 
@@ -221,7 +436,19 @@ class MLA(nn.Module):
     self.kv_norm.weight.data.fill_(1.0)
 
   @record_function("attn")
-  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+              cu_seqlens: list[torch.Tensor] | None = None) -> torch.Tensor:
+    """MLA forward pass.
+
+    Args:
+      x: Input tensor [B, S, D].
+      cos, sin: RoPE rotation tensors.
+      cu_seqlens: Optional list of B int32 tensors for packed sequence attention.
+                  Each tensor has shape [num_docs_i + 1] marking document boundaries
+                  within batch element i. When provided, attention is document-isolated:
+                  tokens from different documents cannot attend to each other.
+                  When None, standard causal attention is used.
+    """
     bsz, seqlen, _ = x.size()
     q = self.wq_b(self.q_norm(self.wq_a(x)))
     q = q.view(bsz, seqlen, self.n_heads, self.qk_head_dim)
@@ -238,11 +465,19 @@ class MLA(nn.Module):
     k[..., :self.qk_nope_head_dim].copy_(k_nope)
     k[..., self.qk_nope_head_dim:].copy_(k_pe.expand(-1, -1, self.n_heads, -1))
     with record_function("attn.kernel[mla]"):
-      if _USE_SDPA:
-        # Use PyTorch SDPA (default) - FA4 has a bug with (192, 128) on SM100
-        output = _mla_sdpa_forward(q, k, v, self.softmax_scale)
+      if cu_seqlens is not None:
+        # Packed sequences: use document-isolated attention
+        if _USE_SDPA:
+          # FlexAttention with block-diagonal causal mask
+          output = _mla_sdpa_packed_forward(q, k, v, self.softmax_scale, cu_seqlens)
+        else:
+          # FlashMLA varlen: zero-mask-memory document isolation
+          output = _MlaFlashMlaVarlenPacked.apply(q, k, v, self.softmax_scale, cu_seqlens)
       else:
-        # Use FA4+FlashMLA (may produce NaN with current FA4 cute-dsl)
-        output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
+        # Standard causal attention (no packing)
+        if _USE_SDPA:
+          output = _mla_sdpa_forward(q, k, v, self.softmax_scale)
+        else:
+          output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
     output = output.contiguous().view(bsz, seqlen, self.n_heads * self.v_head_dim)
     return self.wo(output)

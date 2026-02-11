@@ -278,30 +278,3 @@ def get_cuda_memory_info() -> dict:
     }
 
 
-def format_cuda_error_context(operation: str, **kwargs) -> str:
-    """Format a detailed error context message.
-
-    Args:
-        operation: Name of the failed operation.
-        **kwargs: Additional context (tensors, shapes, etc.)
-
-    Returns:
-        Formatted error context string.
-    """
-    lines = [f"[nmoe] CUDA Error Context for '{operation}':"]
-
-    # Add memory info
-    mem_info = get_cuda_memory_info()
-    if mem_info["available"]:
-        lines.append(f"  Device: {mem_info['device']}")
-        lines.append(f"  Memory allocated: {mem_info['allocated'] / 1e9:.2f} GB")
-        lines.append(f"  Memory reserved: {mem_info['reserved'] / 1e9:.2f} GB")
-
-    # Add custom context
-    for key, value in kwargs.items():
-        if isinstance(value, torch.Tensor):
-            lines.append(f"  {key}: shape={value.shape}, dtype={value.dtype}, device={value.device}")
-        else:
-            lines.append(f"  {key}: {value}")
-
-    return "\n".join(lines)

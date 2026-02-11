@@ -1,14 +1,16 @@
+import logging
 import os
 import time
-import math
 import duckdb
 from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping, Optional
 import subprocess
 
+logger = logging.getLogger(__name__)
+
 import torch
 from torch.nn.utils import get_total_norm
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import torch.distributed as dist
 from collections import defaultdict
 import os as _os
@@ -50,18 +52,6 @@ B200_BF16_PEAK_TFLOPS: float = 2250.0
 B200_FP8_PEAK_TFLOPS: float = 4500.0
 B200_NVFP4_PEAK_TFLOPS: float = 9000.0
 
-def b200_peak_tflops(dtype: str) -> float:
-    """Return per‑GPU dense peak TFLOPS for B200 by dtype.
-
-    Recognized keys: 'bf16', 'fp8', 'nvfp4'/'fp4'. Defaults to BF16.
-    """
-    d = dtype.lower()
-    if d == "fp8":
-        return B200_FP8_PEAK_TFLOPS
-    if d in ("nvfp4", "fp4"):
-        return B200_NVFP4_PEAK_TFLOPS
-    return B200_BF16_PEAK_TFLOPS
-
 
 @dataclass
 class MetricsState:
@@ -99,7 +89,7 @@ def _num_flops_per_token(model: torch.nn.Module, seq_len: int) -> float:
         if dist.is_available() and dist.is_initialized():
             world = dist.get_world_size()
     except Exception:
-        pass
+        logger.debug("metrics: dist world_size lookup for flop calculation", exc_info=True)
 
     # Local expert params (sharded across GPUs)
     n_local = E // world
@@ -196,9 +186,6 @@ class _SegAgg:
 _SEG_AGG = _SegAgg()
 
 
-def seg_reset() -> None:
-    _SEG_AGG.reset()
-
 
 def seg_add_time(tag: str, ms: float) -> None:
     _SEG_AGG.add_time_ms(tag, ms)
@@ -227,7 +214,7 @@ def _is_rank0() -> bool:
         if dist.is_available() and dist.is_initialized():
             return dist.get_rank() == 0
     except Exception:
-        pass
+        logger.debug("metrics: dist rank check for is_rank0", exc_info=True)
     return True  # single-GPU or non-dist treated as rank 0
 
 
@@ -272,6 +259,7 @@ def _flush_timers_into_segments() -> None:
             ms = float(s.elapsed_time(e))
             seg_add_time(tag, ms)
         except Exception:
+            logger.debug("metrics: CUDA timer elapsed_time for tag %s", tag, exc_info=True)
             keep.append((tag, s, e))
     _PENDING_TIMERS[:] = keep
 
@@ -299,7 +287,7 @@ def _install_timers_on_module(mod: torch.nn.Module, tag: str) -> None:
             setattr(mod, key_f, torch.cuda.Event(enable_timing=True))
             getattr(mod, key_f).record()
         except Exception:
-            pass
+            logger.debug("metrics: CUDA timer record fwd_pre for %s", tag, exc_info=True)
 
     def fwd_post(_m, _inp, _out):
         try:
@@ -309,14 +297,14 @@ def _install_timers_on_module(mod: torch.nn.Module, tag: str) -> None:
             if start is not None:
                 _PENDING_TIMERS.append((f"time_ms/{tag}_fwd", start, end))
         except Exception:
-            pass
+            logger.debug("metrics: CUDA timer record fwd_post for %s", tag, exc_info=True)
 
     def bwd_pre(_m, _grad_in):
         try:
             setattr(mod, key_b, torch.cuda.Event(enable_timing=True))
             getattr(mod, key_b).record()
         except Exception:
-            pass
+            logger.debug("metrics: CUDA timer record bwd_pre for %s", tag, exc_info=True)
 
     def bwd_post(_m, _grad_in, _grad_out):
         try:
@@ -326,18 +314,22 @@ def _install_timers_on_module(mod: torch.nn.Module, tag: str) -> None:
             if start is not None:
                 _PENDING_TIMERS.append((f"time_ms/{tag}_bwd", start, end))
         except Exception:
-            pass
+            logger.debug("metrics: CUDA timer record bwd_post for %s", tag, exc_info=True)
 
     try:
         mod.register_forward_pre_hook(fwd_pre)
         mod.register_forward_hook(fwd_post)
         # full backward hooks for autograd modules
+        # PyTorch version compatibility: register_full_backward_pre_hook was
+        # added in PyTorch 1.12; older versions only expose the deprecated
+        # register_backward_hook.  The hasattr guard lets this code work on
+        # any PyTorch version without raising AttributeError.
         if hasattr(mod, 'register_full_backward_pre_hook'):
             mod.register_full_backward_pre_hook(bwd_pre)
         if hasattr(mod, 'register_full_backward_hook'):
             mod.register_full_backward_hook(bwd_post)
     except Exception:
-        pass
+        logger.debug("metrics: hook registration on module %s", tag, exc_info=True)
 
 
 def register_model_timers(model: torch.nn.Module) -> None:
@@ -355,37 +347,6 @@ def register_model_timers(model: torch.nn.Module) -> None:
         if isinstance(m, torch.nn.Linear) and getattr(m, 'out_features', None) == getattr(model, 'config', None).vocab_size:
             _install_timers_on_module(m, 'head')
 
-
-def comm_counts(*, stage: str | None = None,
-                M_recv: float | None = None,
-                M_back: float | None = None,
-                dropped: float | None = None,
-                T: int | None = None,
-                K: int | None = None) -> None:
-    """Convenience to log comm counters; rank-0 only.
-
-    Computes capacity and utilization if T,K given.
-    """
-    if M_recv is not None:
-        seg_add_count('comm/M_recv', float(M_recv))
-    if M_back is not None:
-        seg_add_count('comm/M_back', float(M_back))
-    if dropped is not None:
-        seg_add_count('comm/dropped_rows', float(dropped))
-    if T is not None and K is not None:
-        world = 1
-        try:
-            if dist.is_available() and dist.is_initialized():
-                world = dist.get_world_size()
-        except Exception:
-            pass
-        capacity = float(T * K * world)
-        seg_add_count('comm/capacity', capacity)
-        if capacity > 0:
-            if M_recv is not None:
-                seg_add_count('comm/capacity_utilization', float(M_recv) / capacity)
-            elif M_back is not None:
-                seg_add_count('comm/capacity_utilization', float(M_back) / capacity)
 
 
 def init_metrics(model: torch.nn.Module, seq_len: int) -> MetricsState:
@@ -422,11 +383,6 @@ def param_counts(model: torch.nn.Module) -> tuple[int, int]:
     return int(nparams_total), nparams_active
 
 
-def log_param_summary(model: torch.nn.Module, print_fn: Callable[[str], None]) -> None:
-    total, active = param_counts(model)
-    b = 1_000_000_000
-    print_fn(f"({total / b:.2f}B params {active / b:.2f}B active)")
-
 
 def log_step_torchtitan(
     step: int,
@@ -448,6 +404,7 @@ def log_step_torchtitan(
     try:
         world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
     except Exception:
+        logger.debug("metrics: dist world_size lookup in log_step_torchtitan", exc_info=True)
         world = 1
 
     is_rank0 = _is_rank0()
@@ -498,7 +455,7 @@ def log_step_torchtitan(
             node_tps = round(tps * world)
             line += f"  node_tps: {node_tps:,}"
         except Exception:
-            pass
+            logger.debug("metrics: node_tps computation", exc_info=True)
     print_fn(line)
 
     out = {
@@ -581,7 +538,7 @@ class MetricsWriter:
         try:
             self._conn.close()
         except Exception:
-            pass
+            logger.debug("metrics: DuckDB connection close", exc_info=True)
 
     def _now_ts_ms(self) -> int:
         return int(time.time() * 1000)
@@ -695,13 +652,13 @@ class MetricsWriter:
                 try:
                     pairs.append((f"gpu/{idx}/ecc_corrected", float(ecc_c)))
                 except Exception:
-                    pass
+                    logger.debug("metrics: ECC corrected counter cast for GPU %s", idx, exc_info=True)
             ecc_u = g.get('ecc_uncorrected')
             if ecc_u is not None:
                 try:
                     pairs.append((f"gpu/{idx}/ecc_uncorrected", float(ecc_u)))
                 except Exception:
-                    pass
+                    logger.debug("metrics: ECC uncorrected counter cast for GPU %s", idx, exc_info=True)
             for tag, v in pairs:
                 if v is not None:
                     base_items.append((tag, v))
@@ -752,6 +709,7 @@ def start_metrics(run_id: Optional[str] = None,
     try:
         rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
     except Exception:
+        logger.debug("metrics: dist rank lookup in start_metrics", exc_info=True)
         rank = 0
 
     try:
@@ -763,6 +721,7 @@ def start_metrics(run_id: Optional[str] = None,
         db_path = os.path.join(run_dir, f"rank_{rank}.duckdb")
         writer = MetricsWriter(db_path, run=rid)
     except Exception:
+        logger.debug("metrics: DuckDB writer initialization", exc_info=True)
         writer = None
 
     # GPU poller via csrc extension (optional)
@@ -914,7 +873,7 @@ def log_training_step(step: int,
         if cfg is not None and int(getattr(cfg, 'steps', 0)) == int(step):
             do_log = True
     except Exception:
-        pass
+        logger.debug("metrics: last-step log gate check", exc_info=True)
 
     # Console prints rank0 only.
     is_rank0 = _is_rank0()
@@ -938,6 +897,7 @@ def log_training_step(step: int,
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
     except Exception:
+        logger.debug("metrics: dist rank lookup in log_training_step", exc_info=True)
         rank = 0
 
     if ctx is not None and ctx.writer is not None and rank == 0:
@@ -971,6 +931,7 @@ def log_training_step(step: int,
                 ms_bf16 = ms_attn + ms_dense + ms_head
                 tflops_bf16_ach = (flops_bf16_step / (ms_bf16 / 1000.0) / 1e12) if ms_bf16 > 0 else None
             except Exception:
+                logger.debug("metrics: per-dtype TFLOP/s derivation", exc_info=True)
                 tflops_fp8_ach = None
                 tflops_bf16_ach = None
             ctx.writer.log_core(
@@ -1084,7 +1045,7 @@ def log_training_step(step: int,
             if items:
                 ctx.writer.insert_many(step, items)
         except Exception:
-            pass
+            logger.debug("metrics: DuckDB write segment/comm metrics", exc_info=True)
 
     # GPU snapshot ~1 Hz
     if ctx is not None and ctx.writer is not None and ctx.gpu_snapshot_fn is not None:
@@ -1095,13 +1056,13 @@ def log_training_step(step: int,
                 ctx.writer.log_gpu_snapshot(step, snap)
                 ctx.last_gpu_log = now
             except Exception:
-                pass
+                logger.debug("metrics: GPU stats collection and snapshot write", exc_info=True)
 
     # Console router summary
     if is_rank0:
         try:
             log_router_stats(model, print_out)
         except Exception:
-            pass
+            logger.debug("metrics: console router stats summary", exc_info=True)
 
     return out

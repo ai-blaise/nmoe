@@ -11,6 +11,7 @@ Issue [07] intent:
 
 import argparse
 import json
+import logging
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -36,7 +37,11 @@ TASKS: dict[str, type] = {
 
 def _init_dist() -> tuple[int, int]:
     if "RANK" in os.environ and not dist.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if torch.cuda.is_available():
+            backend = "nccl"
+        else:
+            backend = "gloo"
+            logging.getLogger(__name__).warning("CUDA not available, falling back to gloo backend")
         dist.init_process_group(backend=backend)
     rank = dist.get_rank() if dist.is_initialized() else 0
     world = dist.get_world_size() if dist.is_initialized() else 1

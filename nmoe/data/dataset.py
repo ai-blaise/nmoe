@@ -7,7 +7,6 @@ of tokens (seq_len). Crossing file boundaries is supported.
 """
 from __future__ import annotations
 
-import gzip
 import os
 from dataclasses import dataclass
 from pathlib import Path

@@ -10,6 +10,7 @@ Usage:
   python -m nmoe.train configs/moonlet.toml
   torchrun --nproc_per_node=8 -m nmoe.train configs/moonlight.toml
 """
+import logging
 import os
 import sys
 import tomllib
@@ -30,6 +31,7 @@ from nmoe.experiments import ExperimentTracker
 from nmoe import runtime
 from nmoe.eval.hooks import maybe_schedule_eval
 
+logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -114,7 +116,7 @@ def train(cfg: Config):
       dp_size = max(1, world // ep_size)
     dp_rank = rank // ep_size  # EP ranks are contiguous; DP rank = rank / ep_size
     if rank == 0:
-      print(f"[SFT] ep_size={ep_size} dp_size={dp_size} dp_rank={dp_rank} world={world}")
+      logger.info("SFT ep_size=%d dp_size=%d dp_rank=%d world=%d", ep_size, dp_size, dp_rank, world)
     loader = build_sft_loader(cfg, dp_rank=dp_rank, dp_world_size=dp_size, print_fn=print)
     plan = None  # SFT has no MixturePlan
   else:
@@ -156,7 +158,7 @@ def train(cfg: Config):
     from nmoe.opt import _get_dp_group
     zero2.eager_init(dense_groups, pg=_get_dp_group())
     if rank == 0:
-      print(f"[nmoe] ZeRO-2 flat buffers eagerly initialized for {len(dense_groups)} dense groups")
+      logger.info("ZeRO-2 flat buffers eagerly initialized for %d dense groups", len(dense_groups))
 
   # Fused backward-optimizer: create and attach after checkpoint load
   fused_eco = None
@@ -176,54 +178,89 @@ def train(cfg: Config):
       fused_eco.load_state_dict(pending_state)
       del model._pending_fused_eco_state
       if rank == 0:
-        print(f"[nmoe] Restored FusedBackwardECO state from checkpoint")
+        logger.info("Restored FusedBackwardECO state from checkpoint")
     fused_eco.attach(model)
     if rank == 0:
-      print(f"[nmoe] FusedBackwardECO attached: {len(fused_eco._moes)} MoE modules")
+      logger.info("FusedBackwardECO attached: %d MoE modules", len(fused_eco._moes))
 
   last_loss: torch.Tensor | None = None
   config_fingerprint = fingerprint(cfg)
   checkpoint_every = getattr(cfg, 'checkpoint_every', 100)
+
+  # Gradient accumulation configuration
+  accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
+  if accum_steps > 1 and rank == 0:
+    logger.info("Gradient accumulation: %d micro-steps per optimizer step", accum_steps)
+    logger.info("Effective batch size: %d (micro_batch=%d x %d)", cfg.batch_size, cfg.batch_size // accum_steps, accum_steps)
 
   try:
     with nvtx_ctx('train/run'):
       for step_num in range(start_step, cfg.steps):
         lr = update_lr(optimizer, dense_groups, step_num, tokens_seen, cfg)
 
+        # Gradient accumulation: inner loop over micro-batches
+        accumulated_loss = 0.0
         t0 = time.perf_counter()
-        if sft_mode:
-          inputs, targets, loss_mask = loader.next()
-        else:
-          inputs, targets = loader.next()
-          loss_mask = None
-        loader_wait_ms = (time.perf_counter() - t0) * 1000.0
 
-        with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
-          logits = model(inputs)
-
-        with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
-          loss_unreduced = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
-          if loss_mask is not None:
-            # SFT: use per-token loss mask from chat template (0=prompt, 1=response)
-            mask = loss_mask.reshape(-1)
+        for micro_step in range(accum_steps):
+          cu_seqlens = None
+          if sft_mode:
+            loader_result = loader.next()
+            if len(loader_result) == 4:
+              # Packed mode: (inputs, targets, loss_mask, cu_seqlens)
+              inputs, targets, loss_mask, cu_seqlens = loader_result
+            else:
+              # Unpacked mode: (inputs, targets, loss_mask)
+              inputs, targets, loss_mask = loader_result
           else:
-            # Pre-training: mask out EOS tokens
-            mask = (targets != cfg.eos_token_id).reshape(-1).float()
-          loss = (loss_unreduced * mask).sum() / mask.sum().clamp(min=1.0)
+            inputs, targets = loader.next()
+            loss_mask = None
 
-        model.zero_grad(set_to_none=True)
-        if fused_eco is not None:
-          # update_lr() already set optimizer.param_groups[0]['lr'] to scheduled lr_expert
-          lr_expert = float(optimizer.param_groups[0]['lr'])
-          fused_eco.set_lr(lr_expert)
-          fused_eco.pre_backward(step_num)
-        with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
-          loss.backward()
-        if fused_eco is not None:
-          fused_eco.post_backward()
+          with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
+            logits = model(inputs, cu_seqlens=cu_seqlens)
+
+          with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
+            loss_unreduced = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
+            if loss_mask is not None:
+              # SFT: use per-token loss mask from chat template (0=prompt, 1=response)
+              mask = loss_mask.reshape(-1)
+            else:
+              # Pre-training: mask out EOS tokens
+              mask = (targets != cfg.eos_token_id).reshape(-1).float()
+            loss = (loss_unreduced * mask).sum() / mask.sum().clamp(min=1.0)
+            # Scale loss by accumulation steps so gradients are averaged
+            if accum_steps > 1:
+              loss = loss / accum_steps
+
+          # Zero gradients: on first micro-step, zero everything. On subsequent
+          # micro-steps, only zero if no accumulation for dense params is needed.
+          # With fused_eco, expert gradients are consumed in backward and don't
+          # accumulate. Dense gradients DO accumulate across micro-steps via autograd.
+          if micro_step == 0:
+            model.zero_grad(set_to_none=True)
+          # For micro_step > 0 with fused_eco: don't zero — dense grads should
+          # accumulate. Expert grads are consumed in fused_update each micro-step.
+          # For micro_step > 0 without fused_eco: don't zero — all grads accumulate.
+
+          if fused_eco is not None:
+            # update_lr() already set optimizer.param_groups[0]['lr'] to scheduled lr_expert
+            lr_expert = float(optimizer.param_groups[0]['lr'])
+            fused_eco.set_lr(lr_expert)
+            fused_eco.set_microstep(micro_step, accum_steps)
+            fused_eco.pre_backward(step_num)
+          with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
+            loss.backward()
+          if fused_eco is not None:
+            fused_eco.post_backward()
+
+          accumulated_loss += loss.detach().item() * (accum_steps if accum_steps > 1 else 1)
+
+        # End of micro-batch loop. Now do optimizer step.
+        loader_wait_ms = (time.perf_counter() - t0) * 1000.0
 
         # Gradient clipping (important for SFT stability with quantized training)
         # When fused_eco is active, expert grads are already consumed — only clip dense params.
+        # Dense gradients accumulate across micro-steps (autograd adds them).
         grad_clip = getattr(cfg, 'grad_clip', 0.0)
         if grad_clip > 0:
           if fused_eco is not None:
@@ -237,15 +274,15 @@ def train(cfg: Config):
         with nvtx_ctx('train/opt_step'), time_ctx('time_ms/opt_step'):
           step(model, optimizer, dense_groups, zero2_state, cfg, world)
 
-        tokens_this_step = int(inputs.numel())
+        tokens_this_step = int(inputs.numel()) * accum_steps
         tokens_seen += cfg.batch_size * cfg.seq_len
-        last_loss = loss.detach()
+        last_loss = torch.tensor(accumulated_loss / accum_steps if accum_steps > 1 else accumulated_loss)
 
         s = step_num + 1
         log_training_step(
           s,
           model=model,
-          loss=loss.detach(),
+          loss=last_loss,
           lr=lr,
           tokens_this_step=tokens_this_step,
           state=metrics_state,
@@ -267,7 +304,7 @@ def train(cfg: Config):
               max_examples=int(getattr(cfg, "eval_budget_max_examples", 500)),
             )
             if rank == 0:
-              print(f"[eval] step={s} {format_results(eval_results)}")
+              logger.info("Eval step=%d %s", s, format_results(eval_results))
               if getattr(metrics_ctx, "writer", None) is not None:
                 items = []
                 for tname, r in eval_results.items():
@@ -277,14 +314,14 @@ def train(cfg: Config):
                 metrics_ctx.writer.insert_many(step=s, items=items)
           except Exception as e:
             if rank == 0:
-              print(f"[eval] failed: {e}")
+              logger.exception("Eval failed")
 
         # Opportunistically schedule evaluation (async or inline), if enabled
         try:
           maybe_schedule_eval(s, cfg, model, run_id, print)
         except Exception as e:
           if rank == 0:
-            print(f"[eval] scheduling failed: {e}")
+            logger.warning("Eval scheduling failed: %s", e)
 
         save_checkpoint(
           checkpointer, s, tokens_seen, model, optimizer, loader, plan,
@@ -292,7 +329,7 @@ def train(cfg: Config):
         )
 
     if rank == 0:
-      print(f"[nmoe] Training complete. {tokens_seen:,} tokens.")
+      logger.info("Training complete. %s tokens.", f"{tokens_seen:,}")
 
     final_loss = float(last_loss.item()) if last_loss is not None else 0.0
     results = {'final_loss': final_loss, 'tokens_seen': tokens_seen, 'steps_completed': cfg.steps}

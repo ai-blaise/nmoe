@@ -7,6 +7,7 @@ Vendored from: https://github.com/sustcsonglin/flash-linear-attention
 Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 """
 
+import logging
 import torch
 import torch.nn.functional as F
 import triton
@@ -26,16 +27,16 @@ from typing import Callable, Optional, Tuple
 try:  # best‑effort; noop on unsupported runtimes
     if hasattr(triton, "set_allocator"):
         def _nmoe_triton_alloc(size: int, alignment: int, stream: int):
-            try:
-                dev = "cuda" if torch.cuda.is_available() else "cpu"
-                return torch.empty(size, device=dev, dtype=torch.int8)
-            except Exception:
-                # Final fallback: host allocation
-                return torch.empty(size, device="cpu", dtype=torch.int8)
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "Triton scratch allocator requires CUDA but torch.cuda.is_available() is False. "
+                    "Triton kernels cannot run on CPU."
+                )
+            return torch.empty(size, device="cuda", dtype=torch.int8)
 
         triton.set_allocator(_nmoe_triton_alloc)
-except Exception:
-    pass
+except Exception as e:
+    logging.getLogger(__name__).debug("Triton allocator setup skipped: %s", e)
 
 # ============================================================================
 # SECTION 0: Helper constants and decorators (must be first)
@@ -47,13 +48,7 @@ autotune_cache_kwargs = {"cache_results": True} if supports_autotune_cache else 
 
 # Triton ops (use standard, not fast variants)
 exp = tl.exp
-exp2 = tl.math.exp2
 log = tl.log
-log2 = tl.log2
-
-@triton.jit
-def safe_exp(x):
-    return exp(tl.where(x <= 0, x, float('-inf')))
 
 # Device context helper
 def custom_device_ctx(index: int):
@@ -92,10 +87,6 @@ def input_guard(fn: Callable) -> Callable:
 
     return wrapper
 
-# Autocast helpers
-autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type='cuda')
-autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type='cuda')
-
 # Hardware detection helpers
 def is_amd() -> bool:
     """Check if running on AMD hardware."""
@@ -126,10 +117,6 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         return max_shared_memory >= 48 * 1024
     except Exception:
         return False
-
-def is_gather_supported() -> bool:
-    """Check if tl.gather is supported."""
-    return hasattr(tl, 'gather')
 
 def is_nvidia_hopper() -> bool:
     """Check if running on NVIDIA Hopper (H100/H200) or newer."""
@@ -164,13 +151,9 @@ if hasattr(triton.language, '_experimental_make_tensor_descriptor'):
 elif hasattr(triton.language, 'make_tensor_descriptor'):
     make_tensor_descriptor = triton.language.make_tensor_descriptor
 else:
-    @triton.jit
     def make_tensor_descriptor(base, shape, strides, block_shape, _builder=None):
         """Fallback when TMA not supported."""
-        return None
-
-
-is_nvidia_blackwell = is_nvidia_hopper  # B200 is Blackwell, even better!
+        raise RuntimeError("TMA tensor descriptors require Triton >= 3.x with NVIDIA Hopper+ GPU")
 
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
@@ -1891,9 +1874,7 @@ def fused_kda_gate(g: torch.Tensor, A: torch.Tensor, head_k_dim: int,
 
 # Use standard Triton ops (not fast variants)
 exp = tl.exp
-exp2 = tl.math.exp2
-log = tl.log  
-log2 = tl.log2
+log = tl.log
 
 @triton.jit
 def safe_exp(x):
@@ -3165,24 +3146,6 @@ def l2norm(
     output_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
     return L2NormFunction.apply(x, eps, output_dtype)
-
-
-l2_norm = l2norm
-
-
-class L2Norm(nn.Module):
-
-    def __init__(
-        self,
-        eps: float = 1e-6,
-        output_dtype: Optional[torch.dtype] = None
-    ):
-        super().__init__()
-        self.eps = eps
-        self.output_dtype = output_dtype
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return l2norm(x, self.eps, self.output_dtype)
 
 # ============================================================================
 # SECTION 11: Gated Delta Rule kernels (chunk_delta_h)
@@ -5779,10 +5742,6 @@ def input_guard(fn: Callable) -> Callable:
             return fn(*contiguous_args, **contiguous_kwargs)
     
     return wrapper
-
-# Autocast helpers
-autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type='cuda')
-autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type='cuda')
 
 # Hardware detection helpers
 def is_amd() -> bool:

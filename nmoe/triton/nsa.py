@@ -87,10 +87,6 @@ def _cmp_attn_fwd(
     qk_scale = sm_scale
     q = Q.load([off_z, off_h, start_m * BLOCK_M, 0]).reshape([BLOCK_M, HEAD_DIM])
 
-    # Causal bound: query m can attend to compressed token i if i*d + l - 1 <= m
-    # Rearranged: i <= (m - l + 1) / d
-    # max_valid_i[m] = floor((m - l + 1) / d)
-    # NOTE: Use tl.math.floor for proper floor division (Triton // is C-style truncation)
     numerator = (offs_m - CMP_LEN + 1).to(tl.float32)
     max_valid_i = tl.math.floor(numerator / CMP_STRIDE).to(tl.int32)  # [BLOCK_M]
 

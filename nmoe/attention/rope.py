@@ -7,12 +7,20 @@ from torch import nn
 def rotate_pe(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
   """Apply rotary position embedding to tensor x.
 
-  Note: cos/sin are expected to be pre-sliced to seqlen and pre-cast to x.dtype
-  (done in Transformer.forward and RotaryEmbedding.__init__).
+  cos/sin can be:
+    - 2D [S, D]: standard sequential positions (broadcast over batch and heads)
+    - 3D [B, S, D]: per-batch-element positions (packed sequences with reset positions)
+
+  In both cases, a head dimension is inserted for broadcasting against x: [B, S, H, D].
   """
-  # cos/sin: [seqlen, head_dim//2] -> [seqlen, 1, head_dim//2] for broadcasting
-  cos = cos[:x.size(1), :].unsqueeze(-2)
-  sin = sin[:x.size(1), :].unsqueeze(-2)
+  if cos.ndim == 2:
+    # [S, D] -> [S, 1, D] for broadcasting over [B, S, H, D]
+    cos = cos[:x.size(1), :].unsqueeze(-2)
+    sin = sin[:x.size(1), :].unsqueeze(-2)
+  else:
+    # [B, S, D] -> [B, S, 1, D] for broadcasting over [B, S, H, D]
+    cos = cos.unsqueeze(-2)
+    sin = sin.unsqueeze(-2)
   half = x.size(-1) // 2
   x1 = x[..., :half]
   x2 = x[..., half:]

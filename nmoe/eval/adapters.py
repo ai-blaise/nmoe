@@ -18,7 +18,7 @@ Sources are encoded as strings like:
 Adapters are intentionally compact and robust to minor schema variations.
 """
 
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 
 def _parse_source(src: str) -> Tuple[str, List[str]]:

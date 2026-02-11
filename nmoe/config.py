@@ -161,6 +161,7 @@ class Config:
   eco_stochastic_rounding: bool = True # SR for NVFP4 E2M1 quantization
   eco_fused_backward: bool = True      # Fuse optimizer step into backward (eliminates 152 GiB of BF16 params + grads)
   eco_require_cuda: bool = True       # Hard-fail if CUDA kernels unavailable (no silent Python fallback)
+  eco_factored_v: bool = False         # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
   gradient_checkpointing: bool = False # Required for NVFP4 primary (1 layer BF16 scratch)
 
   # =============================================================================

@@ -122,10 +122,8 @@ def cmd_prep(args: argparse.Namespace) -> int:
         HfFileSystemSource,
         HuggingFaceSource,
         HydraFilteredSource,
-        HydraScoringSource,
         JSONLSource,
         JSONLZstSource,
-        create_source,
     )
     try:
         from .prep import PrepConfig, PrepPipeline, ParallelPrepPipeline
@@ -227,7 +225,7 @@ def cmd_prep(args: argparse.Namespace) -> int:
             log.error("HYDRA filtering requires CUDA; run in the container on a GPU node.")
             return 1
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda")
         hydra_model = Transformer.from_checkpoint(args.checkpoint, device=device)
         for p in hydra_model.parameters():
             p.requires_grad = False
@@ -547,6 +545,8 @@ def cmd_rephrase(args: argparse.Namespace) -> int:
 
     # Initialize BatchedGenerator
     log.info(f"Loading model from {args.checkpoint}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required for rephrase command")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     gen = BatchedGenerator(
         args.checkpoint,

@@ -546,20 +546,6 @@ def import_nvfp4_to_nmoe(
     # Free dense state
     del dense_state, rd_state
 
-    # 6. Process expert weights layer-by-layer, shard for EP ranks
-    #
-    # NVFP4 expert memory per layer (128 experts, all 3 suffixes, all 3 projections):
-    #   weight_packed:
-    #     W1: 128 x [2048, 3584] uint8 = 128 x 7.0 MB = ~896 MB
-    #     W3: 128 x [2048, 3584] uint8 = ~896 MB
-    #     W2: 128 x [7168, 1024] uint8 = ~896 MB
-    #   weight_scale:
-    #     W1: 128 x [2048, 448] fp8 = 128 x 0.9 MB = ~112 MB
-    #     W3: similar = ~112 MB
-    #     W2: 128 x [7168, 128] fp8 = ~112 MB
-    #   weight_global_scale: negligible (128 x [1] x 4 bytes)
-    #   Total: ~3.0 GB per layer (much less than BF16's ~10.5 GB)
-
     logger.info("Processing expert NVFP4 triplets layer-by-layer...")
 
     # Group expert keys by (layer_id, proj_type, suffix)
@@ -886,10 +872,6 @@ def plan_sharding(
     print(f"  Unmapped:         {unmapped_count}")
     print()
 
-    # Expected size estimates per expert per layer (NVFP4)
-    # W1/W3 gate/up_proj:  packed=[2048, 3584]=7.0MB, scale=[2048, 448]=0.9MB
-    # W2 down_proj:        packed=[7168, 1024]=7.0MB, scale=[7168, 128]=0.9MB
-    # Per expert per layer: ~3 x (7.0 + 0.9) MB = ~23.7 MB
     per_expert_mb = 3 * (7.0 + 0.9 + 0.004)  # packed + scale + global_scale
     per_rank_expert_mb = n_local * n_moe_layers * per_expert_mb
     per_rank_expert_gb = per_rank_expert_mb / 1024

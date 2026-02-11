@@ -206,9 +206,6 @@ class NMoEModelConfig:
             return 0
         return (self.num_experts or 0) + self.n_shared_experts
 
-    # ==========================================================================
-    # nmoe naming aliases (for compatibility with nmoe.config.Config style)
-    # ==========================================================================
     @property
     def dim(self) -> Optional[int]:
         """Alias for hidden_size (nmoe naming)."""

@@ -13,10 +13,9 @@ import argparse
 import gzip
 import io
 import json
+import logging
 import math
 import os
-import subprocess
-import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ import boto3
 try:
   import pyarrow.parquet as pq
 except Exception as e:  # pragma: no cover
+  logging.getLogger(__name__).debug("pyarrow not available: %s", e)
   pq = None  # type: ignore
   _pyarrow_err = e
 

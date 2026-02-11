@@ -773,6 +773,164 @@ inline cudaError_t launch_eco_adam_nvfp4_fv_update(
     return cudaGetLastError();
 }
 
+// ============================================================================
+// AdamA m/v accumulation kernel (lightweight, no weight update)
+// ============================================================================
+//
+// For gradient accumulation via Adam Accumulation (AdamA, arXiv:2305.19982):
+// instead of storing separate gradient accumulation buffers (~5.85 GiB),
+// we update m/v directly each micro-step with fractional betas.
+//
+// After K micro-steps with β^(1/K):
+//   m_K = β * m_0 + Σ (1-β^(1/K)) * β^((K-i)/K) * gᵢ
+//
+// Bias corrections remain identical: 1-(β^(1/K))^(t*K) = 1-β^t
+//
+// This kernel handles NON-FINAL micro-steps only. It updates m/v without
+// touching NVFP4 weight buffers — no weight update, no ECO error injection.
+// The final micro-step uses the existing k_eco_adam_nvfp4_update kernel
+// (with fractional betas passed as the beta1/beta2 arguments).
+//
+// Memory: zero additional buffers. m/v states already exist.
+//
+// Layout: gradient [E, in_dim, out_dim] (nmoe), m/v same layout.
+// ============================================================================
+
+// Per-element m/v EMA update with fractional betas.
+// One thread per element in the (E, in_dim, out_dim) tensor.
+template <bool kFactoredV>
+__global__ void k_eco_mv_accumulate(
+    // FP8 optimizer states (nmoe layout: [E, in_dim, out_dim])
+    uint8_t* __restrict__ m_data,         // [E, in_dim, out_dim] E5M2
+    float* __restrict__ m_scale,          // [E * in_dim] per-row FP32 scale
+    uint8_t* __restrict__ v_data,         // [E, in_dim, out_dim] E4M3 (kFactoredV=false only)
+    float* __restrict__ v_scale,          // [E * in_dim] per-row (kFactoredV=false only)
+
+    // Gradient (nmoe layout, FP32)
+    const float* __restrict__ grad,       // [E, in_dim, out_dim]
+
+    // Dimensions
+    int E,
+    int in_dim,
+    int out_dim,
+
+    // Fractional betas: β^(1/K)
+    float beta1_frac,
+    float beta2_frac)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
+    if (idx >= total) return;
+
+    // Compute row index for per-row scale: row = idx / out_dim
+    const int row = idx / out_dim;
+
+    const float one_minus_b1 = 1.0f - beta1_frac;
+    const float one_minus_b2 = 1.0f - beta2_frac;
+
+    // Load gradient
+    float g = grad[idx];
+
+    // --- Update m ---
+    float m_sc = m_scale[row];
+    float m_val = ptx::e5m2_byte_to_f32(m_data[idx]) * m_sc;
+    m_val = beta1_frac * m_val + one_minus_b1 * g;
+
+    // Write m back with old scale (scale recompute pass follows)
+    float m_inv_sc = (m_sc > 0.0f) ? (1.0f / m_sc) : 1.0f;
+    m_data[idx] = ptx::f32_to_e5m2_byte(m_val * m_inv_sc);
+
+    // --- Update v (full FP8 path only; factored-v handled separately) ---
+    if constexpr (!kFactoredV) {
+        float v_sc = v_scale[row];
+        float v_val = ptx::e4m3_byte_to_f32(v_data[idx]) * v_sc;
+        v_val = beta2_frac * v_val + one_minus_b2 * g * g;
+        float v_inv_sc = (v_sc > 0.0f) ? (1.0f / v_sc) : 1.0f;
+        v_data[idx] = ptx::f32_to_e4m3_byte(v_val * v_inv_sc);
+    }
+#else
+    (void)m_data; (void)m_scale; (void)v_data; (void)v_scale;
+    (void)grad; (void)E; (void)in_dim; (void)out_dim;
+    (void)beta1_frac; (void)beta2_frac;
+    __trap();
+#endif
+}
+
+
+// Launch wrapper for AdamA m/v accumulation (non-factored v)
+inline cudaError_t launch_eco_mv_accumulate(
+    uint8_t* m_data, float* m_scale,
+    uint8_t* v_data, float* v_scale,
+    const float* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
+    constexpr int THREADS = 256;
+    const dim3 grid(ceil_div(static_cast<int>(total), THREADS));
+    const dim3 block(THREADS);
+
+    k_eco_mv_accumulate<false><<<grid, block, 0, stream>>>(
+        m_data, m_scale, v_data, v_scale, grad,
+        E, in_dim, out_dim, beta1_frac, beta2_frac);
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // FP8 scale recomputation for m and v
+    const int total_rows = E * in_dim;
+    constexpr int RECOMP_THREADS = 256;
+    const dim3 recomp_grid(ceil_div(total_rows, RECOMP_THREADS));
+
+    k_fp8_recompute_row_scale<true><<<recomp_grid, RECOMP_THREADS, 0, stream>>>(
+        m_data, m_scale, E, in_dim, out_dim);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    k_fp8_recompute_row_scale<false><<<recomp_grid, RECOMP_THREADS, 0, stream>>>(
+        v_data, v_scale, E, in_dim, out_dim);
+    return cudaGetLastError();
+}
+
+
+// Launch wrapper for AdamA m/v accumulation (factored-v)
+inline cudaError_t launch_eco_mv_accumulate_fv(
+    uint8_t* m_data, float* m_scale,
+    float* v_row, float* v_col, float* v_rms,
+    const float* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    // Step 1: Run factored-v reduction kernels to update v_row, v_col, v_rms
+    // (these use beta2_frac instead of beta2)
+    auto err = launch_factored_v_update(grad, v_row, v_col, v_rms,
+                                        E, in_dim, out_dim, beta2_frac, stream);
+    if (err != cudaSuccess) return err;
+
+    // Step 2: Update m only (kFactoredV=true skips v_data update)
+    const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
+    constexpr int THREADS = 256;
+    const dim3 grid(ceil_div(static_cast<int>(total), THREADS));
+
+    k_eco_mv_accumulate<true><<<grid, THREADS, 0, stream>>>(
+        m_data, m_scale, nullptr, nullptr, grad,
+        E, in_dim, out_dim, beta1_frac, beta2_frac);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // FP8 scale recomputation for m only (v is factored)
+    const int total_rows = E * in_dim;
+    constexpr int RECOMP_THREADS = 256;
+    const dim3 recomp_grid(ceil_div(total_rows, RECOMP_THREADS));
+
+    k_fp8_recompute_row_scale<true><<<recomp_grid, RECOMP_THREADS, 0, stream>>>(
+        m_data, m_scale, E, in_dim, out_dim);
+    return cudaGetLastError();
+}
+
+
 }  // namespace eco_adam
 }  // namespace nmoe
 
@@ -841,4 +999,43 @@ extern "C" cudaError_t eco_adam_nvfp4_fv_update(
         stochastic_rounding != 0, error_feedback != 0,
         prng_seed0, prng_seed1,
         stream);
+}
+
+// AdamA m/v accumulation: update FP8 m/v with fractional betas (non-factored v)
+extern "C" cudaError_t eco_mv_accumulate(
+    void* m_data, void* m_scale,
+    void* v_data, void* v_scale,
+    const void* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    return nmoe::eco_adam::launch_eco_mv_accumulate(
+        reinterpret_cast<uint8_t*>(m_data),
+        reinterpret_cast<float*>(m_scale),
+        reinterpret_cast<uint8_t*>(v_data),
+        reinterpret_cast<float*>(v_scale),
+        reinterpret_cast<const float*>(grad),
+        E, in_dim, out_dim,
+        beta1_frac, beta2_frac, stream);
+}
+
+// AdamA m/v accumulation: update FP8 m + factored v with fractional betas
+extern "C" cudaError_t eco_mv_accumulate_fv(
+    void* m_data, void* m_scale,
+    void* v_row, void* v_col, void* v_rms,
+    const void* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    return nmoe::eco_adam::launch_eco_mv_accumulate_fv(
+        reinterpret_cast<uint8_t*>(m_data),
+        reinterpret_cast<float*>(m_scale),
+        reinterpret_cast<float*>(v_row),
+        reinterpret_cast<float*>(v_col),
+        reinterpret_cast<float*>(v_rms),
+        reinterpret_cast<const float*>(grad),
+        E, in_dim, out_dim,
+        beta1_frac, beta2_frac, stream);
 }

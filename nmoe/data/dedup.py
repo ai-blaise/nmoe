@@ -96,11 +96,6 @@ def dedup_paragraph_level(text: str) -> str:
     return "\n\n".join(out)
 
 
-def near_dedup_minhash(texts: Iterable[str]) -> List[str]:
-    """Backward‑compat shim retained for imports; use `stream_near_dedup` instead."""
-    return list(stream_near_dedup(texts))
-
-
 # ========================
 # MinHash / LSH primitives
 # ========================

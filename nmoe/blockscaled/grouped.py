@@ -8,7 +8,7 @@ Used by MoE expert MLP compute. Production contract:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, astuple
+from dataclasses import dataclass
 from typing import Tuple, Type, Union
 from inspect import isclass
 
@@ -27,14 +27,13 @@ try:
     import cutlass.utils.blackwell_helpers as sm100_utils
     import cutlass.utils.blockscaled_layout as blockscaled_utils
     from cutlass.cutlass_dsl import dsl_user_op
-    from cutlass._mlir.dialects import arith, builtin, llvm
+    from cutlass._mlir.dialects import arith, llvm
     from cutlass.base_dsl.typing import T
     from cutlass.cute.typing import (
         Float32,
         Float4E2M1FN,
         Float8E4M3FN,
         Int32,
-        Int4,
         Uint16,
         Uint8,
     )
@@ -58,32 +57,6 @@ except Exception as e:  # pragma: no cover - environment guard
 # Scale factor swizzle + grouped GEMM metadata (from in-repo CUDA extension)
 from nmoe.csrc import rdep
 
-def _swizzle_sf_to_mma(sf_mkl: torch.Tensor) -> torch.Tensor:
-  """Swizzle scale factors from MKL row-major to MMA layout.
-
-  IMPORTANT: Returns the full padded tensor to preserve the swizzle pattern.
-  The GEMM kernel uses offs array to know actual bounds.
-  """
-  assert sf_mkl.dtype == torch.uint8 and sf_mkl.ndim == 3
-  M, sf_k, _ = sf_mkl.shape
-
-  # Pad M to 128 and sf_k to 4 (required by swizzle)
-  M_pad = ((M + 127) // 128) * 128
-  sf_k_pad = ((sf_k + 3) // 4) * 4
-
-  if M != M_pad or sf_k != sf_k_pad:
-    sf_mkl_pad = torch.zeros(M_pad, sf_k_pad, dtype=torch.uint8, device=sf_mkl.device)
-    sf_mkl_pad[:M, :sf_k] = sf_mkl.squeeze(-1)
-  else:
-    sf_mkl_pad = sf_mkl.squeeze(-1).contiguous()
-
-  sf_mma_flat = torch.empty(M_pad * sf_k_pad, dtype=torch.uint8, device=sf_mkl.device)
-  stream = torch.cuda.current_stream(sf_mkl.device)
-  rdep.swizzle_sf_mkl_to_mma(sf_mkl_pad.data_ptr(), sf_mma_flat.data_ptr(), M_pad, sf_k_pad, stream)
-
-  # Return full padded tensor - DO NOT slice or call .contiguous() as that would
-  # copy data back to row-major layout, destroying the MMA swizzle pattern!
-  return sf_mma_flat.view(M_pad, sf_k_pad, 1)
 # No external loader — kernel is vendored below in this file.
 
 
@@ -115,11 +88,6 @@ def _require_sm100(device_index: int | None = None) -> None:
 # Fused epilogue helpers (CuTeDSL).
 # These are used only when fuse_swiglu_quant=True.
 # -----------------------------------------------------------------------------
-
-def _tanh_approx_f32(x: cutlass.Float32) -> cutlass.Float32:
-    # Exact tanh is acceptable here; input is already half-scaled (x = 0.5 * gate).
-    return cute.tanh(x)
-
 
 @dsl_user_op
 def _e8m0_encode_from_pos_f32(scale: Float32, *, loc=None, ip=None):
@@ -204,34 +172,6 @@ def _fp8_pack2_e4m3(x0: Float32, x1: Float32, *, loc=None, ip=None):
         ip=ip,
     )
     return result
-
-
-@dsl_user_op
-def _nvfp4_pack2_e2m1(x0: Float32, x1: Float32, *, loc=None, ip=None):
-    """Pack two NVFP4 E2M1 values into a uint8 (low nibble = x0, high nibble = x1).
-
-    Uses inline PTX: cvt.rn.satfinite.e2m1x2.f32 (sm_100a / Blackwell).
-    Matches nmoe/csrc/ptx.cu behavior.
-
-    Future optimization: CUTLASS EVT (Epilogue Visitor Tree) could provide native NVFP4 support
-    with better codegen and avoid inline PTX. See NVIDIA CUTLASS documentation.
-    """
-    x0_v = x0.ir_value(loc=loc, ip=ip) if hasattr(x0, 'ir_value') else x0
-    x1_v = x1.ir_value(loc=loc, ip=ip) if hasattr(x1, 'ir_value') else x1
-    # cvt.rn.satfinite.e2m1x2.f32 packs two f32 -> one .b8 (two E2M1 nibbles)
-    # PTX uses .b8 register for packed output. Order: low nibble = $2, high nibble = $1.
-    # Output to u32 via mov.b32 then extract low byte, since LLVM lacks direct b8 support.
-    result_i32 = llvm.inline_asm(
-        Int32.mlir_type,
-        [x1_v, x0_v],  # Swapped to get x0 in low nibble
-        "{ .reg.b8 tmp; cvt.rn.satfinite.e2m1x2.f32 tmp, $1, $2; mov.b32 $0, {tmp, tmp, tmp, tmp}; }",
-        "=r,f,f",
-        has_side_effects=False,
-        loc=loc,
-        ip=ip,
-    )
-    # Extract low byte
-    return arith.trunci(Uint8.mlir_type, result_i32, loc=loc, ip=ip)
 
 
 _STRIDED_WORKSPACE_CACHE: dict[tuple, tuple] = {}
@@ -457,30 +397,6 @@ def _fp8_pack2_e4m3(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint16:
 
 
 @dsl_user_op
-def _nvfp4_pack2_e2m1(a: Float32, b: Float32, *, loc=None, ip=None) -> Uint8:
-    # Pack two NVFP4 E2M1 nibbles into one byte. Use argument order (b, a) to
-    # match the packed layout consumed by CUTLASS FP4 kernels.
-    u32 = llvm.inline_asm(
-        T.i32(),
-        [
-            Float32(b).ir_value(loc=loc, ip=ip),
-            Float32(a).ir_value(loc=loc, ip=ip),
-        ],
-        """{\n\t
-        .reg .b8 t; \n\t
-        cvt.rn.satfinite.e2m1x2.f32 t, $1, $2; \n\t
-        mov.b32 $0, {t, 0, 0, 0}; \n\t
-        }""",
-        "=r,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    u8 = llvm.trunc(T.i8(), u32, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip)
-    return Uint8(u8)
-
-
-@dsl_user_op
 def _nvfp4_pack4_e2m1_u16(a0: Float32, a1: Float32, a2: Float32, a3: Float32, *, loc=None, ip=None) -> Uint16:
     # Match nmoe/csrc/ptx.cu + nmoe/csrc/quant.cu:
     #  - pack 4 E2M1 nibbles into uint16 (two bytes)
@@ -568,10 +484,6 @@ class NmoeGroupedScaledGemmKernel:
         problem_sizes_mnkl_host: tuple[tuple[int, int, int, int]]
         max_active_clusters: int
         fuse_swiglu_quant: bool = False
-
-        @property
-        def hash_key(self):
-            return astuple(self)
 
     # Constants used by the kernel
     reserved_smem_bytes = 1024

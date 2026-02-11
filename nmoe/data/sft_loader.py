@@ -1,8 +1,18 @@
 """SFT data loader for nmoe training.
 
 Loads instruction-following datasets, applies chat templates, tokenizes,
-generates loss masks (0=prompt, 1=response), and returns 3-tuples
-(inputs, targets, loss_mask) for supervised fine-tuning.
+generates loss masks (0=prompt, 1=response), and returns 3- or 4-tuples
+for supervised fine-tuning.
+
+Without packing:
+    inputs, targets, loss_mask = loader.next()
+
+With packing (sft_packing_enabled=True):
+    inputs, targets, loss_mask, cu_seqlens = loader.next()
+
+Packing uses First-Fit Decreasing (FFD) bin packing to concatenate multiple
+SFT examples into a single sequence, with cu_seqlens marking document boundaries
+for document-isolated attention via FlashMLA varlen or FlexAttention block_mask.
 
 Supports DeepSeek V3.2 chat format and standard chatml / llama3 formats.
 
@@ -273,6 +283,228 @@ def tokenize_with_loss_mask(
     return inputs, targets, loss_mask
 
 
+@dataclass
+class PackedBin:
+    """A packed sequence bin containing multiple SFT examples.
+
+    Stores pre-computed tensors ready for batching: inputs, targets, loss_mask,
+    and cu_seqlens marking document boundaries within the packed sequence.
+    """
+    inputs: torch.Tensor       # [seq_len] long -- concatenated input token IDs
+    targets: torch.Tensor      # [seq_len] long -- concatenated target token IDs
+    loss_mask: torch.Tensor    # [seq_len] float -- 0 at prompt/boundary, 1 at response
+    cu_seqlens: torch.Tensor   # [num_docs + 1] int32 -- cumulative document lengths
+    num_real_tokens: int       # Total non-padding tokens in this bin
+    num_docs: int              # Number of documents packed into this bin
+
+
+def pack_examples_ffd(
+    examples: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    seq_len: int,
+    pad_token_id: int = 0,
+    max_docs_per_bin: int = 16,
+) -> List[PackedBin]:
+    """Pack tokenized SFT examples into fixed-length bins using First-Fit Decreasing.
+
+    Algorithm:
+      1. Sort examples by token length (descending) for optimal packing
+      2. For each example, find the first bin with enough remaining capacity
+      3. If no bin has capacity, create a new bin
+      4. After all examples are assigned, build packed tensors for each bin
+
+    Document boundary handling:
+      - Each document's tokens are concatenated directly (no separator tokens needed)
+      - cu_seqlens marks where each document starts/ends within the packed sequence
+      - loss_mask is set to 0 at the last position of each non-final document to prevent
+        the model from learning to predict the first token of the next document given
+        the previous document's context (cross-document contamination)
+
+    Args:
+        examples: List of (inputs, targets, loss_mask) tuples from tokenize_with_loss_mask.
+                  inputs and targets are [length] long tensors (NOT padded to seq_len).
+        seq_len: Maximum sequence length (bin capacity).
+        pad_token_id: Token ID for padding unused positions.
+        max_docs_per_bin: Maximum documents per bin (safety limit).
+
+    Returns:
+        List of PackedBin instances, each representing one packed training sequence.
+    """
+    if not examples:
+        return []
+
+    # Compute actual (unpadded) token lengths for each example.
+    # Examples from tokenize_with_loss_mask are padded to seq_len, so we need to
+    # find the actual length by looking for the last non-zero loss_mask position
+    # or by checking where padding starts in the input.
+    indexed_examples = []
+    for idx, (inp, tgt, mask) in enumerate(examples):
+        # Find actual length: last non-pad position + 1.
+        # Inputs are right-padded with pad_token_id=0. Find the actual length by
+        # looking for the first pad token or using the full length if no padding.
+        length = inp.shape[0]
+        # Check from the end for padding
+        while length > 0 and inp[length - 1].item() == pad_token_id and mask[length - 1].item() == 0.0:
+            length -= 1
+        if length == 0:
+            continue
+        indexed_examples.append((idx, length, inp[:length], tgt[:length], mask[:length]))
+
+    if not indexed_examples:
+        return []
+
+    # Step 1: Sort by length descending (FFD)
+    indexed_examples.sort(key=lambda x: x[1], reverse=True)
+
+    # Step 2-3: First-Fit Decreasing bin packing
+    # Each bin tracks: list of (inp_slice, tgt_slice, mask_slice), remaining capacity
+    bins: List[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = []
+    bin_remaining: List[int] = []
+
+    for _, length, inp_slice, tgt_slice, mask_slice in indexed_examples:
+        if length > seq_len:
+            # Truncate to seq_len if somehow longer (should not happen with proper tokenization)
+            inp_slice = inp_slice[:seq_len]
+            tgt_slice = tgt_slice[:seq_len]
+            mask_slice = mask_slice[:seq_len]
+            length = seq_len
+
+        placed = False
+        for bin_idx in range(len(bins)):
+            if bin_remaining[bin_idx] >= length and len(bins[bin_idx]) < max_docs_per_bin:
+                bins[bin_idx].append((inp_slice, tgt_slice, mask_slice))
+                bin_remaining[bin_idx] -= length
+                placed = True
+                break
+
+        if not placed:
+            bins.append([(inp_slice, tgt_slice, mask_slice)])
+            bin_remaining.append(seq_len - length)
+
+    # Step 4: Build packed tensors for each bin
+    packed_bins = []
+    for bin_docs in bins:
+        packed = _build_packed_bin(bin_docs, seq_len, pad_token_id)
+        packed_bins.append(packed)
+
+    return packed_bins
+
+
+def _build_packed_bin(
+    docs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    seq_len: int,
+    pad_token_id: int,
+) -> PackedBin:
+    """Build a single PackedBin from a list of document slices.
+
+    Handles:
+    - Concatenation of document tokens
+    - Construction of cu_seqlens for varlen attention
+    - Zeroing loss_mask at document boundaries to prevent cross-document target leakage
+    - Right-padding to seq_len
+
+    Args:
+        docs: List of (inputs, targets, loss_mask) unpadded tensor slices.
+        seq_len: Target sequence length.
+        pad_token_id: Padding token ID.
+
+    Returns:
+        PackedBin with all tensors sized to seq_len.
+    """
+    all_inputs = []
+    all_targets = []
+    all_masks = []
+    cu_seqlens = [0]
+    offset = 0
+
+    for inp, tgt, mask in docs:
+        doc_len = inp.shape[0]
+        all_inputs.append(inp)
+        all_targets.append(tgt)
+        all_masks.append(mask)
+        offset += doc_len
+        cu_seqlens.append(offset)
+
+    # Concatenate all documents
+    inputs_cat = torch.cat(all_inputs, dim=0)
+    targets_cat = torch.cat(all_targets, dim=0)
+    masks_cat = torch.cat(all_masks, dim=0)
+    num_real_tokens = inputs_cat.shape[0]
+
+    # Zero out loss_mask at document boundaries to prevent cross-document target leakage.
+    # At the last position of Doc_i, the target would be the first token of Doc_{i+1},
+    # which is an invalid prediction target. Set loss_mask=0 there.
+    for boundary_idx in range(len(cu_seqlens) - 2):  # All boundaries except the last
+        boundary_pos = cu_seqlens[boundary_idx + 1] - 1  # Last position of this document
+        if 0 <= boundary_pos < num_real_tokens:
+            masks_cat[boundary_pos] = 0.0
+
+    # Right-pad to seq_len
+    pad_len = seq_len - num_real_tokens
+    if pad_len > 0:
+        inputs_cat = torch.nn.functional.pad(inputs_cat, (0, pad_len), value=pad_token_id)
+        targets_cat = torch.nn.functional.pad(targets_cat, (0, pad_len), value=pad_token_id)
+        masks_cat = torch.nn.functional.pad(masks_cat, (0, pad_len), value=0.0)
+    elif pad_len < 0:
+        # Truncate (should not happen with correct packing, but safety)
+        inputs_cat = inputs_cat[:seq_len]
+        targets_cat = targets_cat[:seq_len]
+        masks_cat = masks_cat[:seq_len]
+        # Adjust cu_seqlens
+        cu_seqlens_adjusted = [0]
+        for cs in cu_seqlens[1:]:
+            if cs <= seq_len:
+                cu_seqlens_adjusted.append(cs)
+            else:
+                cu_seqlens_adjusted.append(seq_len)
+                break
+        cu_seqlens = cu_seqlens_adjusted
+        num_real_tokens = seq_len
+
+    # Add final boundary at seq_len if the last cu_seqlen doesn't reach it.
+    # The padding region gets its own "document" in cu_seqlens so the varlen kernel
+    # processes it without attending across the last real document.
+    if cu_seqlens[-1] < seq_len:
+        cu_seqlens.append(seq_len)
+
+    cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32)
+
+    return PackedBin(
+        inputs=inputs_cat,
+        targets=targets_cat,
+        loss_mask=masks_cat,
+        cu_seqlens=cu_seqlens_tensor,
+        num_real_tokens=num_real_tokens,
+        num_docs=len(docs),
+    )
+
+
+def compute_packing_stats(bins: List[PackedBin], seq_len: int) -> Dict[str, float]:
+    """Compute packing efficiency statistics.
+
+    Args:
+        bins: List of packed bins.
+        seq_len: Sequence length.
+
+    Returns:
+        Dictionary with packing statistics.
+    """
+    if not bins:
+        return {"efficiency": 0.0, "avg_docs_per_bin": 0.0, "total_bins": 0}
+
+    total_real = sum(b.num_real_tokens for b in bins)
+    total_capacity = len(bins) * seq_len
+    avg_docs = sum(b.num_docs for b in bins) / len(bins)
+
+    return {
+        "efficiency": total_real / total_capacity if total_capacity > 0 else 0.0,
+        "avg_docs_per_bin": avg_docs,
+        "total_bins": len(bins),
+        "total_real_tokens": total_real,
+        "total_capacity": total_capacity,
+        "waste_fraction": 1.0 - (total_real / total_capacity) if total_capacity > 0 else 1.0,
+    }
+
+
 # ============================================================================
 # Dataset adapters
 # ============================================================================
@@ -346,10 +578,17 @@ def extract_messages_from_example(
 # ============================================================================
 
 class SFTLoader:
-    """SFT data loader that returns (inputs, targets, loss_mask) 3-tuples.
+    """SFT data loader that returns (inputs, targets, loss_mask) 3-tuples,
+    or (inputs, targets, loss_mask, cu_seqlens) 4-tuples when packing is enabled.
 
     Loads data from a HuggingFace dataset, applies chat formatting,
     tokenizes, and generates per-token loss masks.
+
+    When packing is enabled (sft_packing_enabled=True):
+    - Multiple SFT examples are packed into each sequence using FFD bin packing
+    - cu_seqlens marks document boundaries for document-isolated attention
+    - Loss mask is zeroed at document boundaries to prevent cross-document leakage
+    - Packed bins are precomputed at init time for deterministic checkpoint/resume
 
     For EP=8/DP=16: data is sharded across dp_world_size=16 replicas.
     Each DP rank sees 1/16 of the data.
@@ -370,6 +609,8 @@ class SFTLoader:
         seed: int = 42,
         max_examples: Optional[int] = None,
         dataset_split: str = "train",
+        packing_enabled: bool = False,
+        packing_max_docs_per_bin: int = 16,
     ):
         """Initialize SFT loader.
 
@@ -386,6 +627,8 @@ class SFTLoader:
             seed: Random seed for shuffling.
             max_examples: Limit number of examples (for debugging).
             dataset_split: Dataset split to load.
+            packing_enabled: If True, pack multiple examples per sequence.
+            packing_max_docs_per_bin: Maximum documents per packed sequence.
         """
         self.seq_len = seq_len
         self.global_batch_size = batch_size
@@ -394,6 +637,8 @@ class SFTLoader:
         self.dp_world_size = dp_world_size
         self.mask_prompt_loss = mask_prompt_loss
         self.device = device
+        self.packing_enabled = packing_enabled
+        self.packing_max_docs_per_bin = packing_max_docs_per_bin
 
         if prompt_format not in CHAT_FORMATTERS:
             raise ValueError(
@@ -429,6 +674,12 @@ class SFTLoader:
         self._epoch = 0
         self._step = 0
         self._total_tokens = 0
+
+        # Packing: precompute packed bins if enabled
+        self._packed_bins: Optional[List[PackedBin]] = None
+        self._bin_index = 0
+        if self.packing_enabled:
+            self._build_packed_bins()
 
     def _load_dataset(
         self,
@@ -480,6 +731,62 @@ class SFTLoader:
             f"{len(self._indices)} examples (of {n} total)"
         )
 
+    def _build_packed_bins(self) -> None:
+        """Precompute packed bins from all examples for deterministic training.
+
+        Tokenizes all examples assigned to this DP rank, then packs them into
+        fixed-length bins using FFD. The packed bins replace the raw example
+        indices as the iteration source.
+
+        This is done once at init time (or after checkpoint load triggers re-sharding).
+        Runtime cost is amortized over the entire training run.
+        """
+        t0 = time.time()
+        logger.info(
+            f"[Packing] Tokenizing {len(self._indices)} examples for DP rank {self.dp_rank}..."
+        )
+
+        # Tokenize all examples
+        all_examples = []
+        skipped = 0
+        for idx in range(len(self._indices)):
+            result = self._process_example(idx)
+            if result is None:
+                skipped += 1
+                continue
+            all_examples.append(result)
+
+        logger.info(
+            f"[Packing] Tokenized {len(all_examples)} examples "
+            f"(skipped {skipped}) in {time.time() - t0:.1f}s"
+        )
+
+        if not all_examples:
+            self._packed_bins = []
+            return
+
+        # Pack into bins using FFD
+        t1 = time.time()
+        self._packed_bins = pack_examples_ffd(
+            examples=all_examples,
+            seq_len=self.seq_len,
+            pad_token_id=0,
+            max_docs_per_bin=self.packing_max_docs_per_bin,
+        )
+
+        # Log packing statistics
+        stats = compute_packing_stats(self._packed_bins, self.seq_len)
+        pack_time = time.time() - t1
+        total_time = time.time() - t0
+        logger.info(
+            f"[Packing] DP rank {self.dp_rank}: "
+            f"{len(all_examples)} examples -> {stats['total_bins']} packed bins | "
+            f"efficiency={stats['efficiency']:.1%} | "
+            f"avg_docs/bin={stats['avg_docs_per_bin']:.1f} | "
+            f"waste={stats['waste_fraction']:.1%} | "
+            f"pack_time={pack_time:.1f}s total_time={total_time:.1f}s"
+        )
+
     def _process_example(self, idx: int) -> Optional[Tuple[torch.Tensor, ...]]:
         """Process a single example: format -> tokenize -> loss mask."""
         example = self.dataset[self._indices[idx]]
@@ -506,14 +813,29 @@ class SFTLoader:
 
         return result
 
-    def next(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get next batch of (inputs, targets, loss_mask).
+    def next(self):
+        """Get next batch.
 
-        Returns:
+        Without packing:
+            Returns (inputs, targets, loss_mask) 3-tuple.
+
+        With packing:
+            Returns (inputs, targets, loss_mask, cu_seqlens) 4-tuple.
+            cu_seqlens is a list of int32 tensors, one per batch element,
+            each of shape [num_docs_i + 1] marking document boundaries.
+
+        Shapes:
             inputs: [local_batch_size, seq_len] long tensor
             targets: [local_batch_size, seq_len] long tensor
             loss_mask: [local_batch_size, seq_len] float tensor
+            cu_seqlens: list of [num_docs_i + 1] int32 tensors (packing only)
         """
+        if self.packing_enabled and self._packed_bins is not None:
+            return self._next_packed()
+        return self._next_unpacked()
+
+    def _next_unpacked(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Original unpacked batch loading."""
         batch_inputs = []
         batch_targets = []
         batch_masks = []
@@ -545,14 +867,51 @@ class SFTLoader:
 
         return inputs, targets, loss_mask
 
+    def _next_packed(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Packed batch loading with cu_seqlens for document-isolated attention."""
+        batch_inputs = []
+        batch_targets = []
+        batch_masks = []
+        batch_cu_seqlens = []
+
+        while len(batch_inputs) < self.local_batch_size:
+            if self._bin_index >= len(self._packed_bins):
+                # Wrap around (new epoch)
+                self._epoch += 1
+                self._bin_index = 0
+                logger.info(f"SFT loader (packed): starting epoch {self._epoch}")
+
+            pbin = self._packed_bins[self._bin_index]
+            self._bin_index += 1
+
+            batch_inputs.append(pbin.inputs)
+            batch_targets.append(pbin.targets)
+            batch_masks.append(pbin.loss_mask)
+            batch_cu_seqlens.append(pbin.cu_seqlens)
+
+        self._step += 1
+        self._total_tokens += self.local_batch_size * self.seq_len
+
+        inputs = torch.stack(batch_inputs).to(self.device, non_blocking=True)
+        targets = torch.stack(batch_targets).to(self.device, non_blocking=True)
+        loss_mask = torch.stack(batch_masks).to(self.device, non_blocking=True)
+        # cu_seqlens are moved to device individually (variable length per batch element)
+        cu_seqlens = [cs.to(self.device, non_blocking=True) for cs in batch_cu_seqlens]
+
+        return inputs, targets, loss_mask, cu_seqlens
+
     def state_dict(self) -> Dict[str, Any]:
         """Save loader state for checkpointing."""
-        return {
+        state = {
             "index": self._index,
             "epoch": self._epoch,
             "step": self._step,
             "total_tokens": self._total_tokens,
+            "packing_enabled": self.packing_enabled,
         }
+        if self.packing_enabled:
+            state["bin_index"] = self._bin_index
+        return state
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         """Restore loader state from checkpoint."""
@@ -560,6 +919,8 @@ class SFTLoader:
         self._epoch = state.get("epoch", 0)
         self._step = state.get("step", 0)
         self._total_tokens = state.get("total_tokens", 0)
+        if self.packing_enabled:
+            self._bin_index = state.get("bin_index", 0)
 
 
 # ============================================================================
@@ -621,14 +982,21 @@ def build_sft_loader(
 
     prompt_format = getattr(cfg, "sft_prompt_format", "chatml")
     mask_prompt_loss = getattr(cfg, "sft_mask_prompt_loss", True)
+    packing_enabled = getattr(cfg, "sft_packing_enabled", False)
+    packing_max_docs = getattr(cfg, "sft_packing_max_docs_per_bin", 16)
 
     if dp_rank == 0:
         print_fn(f"[SFT] dataset: {sft_data_path}")
         print_fn(f"[SFT] tokenizer: {tokenizer_path}")
         print_fn(f"[SFT] format: {prompt_format}")
         print_fn(f"[SFT] mask_prompt_loss: {mask_prompt_loss}")
+        print_fn(f"[SFT] packing: {'ENABLED' if packing_enabled else 'disabled'}")
+        if packing_enabled:
+            print_fn(f"[SFT] packing_max_docs_per_bin: {packing_max_docs}")
         print_fn(f"[SFT] dp_world_size: {dp_world_size} (each rank sees 1/{dp_world_size} of data)")
 
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required for SFT data loader")
     loader = SFTLoader(
         dataset_path=sft_data_path,
         tokenizer_path=tokenizer_path,
@@ -639,6 +1007,8 @@ def build_sft_loader(
         prompt_format=prompt_format,
         mask_prompt_loss=mask_prompt_loss,
         device="cuda" if torch.cuda.is_available() else "cpu",
+        packing_enabled=packing_enabled,
+        packing_max_docs_per_bin=packing_max_docs,
     )
 
     return loader

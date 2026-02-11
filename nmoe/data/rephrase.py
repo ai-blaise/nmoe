@@ -321,6 +321,8 @@ def compute_fidelity(
         List of cosine similarity scores [0, 1] per pair
     """
     if device is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA required for semantic similarity scoring")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     import tiktoken

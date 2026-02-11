@@ -1,20 +1,22 @@
+import logging
 import os
 from typing import Dict, Optional
 
 import torch
+
+_rdep_logger = logging.getLogger(__name__)
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import numpy as np
 
 # Import C extension (built in csrc/)
 from .csrc import rdep as _C
-from .moe import _MoEBf16Fused, _MoEBlockscaledFused
+from .moe import _MoEBlockscaledFused
 from .cuda_errors import (
     CudaError,
     NvshmemError,
     RdepError,
     cuda_error_context,
-    check_cuda_errors,
 )
 
 
@@ -169,27 +171,27 @@ class Rdep:
         try:
             uid_size = _C.nvshmem_get_uid_size()
             if self.rank == 0:
-                print(f"[RDEP] rank={self.rank}: Getting UID (size={uid_size})...", flush=True)
+                _rdep_logger.info("rank=%d: Getting UID (size=%d)...", self.rank, uid_size)
                 with cuda_error_context("nvshmem_get_uid"):
                     uid = _C.nvshmem_get_uid()
-                print(f"[RDEP] rank={self.rank}: Got UID", flush=True)
+                _rdep_logger.info("rank=%d: Got UID", self.rank)
             else:
                 uid = None
 
             if self.rank == 0:
-                print(f"[RDEP] rank={self.rank}: Broadcasting UID via CPU...", flush=True)
+                _rdep_logger.info("rank=%d: Broadcasting UID via CPU...", self.rank)
             uid_list = [uid]
             dist.broadcast_object_list(uid_list, src=0, group=cpu_pg)
             uid = uid_list[0]
             if self.rank == 0:
-                print(f"[RDEP] rank={self.rank}: UID broadcast complete", flush=True)
+                _rdep_logger.info("rank=%d: UID broadcast complete", self.rank)
             if self.rank == 0:
-                print(f"[RDEP] rank={self.rank}: Initializing NVSHMEM...", flush=True)
+                _rdep_logger.info("rank=%d: Initializing NVSHMEM...", self.rank)
 
             with cuda_error_context("nvshmem_init"):
                 _C.nvshmem_init(uid, self.rank, self.world, self.local_world)
             if self.rank == 0:
-                print(f"[RDEP] rank={self.rank}: NVSHMEM initialized!", flush=True)
+                _rdep_logger.info("rank=%d: NVSHMEM initialized!", self.rank)
 
             with cuda_error_context("nvshmem_alloc_bf16"):
                 _C.nvshmem_alloc_bf16(self.capacity, self.dim, self.n_local)
@@ -259,9 +261,11 @@ class Rdep:
 
     def moe_bf16(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                 W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor) -> torch.Tensor:
-        if self.profile != 'bf16':
-            raise RuntimeError("moe_bf16() requires profile='bf16'")
-        return _MoEBf16Fused.apply(self, x, eid, gates, W1, W3, W2)
+        raise RuntimeError(
+            "BF16 MoE path removed — use blockscaled (dtype=nvfp4). "
+            "The _MoEBf16Fused autograd Function has been deleted; "
+            "set profile='fp8' or profile='nvfp4' and call moe_blockscaled()."
+        )
 
     def moe_blockscaled(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                         W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor,

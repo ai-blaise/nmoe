@@ -78,8 +78,6 @@ adam_eps = 1e-9
 # ECO Optimizer -- NVFP4 Primary + FP8 States
 # =============================================================================
 eco_enabled = true
-eco_primary_format = "nvfp4"     # NVFP4 primary weights (no BF16 master)
-eco_quant_format = "fp8"         # FP8 optimizer states (m=E5M2, v=E4M3)
 eco_error_feedback = true        # Error correction feedback into momentum
 eco_stochastic_rounding = true   # SR for NVFP4 E2M1 quantization
 gradient_checkpointing = true    # Required: 1 layer BF16 scratch at a time

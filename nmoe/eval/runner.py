@@ -3,21 +3,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
+import logging
 import os
-import random
 import re
-import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
 from nmoe.metrics import start_metrics, stop_metrics
 from nmoe.eval.adapters import iter_choices, iter_span
-from nmoe.eval.execution import run_python, humaneval_check, ExecResult
+from nmoe.eval.execution import run_python
 
 
 # -----------------------------
@@ -325,17 +323,6 @@ def iter_judge(name: str, source: str, max_examples: int) -> Iterator[Dict]:
 # -----------------------------
 # Code Generation & Execution
 # -----------------------------
-
-@dataclass
-class CodeGenResult:
-    """Result of code generation and execution."""
-    task_id: str
-    prompt: str
-    completion: str
-    passed: bool
-    error_msg: str = ""
-    exec_time_ms: float = 0.0
-
 
 def generate_code_completion(
     model: torch.nn.Module,
@@ -780,59 +767,8 @@ class EvalResult:
     n: int
 
 
-def _run_choices_sim(task_name: str, model: SimModel, n: int) -> EvalResult:
-    # Determine number of choices from task family
-    n_choices = 4
-    if task_name in ("PIQA", "BoolQ", "COPA", "StoryCloze", "WinoGrande"):
-        n_choices = 2
-    if task_name == "SIQA":
-        n_choices = 3
-    ex = _sim_examples_choices(n, n_choices)
-    correct = 0
-    for e in ex:
-        pred = model.predict_choice(e["prompt"], len(e["choices"]), e["label"])
-        correct += int(pred == int(e["label"]))
-    acc = correct / max(1, n)
-    centered = _centered(acc, BASELINE_BY_TASK.get(task_name, 0.0))
-    return EvalResult(task=task_name, raw_acc=acc, centered_acc=centered, n=n)
-
-
 def _normalize_text(s: str) -> str:
     return " ".join(s.strip().lower().replace("\n", " ").split())
-
-
-def _run_span_sim(task_name: str, model: SimModel, n: int) -> EvalResult:
-    ex = _sim_examples_span(n)
-    em = 0
-    for e in ex:
-        pred = model.generate_span(e["prompt"], e["answers"][0])
-        if _normalize_text(pred) in {_normalize_text(a) for a in e["answers"]}:
-            em += 1
-    acc = em / max(1, n)
-    centered = _centered(acc, BASELINE_BY_TASK.get(task_name, 0.0))
-    return EvalResult(task=task_name, raw_acc=acc, centered_acc=centered, n=n)
-
-
-def _run_unittest_sim(task_name: str, model: SimModel, n: int) -> EvalResult:
-    ex = _sim_examples_unittest(n)
-    passed = 0
-    for e in ex:
-        if model.run_unittest(e["prompt"]):
-            passed += 1
-    acc = passed / max(1, n)
-    centered = _centered(acc, 0.0)
-    return EvalResult(task=task_name, raw_acc=acc, centered_acc=centered, n=n)
-
-
-def _run_judge_sim(task_name: str, model: SimModel, n: int, tau_keep: float = 0.5) -> EvalResult:
-    ex = _sim_examples_judge(n)
-    kept = 0
-    for e in ex:
-        if model.judge_keep(e["prompt"]):
-            kept += 1
-    acc = kept / max(1, n)
-    centered = _centered(acc, tau_keep)  # treat threshold as baseline for centering
-    return EvalResult(task=task_name, raw_acc=acc, centered_acc=centered, n=n)
 
 
 # -----------------------------
@@ -882,10 +818,10 @@ def main() -> None:
     model = Transformer(cfg).cuda().eval()
     # Load state if present
     try:
-        from torch.nn.modules.module import _IncompatibleKeys
         miss = model.load_state_dict(_model_state, strict=False)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger(__name__).error("model.load_state_dict failed: %s. Evaluation may produce invalid results.", e)
+        raise
 
     t0 = _now_ms()
     results: list[EvalResult] = []
@@ -1120,7 +1056,7 @@ def main() -> None:
             items.append(("eval/CORE", float(core)))
             ctx.writer.insert_many(step, items)
     except Exception:
-        pass
+        logging.getLogger(__name__).debug("Metrics DB write failed", exc_info=True)
 
     stop_metrics(ctx)
 

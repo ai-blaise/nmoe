@@ -121,10 +121,6 @@ class BlockManager:
         seq.block_table.clear()
         seq.num_cached_tokens = 0
 
-    def can_append(self, seq: Sequence) -> bool:
-        block_idx = len(seq) // self.block_size
-        return block_idx < len(seq.block_table) or len(self.free) > 0
-
     def append_slot(self, seq: Sequence) -> int:
         pos = len(seq) - 1
         block_idx = pos // self.block_size
@@ -696,16 +692,9 @@ class BatchedGenerator:
         self.waiting.append(seq)
         return seq.seq_id
 
-    # Backwards compatibility
-    def add_request(self, tokens: list[int], max_tokens: int = 256) -> int:
-        return self.add(tokens, max_tokens)
-
     @property
     def idle(self) -> bool:
         return not self.waiting and not self.running
-
-    def is_idle(self) -> bool:
-        return self.idle
 
     def _schedule(self) -> tuple[list[Sequence], bool]:
         """Schedule sequences for next step. Returns (seqs, is_prefill)."""

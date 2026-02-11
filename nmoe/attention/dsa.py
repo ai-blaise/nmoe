@@ -9,9 +9,12 @@ from nmoe.attention.rope import rotate_pe
 from nmoe.config import Config
 from nmoe.triton.dsa import lightning_indexer
 
+import logging as _logging
+_dsa_logger = _logging.getLogger(__name__)
 try:
   _flex_attention = torch.compile(flex_attention)
-except Exception:
+except Exception as _e:
+  _dsa_logger.warning("torch.compile(flex_attention) failed: %s. Using eager mode (slower).", _e)
   _flex_attention = flex_attention
 
 
@@ -234,9 +237,6 @@ class DSA(MLA):
     k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
     k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)  # [B, T, H, qk_head_dim]
 
-    # =====================================================================
-    # Dense Warm-up Mode: standard MLA attention, cache weights for indexer loss
-    # =====================================================================
     if self.training_mode == "dense_warmup":
       with record_function("attn.kernel[dsa.dense]"):
         Q = q.transpose(1, 2)  # [B, H, T, D]

@@ -169,36 +169,9 @@ def lightning_indexer(
     return vals, idxs.to(torch.int32)
 
 
-def lightning_indexer_ref(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    w: torch.Tensor,
-    top_k: int,
-    causal: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference implementation for correctness testing."""
-    B, M, H, D = q.shape
-    N = k.shape[1]
-
-    # Equation 1: I_{t,s} = Σ_h w_{t,h} · ReLU(q_{t,h} · k_s)
-    scores = torch.einsum('bmhd,bnd->bmhn', q.float(), k.float())
-    scores = torch.relu(scores)
-    scores = (w.float().unsqueeze(-1) * scores).sum(dim=2)  # [B, M, N]
-
-    if causal:
-        mask = torch.triu(torch.ones(M, N, device=q.device, dtype=torch.bool), diagonal=1)
-        scores.masked_fill_(mask.unsqueeze(0), float('-inf'))
-
-    K_SEL = min(top_k, N)
-    vals, idxs = scores.topk(K_SEL, dim=-1)
-    return vals, idxs.to(torch.int32)
-
-
 # =============================================================================
 # Fused Streaming Top-K (for small k <= BLOCK_N)
 # =============================================================================
-# This section provides a fused implementation for cases where k is small enough
-# to fit in a single block. For larger k, use lightning_indexer above.
 
 @triton.jit
 def _fpval_to_key(x):
@@ -345,52 +318,3 @@ def _lightning_indexer_fused_small_k(
     tl.store(i_ptrs, y_indices, mask=mask_m[:, None])
 
 
-def lightning_indexer_fused(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    w: torch.Tensor,
-    top_k: int,
-    causal: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused lightning indexer for small k values (k <= 64).
-
-    For larger k, use lightning_indexer() which uses a two-pass approach.
-    """
-    B, M, H, D = q.shape
-    N = k.shape[1]
-    K_SEL = min(top_k, N)
-
-    # This fused version only works for small k
-    K_SEL_PAD = triton.next_power_of_2(K_SEL)
-    BLOCK_N = max(K_SEL_PAD, 64)
-
-    if BLOCK_N > 64:
-        # Fall back to two-pass for large k
-        return lightning_indexer(q, k, w, top_k, causal)
-
-    out_vals = torch.empty(B, M, K_SEL_PAD, device=q.device, dtype=torch.float32)
-    out_idxs = torch.empty(B, M, K_SEL_PAD, device=q.device, dtype=torch.int32)
-
-    BLOCK_M = 32
-
-    # N_PAD must be multiple of BLOCK_N
-    N_PAD = ((N + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
-
-    grid = (triton.cdiv(M, BLOCK_M), B)
-
-    _lightning_indexer_fused_small_k[grid](
-        q, k, w,
-        out_vals, out_idxs,
-        M, N, H, D, K_SEL_PAD,
-        *q.stride(), *k.stride(), *w.stride(),
-        *out_vals.stride(), *out_idxs.stride(),
-        CAUSAL=causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        N_PAD=N_PAD,
-        num_warps=4,
-        num_stages=2,
-    )
-
-    return out_vals[:, :, :K_SEL], out_idxs[:, :, :K_SEL]

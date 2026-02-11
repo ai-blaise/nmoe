@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Dict, Any, Callable, Optional, Tuple
@@ -399,10 +399,6 @@ class ParallelPrepPipeline:
         log.info(f"Wrote manifest: {manifest_path}")
         return ManifestInfo.from_dict(combined_manifest)
 
-
-# =============================================================================
-# Apache Beam Pipeline (optional, for distributed execution)
-# =============================================================================
 
 try:
     import apache_beam as beam

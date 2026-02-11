@@ -67,20 +67,3 @@ logger = setup_logging()
 info = logger.info
 warning = logger.warning
 error = logger.error
-debug = logger.debug
-
-
-def print0(*args, **kwargs) -> None:
-    try:
-        if dist.is_initialized() and dist.get_rank() != 0:
-            return
-    except Exception:
-        pass  # dist not available or not initialized, proceed with print
-    info(*args, **kwargs)
-
-
-def check(condition, message="Check failed"):
-    """Assert with stack trace on failure (glog-style)."""
-    if not condition:
-        logger.error(message)
-        raise AssertionError(message)

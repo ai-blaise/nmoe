@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,8 +14,8 @@ try:
     def _alloc(size: int, alignment: int, stream: int):
       return torch.empty(size, device="cuda", dtype=torch.int8)
     triton.set_allocator(_alloc)
-except Exception:
-  pass
+except Exception as _triton_err:
+  logging.getLogger(__name__).warning("Triton import failed: %s. Triton attention kernels unavailable.", _triton_err)
 
 
 class KDA(nn.Module):
@@ -50,7 +51,21 @@ class KDA(nn.Module):
     self.kv_norm.weight.data.fill_(1.0)
 
   @record_function("attn")
-  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+              cu_seqlens: list[torch.Tensor] | None = None) -> torch.Tensor:
+    """KDA forward with optional packed sequence support.
+
+    When cu_seqlens is provided, sequences within each batch element are treated
+    as independent documents using KDA's native cu_seqlens support. The input must
+    be reshaped to [1, B*T, H, D] with a single flattened cu_seqlens tensor.
+    For simplicity when packing is per-batch-element (not flattened), we pass
+    cu_seqlens=None and rely on the per-position gating to handle document isolation.
+
+    Args:
+      x: Input tensor [B, T, D].
+      cos, sin: RoPE rotation tensors.
+      cu_seqlens: Optional list of B int32 tensors for packed sequences.
+    """
     B, T, _ = x.size()
     q = self.wq_b(self.q_norm(self.wq_a(x))).view(B, T, self.n_heads, self.qk_head_dim)
     kv = self.wkv_a(x)
@@ -62,6 +77,31 @@ class KDA(nn.Module):
     k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
     g = F.logsigmoid(self.wg(x)).view(B, T, self.n_heads, self.qk_head_dim)
     beta = torch.sigmoid(self.wb(x)).view(B, T, self.n_heads)
+
+    # KDA natively supports cu_seqlens for variable-length inputs.
+    # When packing is enabled, flatten batch to [1, B*T, ...] and construct
+    # a unified cu_seqlens tensor from the per-element boundaries.
+    kda_cu_seqlens = None
+    if cu_seqlens is not None and B == 1:
+      # Single-element batch with packing: pass cu_seqlens directly
+      kda_cu_seqlens = cu_seqlens[0].to(torch.long)
+    elif cu_seqlens is not None and B > 1:
+      # Multi-element batch: flatten to [1, B*T, ...] and merge cu_seqlens
+      # Each batch element's cu_seqlens is offset by the element's position
+      merged = [torch.tensor([0], dtype=torch.long, device=x.device)]
+      offset = 0
+      for b_idx in range(B):
+        cu = cu_seqlens[b_idx]
+        # Skip the initial 0 and add offset
+        merged.append(cu[1:].to(torch.long) + offset)
+        offset += T
+      kda_cu_seqlens = torch.cat(merged, dim=0)
+      q = q.reshape(1, B * T, self.n_heads, self.qk_head_dim)
+      k = k.reshape(1, B * T, self.n_heads, self.qk_head_dim)
+      v = v.reshape(1, B * T, self.n_heads, self.v_head_dim)
+      g = g.reshape(1, B * T, self.n_heads, self.qk_head_dim)
+      beta = beta.reshape(1, B * T, self.n_heads)
+
     with record_function("attn.kernel[kda]"):
       o, _ = kda_k.chunk_kda(
         q, k, v, g, beta,
@@ -69,8 +109,12 @@ class KDA(nn.Module):
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
-        cu_seqlens=None,
+        cu_seqlens=kda_cu_seqlens,
       )
+
+    if cu_seqlens is not None and B > 1:
+      o = o.reshape(B, T, self.n_heads, self.v_head_dim)
+
     o = torch.nan_to_num(o, nan=0.0, posinf=1e4, neginf=-1e4)
     o = o.contiguous().view(B, T, self.n_heads * self.v_head_dim)
     return self.wo(o)

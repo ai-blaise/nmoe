@@ -19,7 +19,6 @@ import torch
 
 from nmoe.unified.config import NMoEModelConfig
 from nmoe.tools.config_converter import (
-    nmoe_to_hf_weight_mapping,
     expand_expert_weights_to_hf,
 )
 

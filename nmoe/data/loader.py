@@ -193,8 +193,8 @@ class DeterministicLoader:
         except StopIteration:
             pass
         except Exception:
-            # A production system would log this
-            pass
+            import logging
+            logging.getLogger(__name__).exception("Data prefetch thread failed")
 
     def state_dict(self) -> Dict:
         st = self._stages[self._stage_index]
