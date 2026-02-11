@@ -270,8 +270,9 @@ struct MuonPlan {
   int M{0};
   int N{0};
   int S{0};
-  // cuBLAS handle
+  // cuBLAS handles
   cublasHandle_t h{nullptr};
+  cublasLtHandle_t lt{nullptr};
   // Workspaces sized for Bmax tiles
   float* d_A{nullptr};
   float* d_T{nullptr};
