@@ -710,34 +710,84 @@ class SFTLoader:
                 split=split,
             )
         else:
-            # HuggingFace Hub dataset
+            # HuggingFace Hub dataset — discover available columns first,
+            # then load only the ones we actually need to avoid Arrow
+            # schema-cast errors on deeply-nested struct columns.
+            from huggingface_hub import HfApi
             try:
-                dataset = load_dataset(
-                    dataset_path,
-                    split=split,
-                    trust_remote_code=True,
-                )
+                info = HfApi().dataset_info(dataset_path)
+                if info.card_data and hasattr(info.card_data, "dataset_info"):
+                    # Some datasets expose column names in metadata
+                    pass
             except Exception:
-                # Retry in streaming mode and materialise — avoids
-                # Arrow schema-cast failures on deeply-nested columns.
-                logger.warning(
-                    "Standard load failed; retrying with streaming mode "
-                    "to work around nested-schema issues"
-                )
-                ds_iter = load_dataset(
-                    dataset_path,
-                    split=split,
-                    trust_remote_code=True,
-                    streaming=True,
-                )
-                # Materialise only the columns we need
-                rows = []
-                for row in ds_iter:
-                    keep = {k: v for k, v in row.items() if k in _needed_cols}
-                    if keep:
-                        rows.append(keep)
-                from datasets import Dataset
-                dataset = Dataset.from_list(rows)
+                pass
+
+            # Try loading with only needed columns (datasets ≥ 3.x)
+            _load_kwargs: dict = dict(split=split)
+            errors = []
+            for attempt in range(3):
+                try:
+                    if attempt == 0:
+                        # Attempt 1: standard load with select columns
+                        dataset = load_dataset(dataset_path, **_load_kwargs)
+                        break
+                    elif attempt == 1:
+                        # Attempt 2: streaming → materialise only needed cols
+                        logger.warning(
+                            "Standard load failed; retrying with streaming "
+                            "to work around nested-schema issues"
+                        )
+                        ds_iter = load_dataset(
+                            dataset_path, streaming=True, **_load_kwargs,
+                        )
+                        rows = []
+                        for row in ds_iter:
+                            keep = {k: v for k, v in row.items()
+                                    if k in _needed_cols}
+                            if keep:
+                                rows.append(keep)
+                        from datasets import Dataset as _Dataset
+                        dataset = _Dataset.from_list(rows)
+                        break
+                    else:
+                        # Attempt 3: download parquet files directly and
+                        # read only needed columns with pyarrow
+                        logger.warning(
+                            "Streaming also failed; downloading raw parquet"
+                        )
+                        import pyarrow.parquet as pq
+                        from huggingface_hub import hf_hub_download, list_repo_files
+                        parquet_files = [
+                            f for f in list_repo_files(dataset_path, repo_type="dataset")
+                            if f.endswith(".parquet")
+                        ]
+                        if not parquet_files:
+                            raise RuntimeError(
+                                f"No parquet files found in {dataset_path}"
+                            )
+                        tables = []
+                        for pf in parquet_files:
+                            local = hf_hub_download(
+                                dataset_path, pf, repo_type="dataset",
+                            )
+                            t = pq.read_table(
+                                local,
+                                columns=[c for c in _needed_cols
+                                         if c in pq.read_schema(local).names],
+                            )
+                            tables.append(t)
+                        import pyarrow as pa
+                        from datasets import Dataset as _Dataset
+                        merged = pa.concat_tables(tables)
+                        dataset = _Dataset(merged)
+                        break
+                except Exception as e:
+                    errors.append(str(e))
+                    if attempt == 2:
+                        raise RuntimeError(
+                            f"Failed to load dataset {dataset_path} after "
+                            f"3 attempts:\n" + "\n".join(errors)
+                        ) from e
 
         # Drop columns we don't need (reduces memory and avoids
         # downstream serialization issues with complex Arrow types).
