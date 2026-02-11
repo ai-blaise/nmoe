@@ -31,6 +31,7 @@ class Config:
   # =============================================================================
   vocab_size: int = 201088  # o200k_harmony tokenizer
   tokenizer: str = "o200k_harmony"  # Tokenizer name for data prep
+  tokenizer_path: Optional[str] = None  # Explicit tokenizer path (local dir or HF model ID)
   eos_token_id: int = 199999  # o200k_harmony eot_token; also used as padding
   dim: int = None  # Must specify
   n_layers: int = None  # Must specify
