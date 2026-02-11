@@ -142,11 +142,11 @@ class Rdep:
             if self._mode == 'hybrid':
                 self._setup_hybrid()
             elif self._mode == 'ipc':
-                with cuda_error_context("rdep.alloc_bf16"):
-                    _C.alloc_bf16(capacity, dim, n_local)
                 if profile != 'bf16':
                     with cuda_error_context("rdep.alloc_blockscaled"):
                         _C.alloc_blockscaled(capacity, dim, n_local, self.PROFILES[profile])
+                with cuda_error_context("rdep.alloc_bf16"):
+                    _C.alloc_bf16(capacity, dim, n_local)
                 self._setup_ipc()
             elif self._mode == 'single':
                 with cuda_error_context("rdep.alloc_bf16"):
