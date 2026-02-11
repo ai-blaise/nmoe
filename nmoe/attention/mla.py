@@ -94,12 +94,12 @@ def _mla_sdpa_packed_forward(
     softmax_scale: float,
     cu_seqlens_list: list[torch.Tensor],
 ) -> torch.Tensor:
-  """MLA attention using FlexAttention with block_mask for packed sequences.
+  """MLA attention using SDPA for packed sequences (document-isolated causal).
 
-  Builds a block-diagonal causal mask from cu_seqlens so that tokens from
-  different documents within a packed sequence cannot attend to each other.
-  Uses PyTorch's FlexAttention which compiles the mask into block-sparse
-  attention, avoiding O(S^2) mask materialization.
+  Processes each document within a packed sequence independently via
+  F.scaled_dot_product_attention(is_causal=True).  This uses PyTorch's
+  built-in flash-attention kernel with zero mask materialization overhead,
+  avoiding the O(B*H*S^2) memory cost of FlexAttention's create_block_mask.
 
   Args:
     q: Query tensor [B, S, H, D_qk]
@@ -112,56 +112,33 @@ def _mla_sdpa_packed_forward(
   Returns:
     Output tensor [B, S, H, D_v]
   """
-  from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-
   bsz, seqlen, n_heads, d_qk = q.shape
   d_v = v.shape[-1]
 
-  # Build a document_id tensor: [B, S] where each position maps to its document index.
-  # Uses vectorized searchsorted instead of Python loops to avoid CPU-GPU sync overhead.
-  positions = torch.arange(seqlen, device=q.device)
-  doc_ids = torch.zeros(bsz, seqlen, dtype=torch.int32, device=q.device)
-  for b_idx in range(bsz):
-    cu = cu_seqlens_list[b_idx].to(dtype=torch.long, device=q.device)
-    doc_ids[b_idx] = (torch.searchsorted(cu, positions, right=True) - 1).clamp(min=0).to(torch.int32)
+  output = torch.zeros(bsz, seqlen, n_heads, d_v, device=q.device, dtype=q.dtype)
 
-  # Transpose to [B, H, S, D] for FlexAttention
-  Q = q.transpose(1, 2).contiguous()
-  K = k.transpose(1, 2).contiguous()
-  V = v.transpose(1, 2).contiguous()
+  with _nvtx("attn/sdpa_packed_fwd"):
+    for b in range(bsz):
+      cu = cu_seqlens_list[b]
+      num_docs = cu.shape[0] - 1
+      for d in range(num_docs):
+        start = int(cu[d].item())
+        end = int(cu[d + 1].item())
+        if end <= start:
+          continue
+        # [doclen, H, D] → [1, H, doclen, D] for SDPA
+        q_d = q[b, start:end].transpose(0, 1).unsqueeze(0)  # [1, H, doclen, D_qk]
+        k_d = k[b, start:end].transpose(0, 1).unsqueeze(0)
+        v_d = v[b, start:end].transpose(0, 1).unsqueeze(0)
+        out_d = F.scaled_dot_product_attention(
+            q_d, k_d, v_d,
+            scale=softmax_scale,
+            is_causal=True,
+        )
+        # [1, H, doclen, D_v] → [doclen, H, D_v]
+        output[b, start:end] = out_d.squeeze(0).transpose(0, 1)
 
-  def mask_mod(b, h, q_idx, kv_idx, _doc_ids=doc_ids):
-    # Document isolation: q and kv must be in the same document
-    same_doc = _doc_ids[b, q_idx] == _doc_ids[b, kv_idx]
-    # Causal: kv_idx <= q_idx
-    causal_ok = kv_idx <= q_idx
-    return same_doc & causal_ok
-
-  with _nvtx("attn/flex_packed_mask"):
-    block_mask = create_block_mask(
-        mask_mod, B=bsz, H=n_heads, Q_LEN=seqlen, KV_LEN=seqlen,
-        device=q.device, BLOCK_SIZE=(128, 128),
-    )
-
-  try:
-    _compiled_flex = torch.compile(flex_attention)
-  except Exception as _e:
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
-        "torch.compile(flex_attention) failed: %s. Using eager mode (slower).", _e)
-    _compiled_flex = flex_attention
-
-  with _nvtx("attn/flex_packed_fwd"):
-    out = _compiled_flex(
-        Q, K, V,
-        block_mask=block_mask,
-        scale=softmax_scale,
-        enable_gqa=False,
-        return_lse=False,
-    )
-
-  # Back to [B, S, H, D_v]
-  return out.transpose(1, 2)
+  return output
 
 
 class _MlaFlashMlaVarlenPacked(torch.autograd.Function):
@@ -466,10 +443,10 @@ class MLA(nn.Module):
     k[..., self.qk_nope_head_dim:].copy_(k_pe.expand(-1, -1, self.n_heads, -1))
     with record_function("attn.kernel[mla]"):
       if cu_seqlens is not None:
-        # Packed sequences: always use FlashMLA varlen to avoid O(S²) mask
-        # materialization.  PyTorch FlexAttention's create_block_mask() attempts
-        # to allocate [B,H,Q,KV] intermediates which OOMs on large models.
-        output = _MlaFlashMlaVarlenPacked.apply(q, k, v, self.softmax_scale, cu_seqlens)
+        # Packed sequences: per-document SDPA with is_causal=True.
+        # Uses PyTorch's built-in flash-attention kernel — zero external deps,
+        # zero mask materialization (unlike FlexAttention's create_block_mask).
+        output = _mla_sdpa_packed_forward(q, k, v, self.softmax_scale, cu_seqlens)
       else:
         # Standard causal attention (no packing)
         if _USE_SDPA:
