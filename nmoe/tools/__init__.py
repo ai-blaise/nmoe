@@ -17,11 +17,11 @@ from .reshard_checkpoint import (
 )
 
 from .import_from_hf import (
-    import_hf_to_nmoe,
+    import_nvfp4_to_nmoe,
     validate_import,
-    build_hf_to_nmoe_mapping,
-    parse_expert_weight_name,
-    stack_expert_weights_for_layer,
+    build_hf_to_nmoe_base_mapping,
+    parse_expert_nvfp4_key,
+    stack_expert_nvfp4_triplets,
     shard_expert_tensor,
 )
 
@@ -39,10 +39,10 @@ __all__ = [
     "detect_ep_size",
     "detect_n_experts",
     # HF import
-    "import_hf_to_nmoe",
+    "import_nvfp4_to_nmoe",
     "validate_import",
-    "build_hf_to_nmoe_mapping",
-    "parse_expert_weight_name",
-    "stack_expert_weights_for_layer",
+    "build_hf_to_nmoe_base_mapping",
+    "parse_expert_nvfp4_key",
+    "stack_expert_nvfp4_triplets",
     "shard_expert_tensor",
 ]
