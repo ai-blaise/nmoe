@@ -117,7 +117,7 @@ checkpoint_keep_last_n = 5       # Keep last 5 checkpoints, purge older
 # SFT
 # =============================================================================
 sft_enabled = true
-sft_data_path = "BlaiseAI/interactive-agent-rerolled"
+sft_data_path = "/home/nourdine/sft_data"
 sft_mask_prompt_loss = true      # Only compute loss on assistant response tokens
 sft_prompt_format = "deepseekv32"
 sft_packing_enabled = true       # FFD bin-packing: 2-3x throughput, zero memory cost
