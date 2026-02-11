@@ -129,12 +129,21 @@ def train(cfg: Config):
   if getattr(cfg, 'gradient_checkpointing', False):
     model.gradient_checkpointing_enable()
     if rank == 0:
-      print("[nmoe] Gradient checkpointing enabled")
+      logger.info("Gradient checkpointing enabled")
 
   register_model_timers(model)
   optimizer, dense_groups = build_optimizer(model, cfg)
   metrics_state = init_metrics(model, cfg.seq_len)
   metrics_ctx = start_metrics(run_id=run_id, metrics_dir=cfg.metrics_dir)
+
+  # Upload training config to W&B (rank 0 only)
+  if rank == 0 and metrics_ctx.wandb_run is not None:
+    import dataclasses
+    try:
+      metrics_ctx.wandb_run.config.update(dataclasses.asdict(cfg))
+    except Exception:
+      logger.debug("W&B config upload failed", exc_info=True)
+
   zero2_state = {}
   start_step, tokens_seen, zero2_state = load_checkpoint(checkpointer, model, optimizer, loader, plan, cfg, rank, print)
 

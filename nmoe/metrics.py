@@ -16,13 +16,20 @@ import os as _os
 # Optional top‑level imports to avoid in‑function imports
 try:  # model class references used by register_model_timers
     from nmoe.model import MLP  # type: ignore
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    logging.getLogger(__name__).debug("MLP import failed, model timing disabled: %s", e)
     MLP = None  # type: ignore
 
 try:  # GPU metrics poller (C++ extension), optional
     from nmoe.csrc import gpu  # type: ignore
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    logging.getLogger(__name__).debug("gpu module not available, GPU metrics disabled: %s", e)
     gpu = None  # type: ignore
+
+try:  # Weights & Biases (optional)
+    import wandb as _wandb
+except Exception:  # pragma: no cover
+    _wandb = None  # type: ignore
 
 # ------------------------------------------------------------
 # NVIDIA B200 peak Tensor Core throughput (per GPU, dense)
@@ -728,6 +735,7 @@ class MetricsContext:
     gpu_snapshot_fn: Optional[Callable[[], Iterable[Mapping[str, float]]]]
     gpu_stop_fn: Optional[Callable[[], None]]
     last_gpu_log: float = 0.0
+    wandb_run: object = None
 
 
 def start_metrics(run_id: Optional[str] = None,
@@ -766,16 +774,38 @@ def start_metrics(run_id: Optional[str] = None,
                 gpu_snapshot_fn = gpu.snapshot
                 gpu_stop_fn = gpu.stop
             except Exception:
+                logger.debug("metrics: GPU poller start", exc_info=True)
                 gpu_snapshot_fn = None
                 gpu_stop_fn = None
         else:
             gpu_snapshot_fn = None
             gpu_stop_fn = None
     except Exception:
+        logger.debug("metrics: GPU poller outer init", exc_info=True)
         gpu_snapshot_fn = None
         gpu_stop_fn = None
 
-    return MetricsContext(writer=writer, gpu_snapshot_fn=gpu_snapshot_fn, gpu_stop_fn=gpu_stop_fn, last_gpu_log=0.0)
+    # W&B init (rank 0 only, opt-in via WANDB_ENABLED env var)
+    wandb_run = None
+    if rank == 0 and _wandb is not None and os.getenv("WANDB_ENABLED") == "1":
+        try:
+            wandb_run = _wandb.init(
+                project=os.getenv("WANDB_PROJECT", "nmoe"),
+                entity=os.getenv("WANDB_ENTITY") or None,
+                id=rid,
+                resume="allow",
+            )
+        except Exception:
+            logger.warning("metrics: W&B init failed, continuing without W&B", exc_info=True)
+            wandb_run = None
+
+    return MetricsContext(
+        writer=writer,
+        gpu_snapshot_fn=gpu_snapshot_fn,
+        gpu_stop_fn=gpu_stop_fn,
+        last_gpu_log=0.0,
+        wandb_run=wandb_run,
+    )
 
 
 def stop_metrics(ctx: Optional[MetricsContext]) -> None:
@@ -785,12 +815,17 @@ def stop_metrics(ctx: Optional[MetricsContext]) -> None:
         if ctx.gpu_stop_fn is not None:
             ctx.gpu_stop_fn()
     except Exception:
-        pass
+        logger.debug("metrics: GPU poller stop", exc_info=True)
     try:
         if ctx.writer is not None:
             ctx.writer.close()
     except Exception:
-        pass
+        logger.debug("metrics: DuckDB writer close on stop", exc_info=True)
+    try:
+        if ctx.wandb_run is not None and _wandb is not None:
+            _wandb.finish()
+    except Exception:
+        logger.debug("metrics: W&B finish", exc_info=True)
 
 
 def collect_router_stats(model: torch.nn.Module):
@@ -958,7 +993,28 @@ def log_training_step(step: int,
             if items:
                 ctx.writer.insert_many(step, items)
         except Exception:
-            pass
+            logger.debug("metrics: DuckDB write core metrics", exc_info=True)
+
+    # W&B core metrics (rank 0 only, mirrors DuckDB core columns)
+    if ctx is not None and ctx.wandb_run is not None:
+        try:
+            wandb_payload: dict[str, float] = {"step": step}
+            if out.get('loss') is not None:
+                wandb_payload["loss"] = float(out['loss'])
+            wandb_payload["lr"] = float(lr)
+            if out.get('tps') is not None:
+                wandb_payload["tokens_per_s_gpu"] = float(out['tps'])
+            if out.get('tflops') is not None:
+                wandb_payload["tflops"] = float(out['tflops'])
+            if out.get('alloc_gib') is not None:
+                wandb_payload["memory_alloc_gib"] = float(out['alloc_gib'])
+            if out.get('max_alloc_gib') is not None:
+                wandb_payload["memory_max_alloc_gib"] = float(out['max_alloc_gib'])
+            if out.get('grad_norm') is not None:
+                wandb_payload["grad_norm"] = float(out['grad_norm'])
+            _wandb.log(wandb_payload, step=step)
+        except Exception:
+            logger.debug("metrics: W&B log core metrics", exc_info=True)
 
     # Router metrics (per-layer + aggregates)
     if ctx is not None and ctx.writer is not None and rank == 0:
@@ -990,7 +1046,25 @@ def log_training_step(step: int,
                     experts_active_mean=agg.get('experts_active_mean'),
                 )
         except Exception:
-            pass
+            logger.debug("metrics: DuckDB write router metrics", exc_info=True)
+
+    # W&B router aggregates (rank 0 only)
+    if ctx is not None and ctx.wandb_run is not None:
+        try:
+            _per, _agg = collect_router_stats(model)
+            wandb_router: dict[str, float] = {}
+            if _agg.get('mean_cv') is not None:
+                wandb_router["router/mean_cv"] = float(_agg['mean_cv'])
+            if _agg.get('mean_entropy') is not None:
+                wandb_router["router/mean_entropy"] = float(_agg['mean_entropy'])
+            if _agg.get('dead_experts_count') is not None:
+                wandb_router["router/dead_experts"] = float(_agg['dead_experts_count'])
+            if _agg.get('experts_active_mean') is not None:
+                wandb_router["router/experts_active_mean"] = float(_agg['experts_active_mean'])
+            if wandb_router:
+                _wandb.log(wandb_router, step=step)
+        except Exception:
+            logger.debug("metrics: W&B log router metrics", exc_info=True)
 
     # Flush timers for this rank, then flush step-level segment and comm metrics, if any (all ranks, per-rank tags)
     _flush_timers_into_segments()
