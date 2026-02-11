@@ -421,14 +421,6 @@ __device__ __forceinline__ void fence_acq_rel_sys() {
     asm volatile("fence.acq_rel.sys;" ::: "memory");
 }
 
-__device__ __forceinline__ void fence_acq_rel_gpu() {
-    asm volatile("fence.acq_rel.gpu;" ::: "memory");
-}
-
-__device__ __forceinline__ void fence_acq_rel_cta() {
-    asm volatile("fence.acq_rel.cta;" ::: "memory");
-}
-
 // --- System-scope stores (for P2P writes visible to other GPUs) ---
 __device__ __forceinline__ void st_release_sys_s32(int* ptr, int val) {
     asm volatile("st.release.sys.global.s32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
@@ -454,34 +446,10 @@ __device__ __forceinline__ int ld_acquire_sys_s32(const int* ptr) {
     return ret;
 }
 
-__device__ __forceinline__ uint64_t ld_acquire_sys_u64(const uint64_t* ptr) {
-    uint64_t ret;
-    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
-}
-
 // --- Volatile loads (for polling) ---
 __device__ __forceinline__ int ld_volatile_s32(const int* ptr) {
     int ret;
     asm volatile("ld.volatile.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
-}
-
-__device__ __forceinline__ int64_t ld_volatile_s64(const int64_t* ptr) {
-    int64_t ret;
-    asm volatile("ld.volatile.global.s64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
-}
-
-__device__ __forceinline__ uint64_t ld_volatile_u64(const uint64_t* ptr) {
-    uint64_t ret;
-    asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
-}
-
-__device__ __forceinline__ float ld_volatile_f32(const float* ptr) {
-    float ret;
-    asm volatile("ld.volatile.global.f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
     return ret;
 }
 
@@ -494,25 +462,9 @@ __device__ __forceinline__ void st_na_relaxed_gpu_b16(uint16_t* ptr, uint16_t va
     asm volatile("st.relaxed.gpu.global.L1::no_allocate.b16 [%0], %1;" :: "l"(ptr), "h"(val));
 }
 
-__device__ __forceinline__ void st_na_relaxed_gpu_b32(int* ptr, int val) {
-    asm volatile("st.relaxed.gpu.global.L1::no_allocate.b32 [%0], %1;" :: "l"(ptr), "r"(val));
-}
-
-__device__ __forceinline__ void st_na_relaxed_gpu_b64(int64_t* ptr, int64_t val) {
-    asm volatile("st.relaxed.gpu.global.L1::no_allocate.b64 [%0], %1;" :: "l"(ptr), "l"(val));
-}
-
 __device__ __forceinline__ void st_na_relaxed_gpu_v4(int4* ptr, int4 val) {
     asm volatile("st.relaxed.gpu.global.L1::no_allocate.v4.s32 [%0], {%1, %2, %3, %4};"
                  :: "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w));
-}
-
-__device__ __forceinline__ void st_na_release_gpu_b32(int* ptr, int val) {
-    asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;" :: "l"(ptr), "r"(val));
-}
-
-__device__ __forceinline__ void st_na_release_gpu_b64(int64_t* ptr, int64_t val) {
-    asm volatile("st.release.gpu.global.L1::no_allocate.b64 [%0], %1;" :: "l"(ptr), "l"(val));
 }
 
 // --- Non-allocating loads (avoid polluting L1 on remote reads) ---
@@ -528,18 +480,6 @@ __device__ __forceinline__ uint16_t ld_na_relaxed_gpu_b16(const uint16_t* ptr) {
     return ret;
 }
 
-__device__ __forceinline__ int ld_na_relaxed_gpu_b32(const int* ptr) {
-    int ret;
-    asm volatile("ld.relaxed.gpu.global.L1::no_allocate.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
-}
-
-__device__ __forceinline__ int64_t ld_na_relaxed_gpu_b64(const int64_t* ptr) {
-    int64_t ret;
-    asm volatile("ld.relaxed.gpu.global.L1::no_allocate.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
-    return ret;
-}
-
 // --- Non-coherent loads with L2 hint (streaming from remote) ---
 // DeepEP pattern: ld.global.nc.L1::no_allocate.L2::256B for streaming P2P data
 // This gives 256B L2 cache line allocation for better streaming performance
@@ -549,21 +489,9 @@ __device__ __forceinline__ int64_t ld_na_relaxed_gpu_b64(const int64_t* ptr) {
 #define LD_NC_FUNC "ld.volatile.global"
 #endif
 
-__device__ __forceinline__ uint8_t ld_nc_u8(const uint8_t* ptr) {
-    unsigned short ret;
-    asm volatile(LD_NC_FUNC ".u8 %0, [%1];" : "=h"(ret) : "l"(ptr));
-    return static_cast<uint8_t>(ret);
-}
-
 __device__ __forceinline__ int ld_nc_s32(const int* ptr) {
     int ret;
     asm volatile(LD_NC_FUNC ".s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
-    return ret;
-}
-
-__device__ __forceinline__ int64_t ld_nc_s64(const int64_t* ptr) {
-    int64_t ret;
-    asm volatile(LD_NC_FUNC ".s64 %0, [%1];" : "=l"(ret) : "l"(ptr));
     return ret;
 }
 
@@ -592,10 +520,6 @@ __device__ __forceinline__ void st_na_s32(int* ptr, int val) {
     asm volatile("st.global.L1::no_allocate.s32 [%0], %1;" :: "l"(ptr), "r"(val));
 }
 
-__device__ __forceinline__ void st_na_s64(int64_t* ptr, int64_t val) {
-    asm volatile("st.global.L1::no_allocate.s64 [%0], %1;" :: "l"(ptr), "l"(val));
-}
-
 __device__ __forceinline__ void st_na_f32(float* ptr, float val) {
     asm volatile("st.global.L1::no_allocate.f32 [%0], %1;" :: "l"(ptr), "f"(val));
 }
@@ -615,12 +539,6 @@ __device__ __forceinline__ int atom_add_release_sys_s32(int* ptr, int val) {
     return ret;
 }
 
-__device__ __forceinline__ int atom_add_release_gpu_s32(int* ptr, int val) {
-    int ret;
-    asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(val));
-    return ret;
-}
-
 // System-scope atomics using CUDA intrinsics (for DeepEP-style barriers)
 // These use the _system suffix which provides system-scope visibility
 __device__ __forceinline__ int atomicAdd_sys(int* ptr, int val) {
@@ -632,32 +550,6 @@ __device__ __forceinline__ int atomicSub_sys(int* ptr, int val) {
 }
 
 // --- Shared memory atomics (CTA scope) ---
-
-// --- Lane ID ---
-__device__ __forceinline__ int get_laneid() {
-    int lane_id;
-    asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
-    return lane_id;
-}
-
-// --- Named barrier sync (for intra-kernel synchronization) ---
-__device__ __forceinline__ void bar_sync_count(int bar_id, int thread_count) {
-    asm volatile("bar.sync %0, %1;" :: "r"(bar_id), "r"(thread_count));
-}
-
-// --- Warp elect (leader selection) ---
-__device__ __forceinline__ bool elect_sync(unsigned mask = 0xffffffff) {
-    int pred = 0;
-    asm volatile(
-        "{\n"
-        ".reg .b32 %%rx;\n"
-        ".reg .pred %%px;\n"
-        "elect.sync %%rx|%%px, %1;\n"
-        "@%%px mov.s32 %0, 1;\n"
-        "}\n"
-        : "+r"(pred) : "r"(mask));
-    return pred != 0;
-}
 
 // --- Trap (halt execution on error) ---
 __device__ __forceinline__ void trap() {
@@ -671,9 +563,6 @@ __device__ __forceinline__ void trap() {
 template <typename T> struct ReduceSum { __device__ T operator()(T a, T b) const { return a + b; } };
 template <typename T> struct ReduceMax { __device__ T operator()(T a, T b) const { return a > b ? a : b; } };
 template <typename T> struct ReduceMin { __device__ T operator()(T a, T b) const { return a < b ? a : b; } };
-template <typename T> struct ReduceAnd { __device__ T operator()(T a, T b) const { return a & b; } };
-template <typename T> struct ReduceOr  { __device__ T operator()(T a, T b) const { return a | b; } };
-
 // Unified reduction function
 template <int kNumLanesPerGroup, bool kIntergroupReduce, typename T, typename Op>
 __device__ __forceinline__ T warp_reduce(T value, Op op) {
@@ -703,11 +592,6 @@ __device__ __forceinline__ T warp_reduce_sum(T value) {
 template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
 __device__ __forceinline__ T warp_reduce_max(T value) {
     return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMax<T>{});
-}
-
-template <int kNumLanesPerGroup = 32, bool kIntergroupReduce = false, typename T>
-__device__ __forceinline__ T warp_reduce_min(T value) {
-    return warp_reduce<kNumLanesPerGroup, kIntergroupReduce, T>(value, ReduceMin<T>{});
 }
 
 // ============================================================================

@@ -3,11 +3,14 @@
 Handles platform checks, distributed setup, seeds, and EP/DP process groups.
 Seamlessly supports single GPU, single-node multi-GPU, and multi-node training.
 """
+import logging
 import os
 import sys
 from pathlib import Path
 import torch
 import torch.distributed as dist
+
+_log = logging.getLogger(__name__)
 
 
 def _require_b200():
@@ -81,8 +84,11 @@ def init(seed: int = 42, ep_size: int = 1, tp_size: int = 1) -> tuple[int, int]:
     if not is_nmoe_parallel_initialized():
       init_nmoe_process_groups(ep_size=ep_size, tp_size=tp_size)
       if rank == 0:
+        import logging as _rt_logging
         dp_size = world // (ep_size * tp_size)
-        print(f"[nmoe] Process groups: EP={ep_size}, TP={tp_size}, DP={dp_size}, world={world}")
+        _rt_logging.getLogger(__name__).info(
+            "Process groups: EP=%d, TP=%d, DP=%d, world=%d", ep_size, tp_size, dp_size, world
+        )
 
   return rank, world
 
@@ -95,7 +101,7 @@ def finalize():
     if is_nmoe_parallel_initialized():
       cleanup_process_groups()
   except Exception:
-    pass
+    _log.warning("Failed to clean up nmoe process groups during finalize", exc_info=True)
 
   if dist.is_initialized():
     dist.destroy_process_group()

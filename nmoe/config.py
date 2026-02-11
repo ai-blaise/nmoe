@@ -17,74 +17,6 @@ def fingerprint(cfg: "Config") -> str:
   return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-# P3.10: Config attribute mapping between NMoE and SGLang/HuggingFace naming
-NMOE_TO_HF_MAPPING = {
-    # NMoE name -> HuggingFace name
-    "dim": "hidden_size",
-    "inter_dim": "intermediate_size",
-    "moe_inter_dim": "moe_intermediate_size",
-    "n_layers": "num_hidden_layers",
-    "n_heads": "num_attention_heads",
-    "n_routed_experts": "num_local_experts",  # Or num_experts
-    "n_activated_experts": "num_experts_per_tok",
-    "vocab_size": "vocab_size",
-    "max_position_embeddings": "max_position_embeddings",
-    "rms_norm_eps": "rms_norm_eps",
-    "rope_theta": "rope_theta",
-}
-
-
-def validate_config_mapping(nmoe_config: "Config", hf_config: Any) -> None:
-    """Validate that NMoE config values match HuggingFace config values.
-
-    P3.10: Provides explicit validation with clear error messages for
-    config attribute naming mismatches.
-
-    Args:
-        nmoe_config: NMoE Config instance
-        hf_config: HuggingFace PretrainedConfig or similar
-
-    Raises:
-        ValueError: If any mapped attribute values don't match
-    """
-    errors = []
-
-    for nmoe_attr, hf_attr in NMOE_TO_HF_MAPPING.items():
-        nmoe_val = getattr(nmoe_config, nmoe_attr, None)
-        hf_val = getattr(hf_config, hf_attr, None)
-
-        if nmoe_val is None or hf_val is None:
-            continue
-
-        if nmoe_val != hf_val:
-            errors.append(
-                f"Config mismatch: nmoe.{nmoe_attr}={nmoe_val} vs hf.{hf_attr}={hf_val}"
-            )
-
-    if errors:
-        raise ValueError(
-            "Config validation failed:\n  " + "\n  ".join(errors)
-        )
-
-
-def nmoe_to_hf_config(nmoe_config: "Config") -> Dict[str, Any]:
-    """Convert NMoE Config to HuggingFace-style config dict.
-
-    Args:
-        nmoe_config: NMoE Config instance
-
-    Returns:
-        Dictionary with HuggingFace naming conventions
-    """
-    hf_dict = {}
-
-    for nmoe_attr, hf_attr in NMOE_TO_HF_MAPPING.items():
-        val = getattr(nmoe_config, nmoe_attr, None)
-        if val is not None:
-            hf_dict[hf_attr] = val
-
-    return hf_dict
-
 
 @dataclass
 class Config:
@@ -153,7 +85,6 @@ class Config:
   adam_beta2: float = 0.95
   adam_beta2_expert: float = 0.99  # Higher for FP8 gradient noise
   adam_eps: float = 1e-8
-  muon_momentum: float = 0.95
 
   # =============================================================================
   # Scheduler (WSD - Warmup-Sustain-Decay)
@@ -172,6 +103,7 @@ class Config:
   seed: int = 42
   log_every: int = 10
   grad_clip: float = 0.0           # Max gradient norm (0 = disabled); 1.0 recommended for SFT
+  gradient_accumulation_steps: int = 1  # Number of micro-batches to accumulate before optimizer step
 
   # Checkpointing
   checkpoint_dir: str = "/data/checkpoints"
@@ -211,6 +143,8 @@ class Config:
   sft_prompt_format: str = "chatml"  # chatml | llama3 | deepseekv32 | custom
   sft_mask_prompt_loss: bool = True
   sft_packing_enabled: bool = False
+  sft_packing_efficiency_target: float = 0.95  # Target bin fill ratio for FFD packing
+  sft_packing_max_docs_per_bin: int = 16       # Safety limit on documents per packed sequence
   sft_data_path: Optional[str] = None
 
   # =============================================================================
@@ -223,11 +157,10 @@ class Config:
   # ECO Optimizer -- NVFP4 Primary + FP8 States
   # =============================================================================
   eco_enabled: bool = False
-  eco_primary_format: str = "nvfp4"    # "nvfp4" for NVFP4 primary weights
-  eco_quant_format: str = "fp8"        # "fp8" for FP8 optimizer states (m=E5M2, v=E4M3)
   eco_error_feedback: bool = True      # Error correction feedback into momentum
   eco_stochastic_rounding: bool = True # SR for NVFP4 E2M1 quantization
-  eco_fused_backward: bool = False     # Fuse optimizer step into backward (eliminates 152 GiB of BF16 params + grads)
+  eco_fused_backward: bool = True      # Fuse optimizer step into backward (eliminates 152 GiB of BF16 params + grads)
+  eco_require_cuda: bool = True       # Hard-fail if CUDA kernels unavailable (no silent Python fallback)
   gradient_checkpointing: bool = False # Required for NVFP4 primary (1 layer BF16 scratch)
 
   # =============================================================================

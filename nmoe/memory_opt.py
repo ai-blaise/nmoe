@@ -5,19 +5,18 @@ This module contains implementations for:
 - 5.3.2: ExpertCachePolicy - Configurable cache eviction policies (LRU, LFU, FIFO, ARC)
 - 5.3.3: Activation checkpointing helpers for MoE layers
 - 5.3.4: MemoryEfficientGradAccum - Gradient accumulation with memory efficiency
-- 5.3.5: Mixed-precision optimizer states (see ExpertAdamW in opt.py)
+- 5.3.5: Mixed-precision optimizer states (see opt.py)
 - 5.3.6: DynamicBatchSizer - Adjust batch size based on available memory
 """
 
 from __future__ import annotations
 
-import os
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -352,15 +351,6 @@ class ExpertCachePolicy:
 # =============================================================================
 
 
-@dataclass
-class ExpertWeightSpec:
-    """Specification for expert weight tensor shapes."""
-
-    name: str
-    shape: Tuple[int, ...]
-    dtype: torch.dtype = torch.bfloat16
-
-
 class LazyExpertWeights:
     """Load expert weights on-demand to reduce memory footprint.
 
@@ -614,11 +604,6 @@ class LazyExpertWeights:
     def __contains__(self, expert_id: int) -> bool:
         """Check if expert is currently loaded."""
         return expert_id in self._loaded_experts
-
-
-# =============================================================================
-# 5.3.3: Activation Checkpointing for MoE
-# =============================================================================
 
 
 def moe_forward_with_checkpointing(
@@ -1001,80 +986,6 @@ class DynamicBatchSizer:
         """
         self.current_batch = max(self.min_batch, min(self.max_batch, batch_size))
 
-
-# =============================================================================
-# 5.3.5: Mixed-Precision Optimizer State Utilities
-# =============================================================================
-
-
-def get_optimizer_memory_usage(optimizer: torch.optim.Optimizer) -> Dict[str, int]:
-    """Calculate memory usage of optimizer states.
-
-    Args:
-        optimizer: PyTorch optimizer.
-
-    Returns:
-        Dictionary with total_bytes, param_bytes, state_bytes.
-    """
-    param_bytes = 0
-    state_bytes = 0
-
-    for group in optimizer.param_groups:
-        for p in group["params"]:
-            param_bytes += p.numel() * p.element_size()
-
-            if p in optimizer.state:
-                state = optimizer.state[p]
-                for key, val in state.items():
-                    if torch.is_tensor(val):
-                        state_bytes += val.numel() * val.element_size()
-
-    return {
-        "total_bytes": param_bytes + state_bytes,
-        "param_bytes": param_bytes,
-        "state_bytes": state_bytes,
-    }
-
-
-def convert_optimizer_state_to_fp16(
-    optimizer: torch.optim.Optimizer,
-    exclude_step: bool = True,
-) -> None:
-    """Convert optimizer states to FP16 to save memory.
-
-    Warning: This may reduce training stability. Use with caution.
-
-    Args:
-        optimizer: PyTorch optimizer.
-        exclude_step: Don't convert step counters (they should stay as int/float).
-    """
-    for state in optimizer.state.values():
-        for key, val in state.items():
-            if exclude_step and key in ("step", "step_t"):
-                continue
-            if torch.is_tensor(val) and val.is_floating_point():
-                state[key] = val.half()
-
-
-def convert_optimizer_state_to_bf16(
-    optimizer: torch.optim.Optimizer,
-    exclude_step: bool = True,
-) -> None:
-    """Convert optimizer states to BF16 to save memory.
-
-    BF16 is preferred over FP16 for optimizer states due to its larger
-    dynamic range, which is important for Adam momentum/variance.
-
-    Args:
-        optimizer: PyTorch optimizer.
-        exclude_step: Don't convert step counters (they should stay as int/float).
-    """
-    for state in optimizer.state.values():
-        for key, val in state.items():
-            if exclude_step and key in ("step", "step_t"):
-                continue
-            if torch.is_tensor(val) and val.is_floating_point():
-                state[key] = val.bfloat16()
 
 
 # =============================================================================

@@ -11,10 +11,8 @@ This implementation uses a different approach than true persistent kernels:
 """
 
 import torch
-from typing import Optional, Tuple, Dict, List, Union
+from typing import Optional, Tuple, List, Union
 from dataclasses import dataclass
-import threading
-import queue
 
 
 @dataclass
@@ -245,92 +243,5 @@ class PersistentDecodeRunner:
         self.exit_decode_mode()
 
 
-def benchmark_persistent_vs_regular(
-    rdep,
-    batch_size: int = 32,
-    dim: int = 256,
-    n_experts: int = 8,
-    topk: int = 2,
-    intermediate_dim: int = 1024,
-    n_iters: int = 100,
-) -> dict:
-    """Benchmark persistent mode vs regular dispatch.
-
-    Args:
-        rdep: Rdep instance
-        batch_size: Number of tokens per batch
-        dim: Hidden dimension
-        n_experts: Number of experts
-        topk: Number of experts per token
-        intermediate_dim: MLP intermediate dimension
-        n_iters: Number of benchmark iterations
-
-    Returns:
-        dict with regular_ms, persistent_ms, speedup
-    """
-    import time
-
-    # Create test inputs
-    x = torch.randn(batch_size, dim, dtype=torch.bfloat16, device='cuda')
-    eid = torch.randint(0, n_experts, (batch_size, topk), device='cuda')
-    gates = torch.softmax(torch.randn(batch_size, topk, device='cuda'), dim=-1).bfloat16()
-
-    # Create expert weights
-    W1 = torch.randn(n_experts, dim, intermediate_dim, dtype=torch.bfloat16, device='cuda')
-    W3 = torch.randn(n_experts, dim, intermediate_dim, dtype=torch.bfloat16, device='cuda')
-    W2 = torch.randn(n_experts, intermediate_dim, dim, dtype=torch.bfloat16, device='cuda')
-
-    # Warmup regular
-    for _ in range(10):
-        rdep.dispatch(x, eid, gates, W1, W3, W2)
-    torch.cuda.synchronize()
-
-    # Benchmark regular
-    start = time.perf_counter()
-    for _ in range(n_iters):
-        rdep.dispatch(x, eid, gates, W1, W3, W2)
-    torch.cuda.synchronize()
-    regular_time = (time.perf_counter() - start) / n_iters * 1000  # ms
-
-    # Warmup persistent
-    runner = PersistentDecodeRunner(rdep, max_batch_size=batch_size, dim=dim)
-    with runner:
-        for _ in range(10):
-            runner.decode_step(x, eid, gates, W1, W3, W2)
-    torch.cuda.synchronize()
-
-    # Benchmark persistent
-    with runner:
-        start = time.perf_counter()
-        for _ in range(n_iters):
-            runner.decode_step(x, eid, gates, W1, W3, W2)
-    torch.cuda.synchronize()
-    persistent_time = (time.perf_counter() - start) / n_iters * 1000  # ms
-
-    return {
-        'regular_ms': regular_time,
-        'persistent_ms': persistent_time,
-        'speedup': regular_time / persistent_time if persistent_time > 0 else 0,
-    }
 
 
-if __name__ == "__main__":
-    from nmoe.rdep import Rdep
-
-    dim = 256
-    n_experts = 8
-    intermediate_dim = 1024
-    topk = 2
-
-    rdep = Rdep(dim=dim, n_local=n_experts, topk=topk, profile="bf16")
-    results = benchmark_persistent_vs_regular(
-        rdep,
-        dim=dim,
-        n_experts=n_experts,
-        intermediate_dim=intermediate_dim,
-        topk=topk,
-    )
-
-    print(f"Regular dispatch: {results['regular_ms']:.3f} ms")
-    print(f"Persistent dispatch: {results['persistent_ms']:.3f} ms")
-    print(f"Speedup: {results['speedup']:.2f}x")

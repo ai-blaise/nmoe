@@ -2240,20 +2240,6 @@ inline cudaError_t launch_dequantize_nvfp4_to_bf16(
 
 }} // namespace nmoe::quant
 
-extern "C" cudaError_t dequant_nvfp4_to_bf16(
-    const void* q, int ldq,
-    const void* sfa, int ld_sf,
-    int M, int K,
-    void* out, int ldo,
-    cudaStream_t stream)
-{
-    return nmoe::quant::launch_dequantize_nvfp4_to_bf16(
-        reinterpret_cast<const uint16_t*>(q), ldq,
-        reinterpret_cast<const uint8_t*>(sfa), ld_sf,
-        reinterpret_cast<__nv_bfloat16*>(out), ldo,
-        M, K, stream);
-}
-
 extern "C" cudaError_t repack_nvfp4_dense_perm(
     const void* in_u8, int ldi_bytes,
     void* out_u8, int ldo_bytes,
@@ -2653,20 +2639,6 @@ inline cudaError_t launch_fused_dense_quant_fp8_gemm_bf16(
     return cudaGetLastError();
 }
 } } // namespace nmoe::quant
-
-extern "C" cudaError_t dequant_fp8_to_bf16(
-    const void* q, int ldq,
-    const void* sfa, int ld_sf,
-    int M, int K,
-    void* out, int ldo,
-    cudaStream_t stream)
-{
-    return nmoe::quant::launch_dequantize_fp8_to_bf16(
-        reinterpret_cast<const uint16_t*>(q), ldq,
-        reinterpret_cast<const uint8_t*>(sfa), ld_sf,
-        reinterpret_cast<__nv_bfloat16*>(out), ldo,
-        M, K, stream);
-}
 
 extern "C" cudaError_t fused_dense_quant_fp8_gemm_bf16(
     const void* A, int lda,

@@ -6,141 +6,15 @@ Two parameter types:
 
 Precision support: bf16, fp8, nvfp4 (default: nvfp4)
 """
+import logging
 import math
 import torch
 import torch.distributed as dist
 
 from nmoe.config import Config
 from nmoe import zero2
-from nmoe.csrc import rdep as _rdep_ext
 
-
-class ExpertAdamW(torch.optim.Optimizer):
-  """Fused expert AdamW that emits blockscaled weight caches during the update.
-
-  This removes the separate post-step refresh phase (less memory traffic, fewer kernels).
-  Contract: experts are BF16 parameters; caches are FP8/NVFP4.
-  """
-
-  emits_weight_cache = True
-
-  def __init__(self, moe_modules: list[torch.nn.Module], cfg: Config):
-    params: list[torch.nn.Parameter] = []
-    for moe in moe_modules:
-      for name in ("W1", "W3", "W2"):
-        p = getattr(moe, name, None)
-        if p is None:
-          raise ValueError(f"MoE module missing {name}")
-        params.append(p)
-    defaults = {
-      "lr": cfg.lr_expert,
-      "betas": (cfg.adam_beta1, cfg.adam_beta2_expert),  # Higher beta2 for FP8/NVFP4 gradient noise
-      "eps": cfg.adam_eps,
-      "weight_decay": cfg.weight_decay,
-    }
-    super().__init__(params, defaults)
-    self._moes = moe_modules
-
-  def _init_state(self, p: torch.Tensor) -> dict:
-    state = self.state[p]
-    if len(state) == 0:
-      state["step"] = torch.tensor(0.0, dtype=torch.float32)
-      state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-      state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-    return state
-
-  def load_state_dict(self, state_dict: dict) -> None:  # type: ignore[override]
-    super().load_state_dict(state_dict)
-    # Step tensors may be loaded onto CUDA via map_location; keep them on CPU to
-    # avoid per-step device sync when computing bias corrections.
-    for st in self.state.values():
-      step = st.get("step", None)
-      if torch.is_tensor(step) and step.is_cuda:
-        st["step"] = step.cpu()
-
-  @torch.no_grad()
-  def step(self, closure=None):  # type: ignore[override]
-    if closure is not None:
-      raise RuntimeError("ExpertAdamW does not support closure")
-    if len(self.param_groups) != 1:
-      raise RuntimeError("ExpertAdamW expects a single param group")
-
-    group = self.param_groups[0]
-    lr = float(group["lr"])
-    beta1, beta2 = group["betas"]
-    eps = float(group["eps"])
-    weight_decay = float(group["weight_decay"])
-
-    # Initialize state + bump per-param step (CPU tensors, fast).
-    step_t: torch.Tensor | None = None
-    for p in group["params"]:
-      if p.grad is None:
-        raise RuntimeError("ExpertAdamW requires all expert grads to be present")
-      st = self._init_state(p)
-      st["step"] += 1
-      if step_t is None:
-        step_t = st["step"]
-    assert step_t is not None
-    step = int(step_t.item())
-
-    # Bias corrections match the standard AdamW update.
-    bias_correction1 = 1.0 - (beta1**step)
-    bias_correction2 = 1.0 - (beta2**step)
-    step_size = lr / bias_correction1
-    inv_bias_correction2_sqrt = 1.0 / math.sqrt(bias_correction2)
-
-    for moe in self._moes:
-      profile = getattr(moe, "_dtype", "nvfp4")
-      if profile not in ("fp8", "nvfp4"):
-        raise ValueError(f"ExpertAdamW only supports fp8/nvfp4 caches. Got {profile}")
-      prof_i = 0 if profile == "fp8" else 1
-
-      W1 = moe.W1
-      W3 = moe.W3
-      W2 = moe.W2
-      if not (W1.is_cuda and W3.is_cuda and W2.is_cuda):
-        raise RuntimeError("ExpertAdamW requires CUDA tensors")
-      if not (W1.dtype == torch.bfloat16 and W3.dtype == torch.bfloat16 and W2.dtype == torch.bfloat16):
-        raise RuntimeError("ExpertAdamW requires BF16 expert weights")
-      if W1.grad is None or W3.grad is None or W2.grad is None:
-        raise RuntimeError("Missing expert grads")
-      if not (W1.grad.dtype == torch.bfloat16 and W3.grad.dtype == torch.bfloat16 and W2.grad.dtype == torch.bfloat16):
-        raise RuntimeError("ExpertAdamW requires BF16 expert grads")
-      if not (W1.grad.is_contiguous() and W3.grad.is_contiguous() and W2.grad.is_contiguous()):
-        raise RuntimeError("Expert grads must be contiguous")
-      if not (W1.is_contiguous() and W3.is_contiguous() and W2.is_contiguous()):
-        raise RuntimeError("Expert weights must be contiguous")
-
-      st1 = self._init_state(W1)
-      st3 = self._init_state(W3)
-      st2 = self._init_state(W2)
-
-      # Ensure cache exists (initial use or after checkpoint restore).
-      if getattr(moe, "_W_cache", None) is None:
-        if not hasattr(moe, "refresh_weight_cache"):
-          raise RuntimeError("MoE module missing refresh_weight_cache()")
-        moe.refresh_weight_cache()
-      cache = moe._W_cache
-      if cache is None:
-        raise RuntimeError("MoE weight cache missing after refresh")
-
-      E, H, Dff = W1.shape
-      stream = torch.cuda.current_stream(W1.device)
-      _rdep_ext.expert_adamw_step(
-        prof_i,
-        W1.data_ptr(), W1.grad.data_ptr(), st1["exp_avg"].data_ptr(), st1["exp_avg_sq"].data_ptr(),
-        W3.data_ptr(), W3.grad.data_ptr(), st3["exp_avg"].data_ptr(), st3["exp_avg_sq"].data_ptr(),
-        W2.data_ptr(), W2.grad.data_ptr(), st2["exp_avg"].data_ptr(), st2["exp_avg_sq"].data_ptr(),
-        cache.W13_q.data_ptr(), cache.W13_sf_mma.data_ptr(),
-        cache.W2_q.data_ptr(), cache.W2_sf_mma.data_ptr(),
-        int(E), int(H), int(Dff),
-        float(lr), float(beta1), float(beta2),
-        float(weight_decay), float(eps),
-        float(step_size), float(inv_bias_correction2_sqrt),
-        stream,
-      )
-
-    return None
+_log = logging.getLogger(__name__)
 
 
 class _NullExpertOptimizer(torch.optim.Optimizer):
@@ -247,34 +121,35 @@ def build_optimizer(model: torch.nn.Module, cfg: Config) -> tuple[torch.optim.Op
   # Expert optimizer selection:
   # 0. Fused backward-optimizer (eco_fused_backward=True): optimization happens in backward pass
   # 1. ECO mode (eco_enabled=True): NVFP4 primary weights + FP8 opt states + error feedback
-  # 2. Blockscaled mode (fp8/nvfp4): Fused ExpertAdamW with CUDA kernel
-  # 3. Standard mode: PyTorch AdamW
+  # 2. Fallback: standard PyTorch AdamW (debug / non-production only)
   eco_fused = getattr(cfg, "eco_fused_backward", False)
   eco_enabled = getattr(cfg, "eco_enabled", False)
-  use_blockscaled = getattr(cfg, "dtype", "nvfp4") in ("fp8", "nvfp4")
 
   if eco_fused:
     # Expert optimization is handled by FusedBackwardECO inside backward pass.
     # Use a null optimizer as placeholder — no expert params need tracking here.
     expert_optimizer = _NullExpertOptimizer()
   elif eco_enabled and expert_params:
-    from nmoe.eco import build_eco_optimizer
-    expert_optimizer = build_eco_optimizer(model, cfg)
-  elif use_blockscaled and expert_params:
-    moes: list[torch.nn.Module] = []
-    for blk in getattr(model, "blocks", []):
-      ffn = getattr(blk, "ffn", None)
-      if ffn is not None and hasattr(ffn, "W1") and hasattr(ffn, "W3") and hasattr(ffn, "W2"):
-        moes.append(ffn)
-    expert_optimizer = ExpertAdamW(moes, cfg)
-  else:
-    expert_optimizer = torch.optim.AdamW(
-      expert_params,
-      lr=cfg.lr_expert,
-      betas=(cfg.adam_beta1, cfg.adam_beta2_expert),  # Higher beta2 for expert gradient noise
-      eps=cfg.adam_eps,
-      weight_decay=cfg.weight_decay,
+    # eco_enabled=True without eco_fused_backward=True is a configuration error.
+    # The Python reference optimizer is ~10x slower and must not be used silently.
+    raise RuntimeError(
+        "eco_enabled=True requires eco_fused_backward=True for production use. "
+        "The Python-only ECOAdamW reference optimizer (eco_reference.py) exists "
+        "solely for unit testing and must not be used in training. "
+        "Set eco_fused_backward=True in your config."
     )
+  elif expert_params:
+    # No ECO configured — this is a configuration error for MoE training with
+    # NVFP4 weights. Standard AdamW does not emit blockscaled weight caches.
+    raise RuntimeError(
+        "Expert parameters found but neither eco_fused_backward nor eco_enabled "
+        "is set. Standard PyTorch AdamW does not support NVFP4 quantized weights "
+        "and will not emit blockscaled weight caches. "
+        "Set eco_fused_backward=True and eco_enabled=True in your config."
+    )
+  else:
+    # No expert params (e.g., dense-only model or all experts frozen).
+    expert_optimizer = _NullExpertOptimizer()
 
   return expert_optimizer, dense_groups
 
@@ -415,11 +290,11 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups:
         try:
           ffn.refresh_weight_cache()
         except Exception:
-          pass
+          _log.warning("refresh_weight_cache() failed — stale quantized weights may be used", exc_info=True)
 
       # Update router bias for aux-free load balancing
       if hasattr(ffn, 'router') and hasattr(ffn, 'last_loads'):
         try:
           ffn.router.update_bias(ffn.last_loads, gamma=cfg.router_bias_update_rate)
         except Exception:
-          pass
+          _log.warning("router.update_bias() failed — load balancing may be affected", exc_info=True)

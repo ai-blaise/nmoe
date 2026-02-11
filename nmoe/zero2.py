@@ -6,11 +6,14 @@ Elegant minimal implementation:
 State lives in caller-provided dict to keep this module stateless.
 Works seamlessly for single GPU (no-op) and multi-GPU (ZeRO-2).
 """
+import logging
 import os
 from contextlib import nullcontext
 import math
 import torch
 import torch.distributed as dist
+
+_log = logging.getLogger(__name__)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -184,6 +187,7 @@ def step_dense_adamw(
       from nmoe.metrics import cuda_time as _cuda_time  # local import to avoid hard dependency
       time_ctx = _cuda_time
     except Exception:
+      _log.debug("cuda_time import failed, CUDA timers disabled for ZeRO-2", exc_info=True)
       time_ctx = lambda _tag: nullcontext()
   else:
     time_ctx = lambda _tag: nullcontext()

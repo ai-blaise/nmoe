@@ -1,10 +1,11 @@
-"""Unit tests for ECO optimizer (eco.py).
+"""Unit tests for ECO optimizer.
 
-Tests the Python prototype implementation of the ECO algorithm:
+Tests the Python reference implementation (eco_reference.py) and
+NVFP4/FP8 quantization helpers (now in eco_reference.py):
   - NVFP4 E2M1 quantization (SR and RTN)
   - FP8 state quantization round-trip
   - ECO error injection formula
-  - Full optimizer step
+  - Full optimizer step (reference Python path)
 """
 import sys
 import math
@@ -13,22 +14,24 @@ import torch
 import pytest
 
 # Direct import to bypass nmoe.__init__ (which pulls in C extensions)
-_spec = importlib.util.spec_from_file_location('eco', '/home/nourdine/nmoe/nmoe/eco.py')
-_eco_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_eco_mod)
+_spec_ref = importlib.util.spec_from_file_location('eco_reference', '/home/nourdine/nmoe/nmoe/eco_reference.py')
+_eco_ref_mod = importlib.util.module_from_spec(_spec_ref)
+_spec_ref.loader.exec_module(_eco_ref_mod)
 
-_compute_e8m0_scale = _eco_mod._compute_e8m0_scale
-_quantize_nvfp4_sr = _eco_mod._quantize_nvfp4_sr
-_quantize_nvfp4_rtn = _eco_mod._quantize_nvfp4_rtn
-quantize_nvfp4_eco = _eco_mod.quantize_nvfp4_eco
-_quantize_to_fp8_e5m2 = _eco_mod._quantize_to_fp8_e5m2
-_dequantize_fp8_e5m2 = _eco_mod._dequantize_fp8_e5m2
-_quantize_to_fp8_e4m3 = _eco_mod._quantize_to_fp8_e4m3
-_dequantize_fp8_e4m3 = _eco_mod._dequantize_fp8_e4m3
-ECOAdamW = _eco_mod.ECOAdamW
-NVFP4_MAX = _eco_mod.NVFP4_MAX
-NVFP4_GRID = _eco_mod.NVFP4_GRID
-SF_VEC = _eco_mod.SF_VEC
+# Quant helpers from eco_reference.py (reference code, used by ECOAdamW)
+_compute_e8m0_scale = _eco_ref_mod._compute_e8m0_scale
+_quantize_nvfp4_sr = _eco_ref_mod._quantize_nvfp4_sr
+_quantize_nvfp4_rtn = _eco_ref_mod._quantize_nvfp4_rtn
+_quantize_to_fp8_e5m2 = _eco_ref_mod._quantize_to_fp8_e5m2
+_dequantize_fp8_e5m2 = _eco_ref_mod._dequantize_fp8_e5m2
+_quantize_to_fp8_e4m3 = _eco_ref_mod._quantize_to_fp8_e4m3
+_dequantize_fp8_e4m3 = _eco_ref_mod._dequantize_fp8_e4m3
+NVFP4_MAX = _eco_ref_mod.NVFP4_MAX
+NVFP4_GRID = _eco_ref_mod.NVFP4_GRID
+SF_VEC = _eco_ref_mod.SF_VEC
+
+# ECOAdamW from reference implementation
+ECOAdamW = _eco_ref_mod.ECOAdamW
 
 
 class TestNVFP4Quantization:
@@ -92,23 +95,20 @@ class TestNVFP4Quantization:
         assert torch.allclose(avg, expected, atol=0.1), \
             f"SR not unbiased: avg={avg.mean():.4f}, expected={expected.mean():.4f}"
 
-    def test_quantize_eco_interface(self):
-        """Test the full quantize_nvfp4_eco interface."""
-        x = torch.randn(4, 64)  # Multiple of SF_VEC
-        x_hat, scale = quantize_nvfp4_eco(x, stochastic_rounding=True)
-        assert x_hat.shape == x.shape
-        assert scale.shape == (4, 64 // SF_VEC)
-
-    def test_quantize_eco_padding(self):
-        """Test that non-SF_VEC-aligned dimensions work."""
-        x = torch.randn(4, 50)  # NOT a multiple of 32
-        x_hat, scale = quantize_nvfp4_eco(x, stochastic_rounding=False)
-        assert x_hat.shape == x.shape
+    def test_rtn_on_block_roundtrip(self):
+        """RTN via low-level helpers should produce values on the grid."""
+        x = torch.randn(4, 64)
+        x_blocks = x.reshape(4, 64 // SF_VEC, SF_VEC)
+        scale = _compute_e8m0_scale(x_blocks)
+        x_hat = _quantize_nvfp4_rtn(x_blocks, scale)
+        assert x_hat.shape == x_blocks.shape
 
     def test_zero_tensor(self):
         """Zero tensor should quantize to zero."""
         x = torch.zeros(1, 32)
-        x_hat, scale = quantize_nvfp4_eco(x, stochastic_rounding=False)
+        x_blocks = x.reshape(1, 1, SF_VEC)
+        scale = _compute_e8m0_scale(x_blocks)
+        x_hat = _quantize_nvfp4_rtn(x_blocks, scale)
         assert (x_hat == 0).all()
 
 
@@ -323,19 +323,25 @@ class TestNVFP4QuantizationProperties:
         """Quantization error should be bounded by max grid gap."""
         torch.manual_seed(42)
         x = torch.randn(8, 64)
-        x_hat, _ = quantize_nvfp4_eco(x, stochastic_rounding=False)
-        error = (x - x_hat).abs()
+        x_blocks = x.reshape(8, 64 // SF_VEC, SF_VEC)
+        scale = _compute_e8m0_scale(x_blocks)
+        x_hat = _quantize_nvfp4_rtn(x_blocks, scale)
+        error = (x_blocks - x_hat).abs()
         # Max gap in E2M1 grid is 2.0 (between 4.0 and 6.0)
         # After scaling, error should be bounded by scale * max_gap
         # Just check it's finite and reasonable
-        assert error.max() < x.abs().max() * 2, "Quantization error too large"
+        assert error.max() < x_blocks.abs().max() * 2, "Quantization error too large"
 
     def test_idempotent(self):
         """Quantizing an already-quantized value should be identity."""
         torch.manual_seed(42)
         x = torch.randn(4, 32)
-        x_hat, _ = quantize_nvfp4_eco(x, stochastic_rounding=False)
-        x_hat2, _ = quantize_nvfp4_eco(x_hat, stochastic_rounding=False)
+        x_blocks = x.reshape(4, 1, SF_VEC)
+        scale = _compute_e8m0_scale(x_blocks)
+        x_hat = _quantize_nvfp4_rtn(x_blocks, scale)
+        # Re-quantize the already-quantized values
+        scale2 = _compute_e8m0_scale(x_hat)
+        x_hat2 = _quantize_nvfp4_rtn(x_hat, scale2)
         assert torch.allclose(x_hat, x_hat2, atol=1e-6), "NVFP4 quantization not idempotent"
 
 

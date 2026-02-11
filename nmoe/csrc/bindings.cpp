@@ -57,22 +57,11 @@ extern "C" {
   void rdep_gather_meta_sorted_bf16(int64_t* row_id_out, float* gate_out, int M_recv, cudaStream_t stream);
   void rdep_gather_from_pad_bf16(const void* in_pad, void* out_sorted, int M_recv, int H, cudaStream_t stream);
   void rdep_scatter_sorted_to_pad_bf16(const void* in_sorted, void* out_pad, int M_recv, int H, cudaStream_t stream);
-  int  rdep_dispatch(const void* x, const int* eids, const float* gates,
-                     int T, int K,
-                     void* Xe_out, int* offs_pad_out, int* dest_out,
-                     int64_t* row_id_out, float* gate_out,
-                     int* M_pad_out, cudaStream_t stream);
   int  rdep_dispatch_meta_blockscaled(const void* x, const int* eids, const float* gates,
                                      int T, int K,
                                      int* offs_pad_out, int* M_pad_out,
                                      cudaStream_t stream);
   void rdep_gather_xe_blockscaled(void* Xe_q_out, void* Xe_sf_out, int M_recv, int M_pad, cudaStream_t stream);
-  int  rdep_dispatch_blockscaled(const void* x, const int* eids, const float* gates,
-                                int T, int K,
-                                void* Xe_q_out, void* Xe_sf_out,
-                                int* offs_pad_out, int* dest_out,
-                                int64_t* row_id_out, float* gate_out,
-                                int* M_pad_out, cudaStream_t stream);
   void rdep_return_scatter(const void* Ye, void* out, int M_recv, int T, int K,
                            cudaStream_t stream);
   void rdep_return_scatter_from_pad_bf16(const void* Ye_pad, void* out, int M_recv, int T, int K,
@@ -99,8 +88,6 @@ extern "C" {
   void rdep_send_dgate_dist_bf16(const int64_t* row_id, const float* dGate_sorted,
                                  float* dGates_tk_out,
                                  int M, int T, int K, cudaStream_t stream);
-  void rdep_scatter_dx_bf16(const void* dXe_pad, const int* dest, const int64_t* row_id,
-                            void* dX_out, int M, int T, int H, int K, cudaStream_t stream);
   void rdep_scatter_dx_bf16_internal(const void* dXe_pad, const int64_t* row_id,
                                      void* dX_out, int M, int T, int H, int K, cudaStream_t stream);
 	  void rdep_gather_dy_dist_bf16(const void* dY_local, const int* eids, const void* Ye_pad,
@@ -109,26 +96,6 @@ extern "C" {
 	                                int M, int T, int H, int K, cudaStream_t stream);
   void rdep_scatter_dx_dist_bf16(const void* dXe_sorted, const int64_t* row_id,
                                  void* dX_out, int M, int T, int H, int K, cudaStream_t stream);
-
-  // ========== DeepEP-aligned API (rdep/rdep.cu) ==========
-  // These will eventually replace the above functions
-  int rdep_v2_init(int rank, int num_ranks, int num_channels,
-                   int buf_tokens, int H, int K, int n_experts,
-                   void** ipc_handles, cudaStream_t stream);
-  void rdep_v2_shutdown();
-  cudaIpcMemHandle_t rdep_v2_get_ipc_handle();
-  int rdep_v2_dispatch(const void* x, const int* eids, const float* gates,
-                       void* recv_x, int T, cudaStream_t stream);
-  void rdep_v2_combine(void* out, const void* expert_out, const float* gates,
-                       int T, int M_recv, cudaStream_t stream);
-  int rdep_v2_get_rank();
-  int rdep_v2_get_num_ranks();
-  int rdep_v2_get_hidden();
-  int rdep_v2_get_topk();
-  int rdep_v2_get_num_experts();
-  int rdep_v2_get_capacity();
-  int* rdep_v2_get_recv_src_idx();
-  float* rdep_v2_get_recv_gate();
 
   // Blockscaled path
   void rdep_alloc_blockscaled(size_t capacity, int H, int n_local, int profile);
@@ -249,6 +216,20 @@ extern "C" {
       int stochastic_rounding, int error_feedback,
       unsigned int prng_seed0, unsigned int prng_seed1,
       cudaStream_t stream);
+  cudaError_t eco_mv_accumulate(
+      void* m_data, void* m_scale,
+      void* v_data, void* v_scale,
+      const void* grad,
+      int E, int in_dim, int out_dim,
+      float beta1_frac, float beta2_frac,
+      cudaStream_t stream);
+  cudaError_t eco_mv_accumulate_fv(
+      void* m_data, void* m_scale,
+      void* v_row, void* v_col, void* v_rms,
+      const void* grad,
+      int E, int in_dim, int out_dim,
+      float beta1_frac, float beta2_frac,
+      cudaStream_t stream);
 	  cudaError_t build_grouped_gemm_metadata(
 	      const int32_t* offs, int E,
 	      int64_t A_base, int64_t A_row_bytes,
@@ -262,13 +243,6 @@ extern "C" {
 	      int32_t N, int32_t K,
 	      int32_t* sizes_mnkl, int32_t* strides_abc, int64_t* ptrs_abc, int64_t* ptrs_sfasfb,
 	      cudaStream_t stream);
-  cudaError_t grouped_dense_nvfp4_gemm_bf16_strided(
-      const int32_t* sizes_mnkl,
-      const int32_t* strides_abc,
-      const int64_t* ptrs_abc,
-      const int64_t* ptrs_sfasfb,
-      int E, int sf_k,
-      cudaStream_t stream);
 }
 #endif
 
@@ -345,16 +319,6 @@ PYBIND11_MODULE(rdep, m) {
   m.def("sync_buffer_ptrs_blockscaled", &rdep_sync_buffer_ptrs_blockscaled,
         "Sync blockscaled buffer pointers to device");
 
-  m.def("direct_ipc_write", [](uintptr_t src_ptr, int target_rank, size_t offset, size_t n_bytes, uintptr_t stream_ptr) {
-    rdep_direct_ipc_write(
-        reinterpret_cast<void*>(src_ptr),
-        target_rank,
-        offset,
-        n_bytes,
-        reinterpret_cast<cudaStream_t>(stream_ptr));
-  }, py::arg("src_ptr"), py::arg("target_rank"), py::arg("offset"), py::arg("n_bytes"), py::arg("stream") = 0,
-     "Direct write to peer's IPC buffer. Used for low-level buffer access.");
-
   // ========== BF16 Path ==========
   m.def("alloc_bf16", [](size_t capacity, int H, int n_local) {
     rdep_alloc_bf16(capacity, H, n_local);
@@ -420,18 +384,6 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("stream") = py::none(),
      "Scatter BF16 rows from sorted layout into padded layout (requires prior dispatch_meta_bf16)");
 
-  m.def("return_scatter", [](uintptr_t Ye_ptr, uintptr_t out_ptr,
-                             int M_recv, int T, int K,
-                             py::object stream) {
-    rdep_return_scatter(
-        reinterpret_cast<const void*>(Ye_ptr),
-        reinterpret_cast<void*>(out_ptr),
-        M_recv, T, K, to_stream(stream));
-  }, py::arg("Ye"), py::arg("out"),
-     py::arg("M_recv"), py::arg("T"), py::arg("K"),
-     py::arg("stream") = py::none(),
-     "Scatter expert outputs back to tokens (BF16)");
-
   m.def("return_scatter_from_pad_bf16", [](uintptr_t Ye_pad_ptr, uintptr_t out_ptr,
                                           int M_recv, int T, int K,
                                           py::object stream) {
@@ -445,27 +397,6 @@ PYBIND11_MODULE(rdep, m) {
      "Scatter expert outputs from padded layout Ye_pad[M_pad,H] back to tokens (BF16 path).");
 
   // ========== BF16 Backward Helpers (single-GPU milestone) ==========
-  m.def("gather_dy_bf16", [](uintptr_t dY_ptr, uintptr_t Ye_ptr,
-                            uintptr_t row_id_ptr, uintptr_t gate_ptr,
-                            uintptr_t dYe_ptr, uintptr_t dGate_ptr,
-                            int M, int T, int H, int K,
-                            py::object stream) {
-    rdep_gather_dy_bf16(
-        reinterpret_cast<const void*>(dY_ptr),
-        reinterpret_cast<const void*>(Ye_ptr),
-        reinterpret_cast<const int64_t*>(row_id_ptr),
-        reinterpret_cast<const float*>(gate_ptr),
-        reinterpret_cast<void*>(dYe_ptr),
-        reinterpret_cast<float*>(dGate_ptr),
-        M, T, H, K,
-        to_stream(stream));
-  }, py::arg("dY"), py::arg("Ye"),
-     py::arg("row_id"), py::arg("gate_sorted"),
-     py::arg("dYe_out"), py::arg("dGate_out"),
-     py::arg("M"), py::arg("T"), py::arg("H"), py::arg("K"),
-     py::arg("stream") = py::none(),
-     "Backward gather: dOut[T,H] -> dYe[M,H] and dGate[M] (BF16)");
-
   m.def("scatter_gate_bf16", [](uintptr_t dGate_sorted_ptr, uintptr_t row_id_ptr,
                                uintptr_t dGates_tk_ptr,
                                int M, int T, int K,
@@ -822,6 +753,68 @@ PYBIND11_MODULE(rdep, m) {
       "Fused ECO AdamW update with Adafactor-style factored second moment (v_row/v_col). "
       "Runs factored-v reduction kernels + modified main kernel in a single call.");
 
+  // ========== AdamA m/v Accumulation (replaces gradient accumulation buffers) ==========
+  m.def(
+      "eco_mv_accumulate",
+      [](uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_data_ptr, uintptr_t v_scale_ptr,
+         uintptr_t grad_ptr,
+         int E, int in_dim, int out_dim,
+         float beta1_frac, float beta2_frac,
+         py::object stream) {
+        if (E <= 0 || in_dim <= 0 || out_dim <= 0)
+            throw std::invalid_argument("eco_mv_accumulate: E, in_dim, out_dim must be positive");
+        auto err = eco_mv_accumulate(
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_data_ptr),
+            reinterpret_cast<void*>(v_scale_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, in_dim, out_dim,
+            beta1_frac, beta2_frac,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_mv_accumulate failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_data"), py::arg("v_scale"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("in_dim"), py::arg("out_dim"),
+      py::arg("beta1_frac"), py::arg("beta2_frac"),
+      py::arg("stream") = py::none(),
+      "AdamA m/v accumulation: update FP8 m (E5M2) and v (E4M3) with fractional betas. "
+      "Zero additional memory — eliminates ~5.85 GiB gradient accumulation buffers.");
+
+  m.def(
+      "eco_mv_accumulate_fv",
+      [](uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_row_ptr, uintptr_t v_col_ptr, uintptr_t v_rms_ptr,
+         uintptr_t grad_ptr,
+         int E, int in_dim, int out_dim,
+         float beta1_frac, float beta2_frac,
+         py::object stream) {
+        if (E <= 0 || in_dim <= 0 || out_dim <= 0)
+            throw std::invalid_argument("eco_mv_accumulate_fv: E, in_dim, out_dim must be positive");
+        auto err = eco_mv_accumulate_fv(
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_row_ptr),
+            reinterpret_cast<void*>(v_col_ptr),
+            reinterpret_cast<void*>(v_rms_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, in_dim, out_dim,
+            beta1_frac, beta2_frac,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_mv_accumulate_fv failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_row"), py::arg("v_col"), py::arg("v_rms"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("in_dim"), py::arg("out_dim"),
+      py::arg("beta1_frac"), py::arg("beta2_frac"),
+      py::arg("stream") = py::none(),
+      "AdamA m/v accumulation with factored second moment: update FP8 m (E5M2) + "
+      "factored v_row/v_col with fractional betas. Zero additional memory.");
+
   // ========== Quantization + Swizzle (dense / weight cache only) ==========
   m.def("quant_fp8", [](uintptr_t x_ptr, int ldx,
                         uintptr_t out_ptr, int ld_out,
@@ -1172,24 +1165,10 @@ PYBIND11_MODULE(rdep, m) {
   }, py::arg("uid"), py::arg("rank"), py::arg("world"), py::arg("local_world"),
      "Initialize NVSHMEM with UID from rank 0");
 
-  m.def("nvshmem_finalize", &rdep_nvshmem_finalize,
-        "Finalize NVSHMEM");
-
   m.def("nvshmem_alloc_bf16", [](size_t capacity, int H, int n_local) {
     rdep_nvshmem_alloc_bf16(capacity, H, n_local);
   }, py::arg("capacity"), py::arg("H"), py::arg("n_local"),
      "Allocate NVSHMEM symmetric buffers for BF16 path");
-
-  m.def("nvshmem_alloc_blockscaled", [](size_t capacity, int H, int n_local, int profile) {
-    rdep_nvshmem_alloc_blockscaled(capacity, H, n_local, profile);
-  }, py::arg("capacity"), py::arg("H"), py::arg("n_local"), py::arg("profile"),
-     "Allocate NVSHMEM symmetric buffers for blockscaled path");
-
-  m.def("nvshmem_barrier", &rdep_nvshmem_barrier,
-        "NVSHMEM barrier (all PEs)");
-
-  m.def("nvshmem_quiet", &rdep_nvshmem_quiet,
-        "NVSHMEM quiet (ensure all puts complete)");
 
   // NVSHMEM IPC buffer functions (separate cudaMalloc'd buffer)
   // These are different from rdep get_ipc_handle_bf16 - they get handles
@@ -1208,19 +1187,6 @@ PYBIND11_MODULE(rdep, m) {
   m.def("nvshmem_sync_ipc_buffer_ptrs_bf16", &rdep_nvshmem_sync_ipc_buffer_ptrs_bf16,
         "Sync NVSHMEM IPC buffer pointers to device");
 
-  m.def("nvshmem_get_ipc_handle_blockscaled", []() {
-    py::array_t<uint8_t> handle(IPC_HANDLE_SIZE);
-    rdep_nvshmem_get_ipc_handle_blockscaled(handle.mutable_data());
-    return handle;
-  }, "Get IPC handle for NVSHMEM's separate IPC buffer (blockscaled)");
-
-  m.def("nvshmem_open_ipc_handles_blockscaled", [](py::array_t<uint8_t> handles, int local_world) {
-    rdep_nvshmem_open_ipc_handles_blockscaled(handles.data(), local_world);
-  }, py::arg("handles"), py::arg("local_world"),
-     "Open remote IPC handles for NVSHMEM's IPC buffer (blockscaled)");
-
-  m.def("nvshmem_sync_ipc_buffer_ptrs_blockscaled", &rdep_nvshmem_sync_ipc_buffer_ptrs_blockscaled,
-        "Sync NVSHMEM IPC buffer pointers to device (blockscaled)");
 #endif
 }
 #endif

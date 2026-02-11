@@ -1,4 +1,4 @@
-"""ECO Optimizer: Error-Compensating Optimizer for NVFP4 primary weights.
+"""ECO Optimizer — production module: FusedBackwardECO + CUDA kernel dispatch.
 
 Implements Algorithm 3 from "ECO: Quantized Training without Full-Precision
 Master Weights" (Nikdan et al., Google Research + ISTA, arXiv:2601.22101v1).
@@ -7,8 +7,8 @@ ECO eliminates BF16 master weights by injecting quantization error into Adam's
 momentum buffer. The error is computed and consumed in the same step -- no
 persistent error buffer needed.
 
-This is the Python prototype. The fused CUDA kernel version (Phase 5b) will
-modify adamw.cu with integrated NVFP4 load/store + FP8 m/v + SR + ECO injection.
+FusedBackwardECO fuses the optimizer step into the backward pass via CUDA
+kernels with zero FP32 global memory materialization.
 
 Key properties:
   - Zero new hyperparameters: eco_alpha = (beta1 - 1) / (beta1 * step_size)
@@ -21,820 +21,23 @@ Memory savings vs BF16 master:
   Per expert parameter: BF16 master (2B) + BF16 m (2B) + BF16 v (2B) = 6 bytes
   ECO:                  NVFP4 primary (0.5B) + FP8 m (1B) + FP8 v (1B) = 2.5 bytes
   Savings: 58% reduction in optimizer memory for expert weights
-
-Usage:
-    eco = ECOAdamW(moe_modules, cfg)
-    eco.step()  # Performs Adam update + NVFP4 quantization + ECO error injection
 """
 
 from __future__ import annotations
 
 import math
 import logging
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# NVFP4 E2M1 quantization grid
-# ============================================================================
-
-# E2M1 representable values (positive side): 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0
-# With sign bit: 4 bits total = 16 values (8 positive + 8 negative)
-NVFP4_MAX = 6.0
-NVFP4_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-
-# FP8 limits
-FP8_E5M2_MAX = 57344.0  # Max representable in E5M2
-FP8_E4M3_MAX = 448.0    # Max representable in E4M3
-
-# Block size for NVFP4 scale factors (SF_VEC)
-SF_VEC = 32
-
-
-# ============================================================================
-# Pure-Python NVFP4 quantization with stochastic rounding
-# ============================================================================
-
-def _compute_e8m0_scale(x_block: torch.Tensor) -> torch.Tensor:
-    """Compute E8M0 block scale factor.
-
-    Scale = max|x_block| / NVFP4_MAX, stored as E8M0 (power-of-2 only).
-
-    Args:
-        x_block: [..., SF_VEC] tensor
-
-    Returns:
-        scale: [...] E8M0 scale factor
-    """
-    amax = x_block.abs().amax(dim=-1)
-    # E8M0: round scale to nearest power of 2
-    # scale = 2^ceil(log2(amax / NVFP4_MAX))
-    raw_scale = amax / NVFP4_MAX
-    # Clamp to avoid log2(0) and extremely small scales
-    raw_scale = raw_scale.clamp(min=1e-30)
-    exponent = torch.ceil(torch.log2(raw_scale))
-    scale = torch.pow(2.0, exponent)
-    # If block is all zeros, scale should be smallest positive E8M0
-    scale = torch.where(amax == 0, torch.ones_like(scale) * (2.0 ** -127), scale)
-    return scale
-
-
-def _quantize_nvfp4_sr(
-    x: torch.Tensor,
-    scale: torch.Tensor,
-    generator: Optional[torch.Generator] = None,
-) -> torch.Tensor:
-    """Quantize FP32 values to NVFP4 E2M1 with stochastic rounding.
-
-    Args:
-        x: FP32 values to quantize
-        scale: E8M0 scale factors (one per SF_VEC block)
-        generator: Optional PRNG for reproducibility
-
-    Returns:
-        x_hat: Dequantized FP32 values (quantize then dequant back)
-    """
-    device = x.device
-    grid = NVFP4_GRID.to(device)
-
-    # Scale down
-    x_scaled = x / scale.unsqueeze(-1)
-
-    # Separate sign and magnitude
-    sign = torch.sign(x_scaled)
-    ax = x_scaled.abs()
-
-    # Clamp to representable range
-    ax = ax.clamp(max=NVFP4_MAX)
-
-    # Find floor and ceil grid indices
-    # grid = [0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
-    floor_idx = torch.searchsorted(grid, ax, right=True) - 1
-    floor_idx = floor_idx.clamp(min=0, max=len(grid) - 2)
-    ceil_idx = floor_idx + 1
-
-    floor_val = grid[floor_idx]
-    ceil_val = grid[ceil_idx]
-
-    # Stochastic rounding probability
-    gap = ceil_val - floor_val
-    frac = (ax - floor_val) / gap.clamp(min=1e-10)
-
-    # Random comparison for stochastic rounding decision
-    if generator is not None:
-        rand = torch.rand(frac.shape, device=frac.device, dtype=frac.dtype, generator=generator)
-    else:
-        rand = torch.rand(frac.shape, device=frac.device, dtype=frac.dtype)
-    use_ceil = rand < frac
-
-    # Select quantized value
-    q_val = torch.where(use_ceil, ceil_val, floor_val)
-
-    # Restore sign and scale back up
-    x_hat = sign * q_val * scale.unsqueeze(-1)
-
-    return x_hat
-
-
-def _quantize_nvfp4_rtn(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Quantize FP32 values to NVFP4 E2M1 with round-to-nearest (RTN).
-
-    Used when stochastic rounding is disabled.
-    """
-    device = x.device
-    grid = NVFP4_GRID.to(device)
-
-    x_scaled = x / scale.unsqueeze(-1)
-    sign = torch.sign(x_scaled)
-    ax = x_scaled.abs().clamp(max=NVFP4_MAX)
-
-    # Find nearest grid point
-    idx = torch.bucketize(ax, grid)
-    idx = idx.clamp(max=len(grid) - 1)
-    # Check if closer to idx or idx-1
-    lower = grid[(idx - 1).clamp(min=0)]
-    upper = grid[idx]
-    use_lower = (ax - lower).abs() < (ax - upper).abs()
-    q_val = torch.where(use_lower, lower, upper)
-
-    x_hat = sign * q_val * scale.unsqueeze(-1)
-    return x_hat
-
-
-def quantize_nvfp4_eco(
-    x: torch.Tensor,
-    stochastic_rounding: bool = True,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize tensor to NVFP4 with ECO-compatible interface.
-
-    Args:
-        x: [*, K] FP32 tensor, K should be multiple of SF_VEC (32)
-        stochastic_rounding: Use SR (True) or RTN (False)
-        generator: Optional PRNG for SR reproducibility
-
-    Returns:
-        x_hat: Dequantized FP32 values (for error computation)
-        scale: E8M0 scale factors
-    """
-    orig_shape = x.shape
-    K = x.shape[-1]
-
-    # Pad K to multiple of SF_VEC if needed
-    pad_k = (SF_VEC - K % SF_VEC) % SF_VEC
-    if pad_k > 0:
-        x = torch.nn.functional.pad(x, (0, pad_k))
-        K = x.shape[-1]
-
-    # Reshape to blocks
-    x_flat = x.reshape(-1, K)
-    M = x_flat.shape[0]
-    x_blocks = x_flat.reshape(M, K // SF_VEC, SF_VEC)
-
-    # Compute block scales
-    scale = _compute_e8m0_scale(x_blocks)  # [M, K // SF_VEC]
-
-    # Quantize
-    if stochastic_rounding:
-        x_hat_blocks = _quantize_nvfp4_sr(x_blocks, scale, generator)
-    else:
-        x_hat_blocks = _quantize_nvfp4_rtn(x_blocks, scale)
-
-    # Reshape back
-    x_hat = x_hat_blocks.reshape(M, K)
-
-    # Remove padding
-    if pad_k > 0:
-        x_hat = x_hat[..., :orig_shape[-1]]
-
-    x_hat = x_hat.reshape(orig_shape)
-    return x_hat, scale
-
-
-# ============================================================================
-# NVFP4 packing/unpacking for buffer storage
-# ============================================================================
-
-def _pack_nvfp4_e2m1(x_hat: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pack dequantized NVFP4 values into compressed_tensors format.
-
-    Args:
-        x_hat: Dequantized FP32 values (already quantized to NVFP4 grid)
-        scale: E8M0 block scales [*, n_blocks]
-
-    Returns:
-        packed: [*, K//2] uint8 (2 E2M1 nibbles per byte)
-        scale_fp8: [*, K//group_size] float8_e4m3fn per-group scales
-        global_scale: [*, 1] float32
-    """
-    device = x_hat.device
-    grid = NVFP4_GRID.to(device)
-    orig_shape = x_hat.shape
-    K = orig_shape[-1]
-
-    # Compute per-group (group_size=16) effective scale from block (32) E8M0 scale
-    # For Option C, we store as compressed_tensors format:
-    #   global_scale = 1.0 (identity, since we use the E8M0 scales directly)
-    #   per-group scale = scale expanded to group_size=16
-    # Each block of 32 has one E8M0 scale. Group_size=16 means 2 groups per block.
-    # Both groups within a block share the same E8M0 scale.
-    global_scale = torch.ones(*orig_shape[:-1], 1, dtype=torch.float32, device=device)
-
-    # Convert E8M0 block scale [*, n_blocks] to per-group scale
-    # n_blocks = K // 32, n_groups = K // 16 = 2 * n_blocks
-    n_blocks = scale.shape[-1]
-    # Repeat each block scale for 2 groups (16 elements each = 32 total)
-    scale_per_group = scale.unsqueeze(-1).expand(*scale.shape, 2).reshape(*scale.shape[:-1], 2 * n_blocks)
-    # Convert to float8_e4m3fn (scale * global_scale, but global_scale=1.0)
-    if hasattr(torch, 'float8_e4m3fn'):
-        scale_fp8 = scale_per_group.float().to(torch.float8_e4m3fn)
-    else:
-        scale_fp8 = scale_per_group.float().to(torch.bfloat16)
-
-    # Pack values into uint8 nibble pairs
-    # Scale down by block scale, then map to E2M1 index
-    x_flat = x_hat.reshape(-1, K)
-    M = x_flat.shape[0]
-    x_blocks = x_flat.reshape(M, K // SF_VEC, SF_VEC)
-    scale_2d = scale.reshape(M, -1)
-
-    # Divide by scale to get normalized values in [-6, 6]
-    x_scaled = x_blocks / scale_2d.unsqueeze(-1).clamp(min=1e-30)
-    sign = (x_scaled < 0).to(torch.int32)
-    ax = x_scaled.abs()
-
-    # Map absolute value to E2M1 index (0-7)
-    idx = torch.searchsorted(grid, ax, right=True) - 1
-    idx = idx.clamp(min=0, max=7)
-
-    # Combine sign + magnitude into 4-bit nibble
-    nibbles = (sign << 3) | idx  # [M, n_blocks, 32]
-    nibbles = nibbles.reshape(M, K)
-
-    # Pack pairs of nibbles into uint8
-    # Low nibble = even index, high nibble = odd index
-    lo = nibbles[..., 0::2].to(torch.uint8)
-    hi = nibbles[..., 1::2].to(torch.uint8)
-    packed = lo | (hi << 4)
-    packed = packed.reshape(*orig_shape[:-1], K // 2)
-
-    # Reshape scale to match compressed_tensors convention
-    scale_fp8 = scale_fp8.reshape(*orig_shape[:-1], K // 16)
-
-    return packed, scale_fp8, global_scale
-
-
-def _dequant_nvfp4_buffers_to_fp32(
-    packed: torch.Tensor,
-    scale: torch.Tensor,
-    global_scale: torch.Tensor,
-    group_size: int = 16,
-) -> torch.Tensor:
-    """Dequantize NVFP4 compressed_tensors triplet to FP32.
-
-    Used by ECO optimizer to read current weights.
-
-    Args:
-        packed: [*, K//2] uint8
-        scale: [*, K//group_size] float8_e4m3fn
-        global_scale: [*, 1] float32
-
-    Returns:
-        [*, K] float32 tensor
-    """
-    device = packed.device
-    lut = NVFP4_GRID.to(device)
-
-    lo = (packed & 0x0F).to(torch.int32)
-    hi = ((packed >> 4) & 0x0F).to(torch.int32)
-
-    lo_sign = ((lo >> 3) & 1).float() * (-2.0) + 1.0
-    lo_mag = lo & 0x07
-    hi_sign = ((hi >> 3) & 1).float() * (-2.0) + 1.0
-    hi_mag = hi & 0x07
-
-    lo_val = lut[lo_mag.long()] * lo_sign
-    hi_val = lut[hi_mag.long()] * hi_sign
-
-    out_shape = list(packed.shape)
-    out_shape[-1] *= 2
-    unpacked = torch.empty(out_shape, dtype=torch.float32, device=device)
-    unpacked[..., 0::2] = lo_val
-    unpacked[..., 1::2] = hi_val
-
-    scale_f32 = scale.float()
-    gs = global_scale.float()
-    while gs.ndim < scale_f32.ndim:
-        gs = gs.unsqueeze(-1)
-    effective_scale = scale_f32 / gs.clamp(min=1e-10)
-
-    n_groups = effective_scale.shape[-1]
-    grouped = unpacked.reshape(*unpacked.shape[:-1], n_groups, group_size)
-    scaled = grouped * effective_scale.unsqueeze(-1)
-
-    return scaled.reshape(out_shape)
-
-
-# ============================================================================
-# FP8 state quantization helpers
-# ============================================================================
-
-def _quantize_to_fp8_e5m2(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize FP32 tensor to FP8 E5M2 with per-row scale.
-
-    E5M2 has range [-57344, 57344] and is used for momentum (first moment).
-    Per-row scaling preserves dynamic range better than per-tensor for
-    tensors with varying magnitudes across rows.
-
-    Returns:
-        x_fp8: FP8 E5M2 tensor (stored as uint8 for compatibility)
-        scale: [nrows] per-row scale factors (FP32)
-    """
-    orig_shape = x.shape
-    x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 1 else x.unsqueeze(0)
-
-    amax = x_2d.abs().amax(dim=-1, keepdim=True)  # [nrows, 1]
-    scale = amax / FP8_E5M2_MAX
-    scale = scale.clamp(min=1e-30)  # Avoid div by zero
-
-    x_scaled = x_2d / scale
-    if hasattr(torch, 'float8_e5m2'):
-        x_fp8 = x_scaled.to(torch.float8_e5m2)
-    else:
-        x_fp8 = x_scaled.clamp(-FP8_E5M2_MAX, FP8_E5M2_MAX).to(torch.bfloat16)
-
-    return x_fp8.reshape(orig_shape), scale.reshape(orig_shape[:-1] + (1,))
-
-
-def _dequantize_fp8_e5m2(x_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 E5M2 to FP32."""
-    return x_fp8.float() * scale
-
-
-def _quantize_to_fp8_e4m3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize FP32 tensor to FP8 E4M3 with per-row scale.
-
-    E4M3 has range [-448, 448] and is used for variance (second moment).
-    Per-row scaling preserves dynamic range for variance tensors that have
-    different magnitudes across different expert/dimension rows.
-
-    Returns:
-        x_fp8: FP8 E4M3 tensor
-        scale: [nrows] per-row scale factors (FP32)
-    """
-    orig_shape = x.shape
-    x_2d = x.reshape(-1, x.shape[-1]) if x.ndim > 1 else x.unsqueeze(0)
-
-    amax = x_2d.abs().amax(dim=-1, keepdim=True)
-    scale = amax / FP8_E4M3_MAX
-    scale = scale.clamp(min=1e-30)  # Avoid div by zero
-
-    x_scaled = x_2d / scale
-    if hasattr(torch, 'float8_e4m3fn'):
-        x_fp8 = x_scaled.to(torch.float8_e4m3fn)
-    else:
-        x_fp8 = x_scaled.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.bfloat16)
-
-    return x_fp8.reshape(orig_shape), scale.reshape(orig_shape[:-1] + (1,))
-
-
-def _dequantize_fp8_e4m3(x_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequantize FP8 E4M3 to FP32."""
-    return x_fp8.float() * scale
-
-
-# ============================================================================
-# ECO AdamW Optimizer
-# ============================================================================
-
-class ECOAdamW(torch.optim.Optimizer):
-    """ECO-enhanced AdamW for expert weights with NVFP4 primary + FP8 states.
-
-    Implements Algorithm 3 from the ECO paper:
-    1. Dequant NVFP4 primary weight -> FP32
-    2. Standard AdamW update in FP32 (using dequanted FP8 m/v)
-    3. Quantize updated weight to NVFP4 (with stochastic rounding)
-    4. Compute quantization error: e = w_updated - w_quantized
-    5. Inject error into momentum: m += eco_alpha * denom * e
-    6. Requantize m/v to FP8
-
-    The injection strength eco_alpha = (beta1 - 1) / (beta1 * step_size)
-    requires NO new hyperparameters -- it's derived from standard Adam params.
-    """
-
-    emits_weight_cache = True  # We handle weight cache refresh in step()
-
-    def __init__(
-        self,
-        moe_modules: list[nn.Module],
-        cfg,
-        stochastic_rounding: bool = True,
-        error_feedback: bool = True,
-        factored_v: bool = False,
-    ):
-        """Initialize ECO optimizer.
-
-        Args:
-            moe_modules: List of MoE modules with W1/W3/W2 parameters.
-            cfg: Config with lr_expert, adam_beta1, adam_beta2_expert, adam_eps,
-                 weight_decay.
-            stochastic_rounding: Use SR for NVFP4 quantization (recommended).
-            error_feedback: Enable ECO error injection into momentum.
-            factored_v: Use Adafactor-style factored second moment (v_row/v_col)
-                instead of full FP8 v matrix. Saves ~38 GiB for typical MoE configs.
-        """
-        params = []
-        for moe in moe_modules:
-            for name in ("W1", "W3", "W2"):
-                p = getattr(moe, name, None)
-                if p is None:
-                    raise ValueError(f"MoE module missing {name}")
-                params.append(p)
-
-        defaults = {
-            "lr": cfg.lr_expert,
-            "betas": (cfg.adam_beta1, getattr(cfg, 'adam_beta2_expert', cfg.adam_beta2)),
-            "eps": cfg.adam_eps,
-            "weight_decay": cfg.weight_decay,
-        }
-        super().__init__(params, defaults)
-
-        self._moes = moe_modules
-        self._stochastic_rounding = stochastic_rounding
-        self._error_feedback = error_feedback
-        self._factored_v = factored_v
-        self._step_count = 0
-
-        logger.info(
-            f"ECOAdamW initialized: {len(moe_modules)} MoE modules, "
-            f"SR={stochastic_rounding}, error_feedback={error_feedback}, "
-            f"factored_v={factored_v}"
-        )
-
-    def _init_state(self, p: torch.Tensor) -> dict:
-        """Initialize optimizer state for a parameter.
-
-        Uses FP8 storage for momentum and variance to save memory:
-          - exp_avg (momentum): FP8 E5M2 + per-tensor scale
-          - exp_avg_sq (variance): FP8 E4M3 + per-tensor scale
-            OR (when factored_v=True):
-          - v_row: [*batch, in_dim] FP32 (Adafactor row factor)
-          - v_col: [*batch, out_dim] FP32 (Adafactor column factor)
-        """
-        state = self.state[p]
-        if len(state) == 0:
-            state["step"] = torch.tensor(0.0, dtype=torch.float32)
-
-            # Per-row scale shape: all dims except last get a scale, last dim gets 1
-            scale_shape = p.shape[:-1] + (1,)
-
-            # FP8 optimizer states with per-row scaling
-            if hasattr(torch, 'float8_e5m2'):
-                state["exp_avg"] = torch.zeros_like(p, dtype=torch.float8_e5m2)
-                state["exp_avg_scale"] = torch.ones(scale_shape, device=p.device, dtype=torch.float32) * 1e-30
-            else:
-                state["exp_avg"] = torch.zeros_like(p, dtype=torch.bfloat16)
-                state["exp_avg_scale"] = torch.ones(scale_shape, device=p.device, dtype=torch.float32) * 1e-30
-
-            if self._factored_v:
-                # Adafactor-style factored second moment.
-                # For p with shape [E, in_dim, out_dim]:
-                #   v_row: [E, in_dim] — EMA of mean(grad^2, dim=-1)
-                #   v_col: [E, out_dim] — EMA of mean(grad^2, dim=-2)
-                # Stored in FP32 (tiny: ~36 KiB per weight for [7168, 2048]).
-                v_row_shape = p.shape[:-1]   # [E, in_dim]
-                v_col_shape = p.shape[:-2] + p.shape[-1:]  # [E, out_dim]
-                state["v_row"] = torch.zeros(v_row_shape, device=p.device, dtype=torch.float32)
-                state["v_col"] = torch.zeros(v_col_shape, device=p.device, dtype=torch.float32)
-            else:
-                if hasattr(torch, 'float8_e4m3fn'):
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float8_e4m3fn)
-                    state["exp_avg_sq_scale"] = torch.ones(scale_shape, device=p.device, dtype=torch.float32) * 1e-30
-                else:
-                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.bfloat16)
-                    state["exp_avg_sq_scale"] = torch.ones(scale_shape, device=p.device, dtype=torch.float32) * 1e-30
-
-        return state
-
-    def _get_nvfp4_buffer_for_param(self, p: torch.Tensor) -> tuple:
-        """Find the NVFP4 buffer triplet for a given parameter.
-
-        Returns (packed, scale, gs, moe_module, param_name) or None if not in buffer mode.
-        """
-        for moe in self._moes:
-            if not getattr(moe, '_nvfp4_primary', False):
-                continue
-            for name in ("W1", "W3", "W2"):
-                if getattr(moe, name, None) is p:
-                    packed = getattr(moe, f'_{name}_packed', None)
-                    scale = getattr(moe, f'_{name}_scale', None)
-                    gs = getattr(moe, f'_{name}_gs', None)
-                    if packed is not None:
-                        return packed, scale, gs, moe, name
-        return None
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """Perform ECO AdamW update on all expert parameters.
-
-        When MoE modules have NVFP4 primary buffers:
-        1. Dequant NVFP4 buffers → FP32 (transient, per-param streaming)
-        2. Standard AdamW update with FP8 m/v
-        3. Quantize to NVFP4 with SR → write to NVFP4 buffers
-        4. Rebuild _W_cache via direct kernel
-        5. No BF16 write-back needed
-
-        When MoE modules use BF16 params (legacy):
-        1. Read BF16 params → FP32
-        2-6. Same as above but writes back to p.data
-        """
-        if closure is not None:
-            raise RuntimeError("ECOAdamW does not support closure")
-        if len(self.param_groups) != 1:
-            raise RuntimeError("ECOAdamW expects a single param group")
-
-        group = self.param_groups[0]
-        lr = float(group["lr"])
-        beta1, beta2 = group["betas"]
-        eps = float(group["eps"])
-        weight_decay = float(group["weight_decay"])
-
-        # Initialize state and bump step
-        step_t = None
-        for p in group["params"]:
-            if p.grad is None:
-                continue
-            st = self._init_state(p)
-            st["step"] += 1
-            if step_t is None:
-                step_t = st["step"]
-
-        if step_t is None:
-            return  # No gradients
-
-        step = int(step_t.item())
-        self._step_count = step
-
-        # Bias corrections (standard Adam)
-        bias_correction1 = 1.0 - (beta1 ** step)
-        bias_correction2 = 1.0 - (beta2 ** step)
-        step_size = lr / bias_correction1
-        inv_bc2_sqrt = 1.0 / math.sqrt(bias_correction2)
-
-        # ECO injection strength (Section 3.2, Eq. 7)
-        # eco_alpha = (beta1 - 1) / (beta1 * step_size)
-        # Note: eco_alpha < 0 because beta1 < 1
-        eco_alpha = (beta1 - 1.0) / (beta1 * step_size) if self._error_feedback else 0.0
-
-        # Determine device from first parameter
-        param_device = next((p.device for p in group["params"] if p.grad is not None), torch.device('cpu'))
-        # PRNG for stochastic rounding (step-seeded for reproducibility)
-        gen_device = param_device if param_device.type == 'cuda' else torch.device('cpu')
-        generator = torch.Generator(device=gen_device)
-        generator.manual_seed(step * 1000003 + 42)  # Deterministic per step
-
-        for p in group["params"]:
-            if p.grad is None:
-                continue
-
-            grad = p.grad.float()
-            st = self.state[p]
-
-            # Check for NVFP4 buffer mode
-            buf_info = self._get_nvfp4_buffer_for_param(p)
-            use_nvfp4_buffers = buf_info is not None
-
-            # 1. Load current weight as FP32
-            if use_nvfp4_buffers:
-                packed, scale_buf, gs_buf, moe, param_name = buf_info
-                group_size = getattr(moe, '_nvfp4_group_size', 16)
-                w = _dequant_nvfp4_buffers_to_fp32(packed, scale_buf, gs_buf, group_size)
-                # NVFP4 buffers are in HF layout [E, out_features, in_features].
-                # Transpose to nmoe layout [E, in_dim, out_dim] to match p.grad shape.
-                w = w.transpose(-1, -2).contiguous()
-            else:
-                w = p.data.float()
-
-            # 2. Dequantize FP8 optimizer states to FP32
-            m = _dequantize_fp8_e5m2(st["exp_avg"], st["exp_avg_scale"])
-
-            # 3. Decoupled weight decay (AdamW: applied before gradient update)
-            if weight_decay > 0:
-                w.mul_(1.0 - lr * weight_decay)
-
-            # 4. Standard Adam EMA updates (momentum always full)
-            m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-
-            # 5. Variance update + adaptive denominator
-            effective_eps = max(eps, 1e-6)
-
-            if self._factored_v:
-                # Adafactor-style factored second moment update.
-                # v_row = beta2 * v_row + (1 - beta2) * mean(grad^2, dim=-1)
-                # v_col = beta2 * v_col + (1 - beta2) * mean(grad^2, dim=-2)
-                grad_sq = grad * grad
-                v_row = st["v_row"]
-                v_col = st["v_col"]
-                v_row.mul_(beta2).add_(grad_sq.mean(dim=-1), alpha=1.0 - beta2)
-                v_col.mul_(beta2).add_(grad_sq.mean(dim=-2), alpha=1.0 - beta2)
-                del grad_sq
-
-                # Reconstruct: v[i,j] = v_row[i] * v_col[j] / mean(v_row)
-                # The RMS normalization prevents v from growing unboundedly.
-                # v_row: [*batch, in_dim] -> [*batch, in_dim, 1]
-                # v_col: [*batch, out_dim] -> [*batch, 1, out_dim]
-                rms = v_row.mean(dim=-1, keepdim=True).clamp(min=1e-30)
-                v_row_3d = v_row.unsqueeze(-1)
-                v_col_3d = v_col.unsqueeze(v_col.ndim - 1)
-                v_reconstructed = (v_row_3d * v_col_3d) / rms.unsqueeze(-1)
-
-                denom = (v_reconstructed.sqrt() * inv_bc2_sqrt) + effective_eps
-                del v_reconstructed, v_row_3d, v_col_3d
-            else:
-                v = _dequantize_fp8_e4m3(st["exp_avg_sq"], st["exp_avg_sq_scale"])
-                v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-
-                # FP8 E4M3 can zero out very small variance values, making denom ~ eps.
-                # With eps=1e-9, this causes update = step_size * m / 1e-9 to be huge.
-                # Solution: use a variance-aware epsilon that ensures denom is reasonable.
-                # In the fused CUDA kernel, this issue doesn't arise because v is computed
-                # in FP32 in-register before quantization. For the Python prototype, we
-                # use a larger effective epsilon = max(eps, 1e-6) to prevent this.
-                denom = (v.sqrt() * inv_bc2_sqrt) + effective_eps
-
-            # 6. Apply Adam update: w = w - step_size * m / denom
-            w.addcdiv_(m, denom, value=-step_size)
-
-            # 7. NVFP4 quantization (with stochastic rounding)
-            # When using NVFP4 buffers, quantize in HF layout for lossless packing.
-            # When using BF16 params, quantize in nmoe layout (no packing needed).
-            if use_nvfp4_buffers:
-                # Transpose w to HF layout for quantization + packing
-                w_hf = w.transpose(-1, -2).contiguous()
-                hf_shape = w_hf.shape
-                K_hf = hf_shape[-1]
-
-                pad_k = (SF_VEC - K_hf % SF_VEC) % SF_VEC
-                if pad_k > 0:
-                    w_padded = torch.nn.functional.pad(w_hf.reshape(-1, K_hf), (0, pad_k))
-                else:
-                    w_padded = w_hf.reshape(-1, K_hf)
-
-                w_blocks = w_padded.reshape(-1, w_padded.shape[-1] // SF_VEC, SF_VEC)
-                scale = _compute_e8m0_scale(w_blocks)
-
-                if self._stochastic_rounding:
-                    w_hat_blocks = _quantize_nvfp4_sr(w_blocks, scale, generator)
-                else:
-                    w_hat_blocks = _quantize_nvfp4_rtn(w_blocks, scale)
-
-                w_hat_hf = w_hat_blocks.reshape(w_padded.shape)
-                if pad_k > 0:
-                    w_hat_hf = w_hat_hf[:, :K_hf]
-                w_hat_hf = w_hat_hf.reshape(hf_shape)
-
-                # Transpose back to nmoe layout for ECO error computation
-                w_hat = w_hat_hf.transpose(-1, -2).contiguous()
-            else:
-                orig_shape = w.shape
-                K = w.shape[-1]
-
-                pad_k = (SF_VEC - K % SF_VEC) % SF_VEC
-                if pad_k > 0:
-                    w_padded = torch.nn.functional.pad(w.reshape(-1, K), (0, pad_k))
-                else:
-                    w_padded = w.reshape(-1, K)
-
-                w_blocks = w_padded.reshape(-1, w_padded.shape[-1] // SF_VEC, SF_VEC)
-                scale = _compute_e8m0_scale(w_blocks)
-
-                if self._stochastic_rounding:
-                    w_hat_blocks = _quantize_nvfp4_sr(w_blocks, scale, generator)
-                else:
-                    w_hat_blocks = _quantize_nvfp4_rtn(w_blocks, scale)
-
-                w_hat = w_hat_blocks.reshape(w_padded.shape)
-                if pad_k > 0:
-                    w_hat = w_hat[:, :K]
-                w_hat = w_hat.reshape(orig_shape)
-
-            # 8. ECO error injection into momentum (always in nmoe layout)
-            if self._error_feedback and eco_alpha != 0.0:
-                # e = theta_tilde - theta_hat (quantization error)
-                error = w - w_hat
-                # m_corrected = m + eco_alpha * denom * e
-                m.add_(denom * error, alpha=eco_alpha)
-
-            # 9. Write back quantized weight
-            if use_nvfp4_buffers:
-                # Pack w_hat_hf (HF layout) directly into NVFP4 compressed_tensors format
-                new_packed, new_scale, new_gs = _pack_nvfp4_e2m1(
-                    w_hat_hf, scale.reshape(hf_shape[:-1] + (-1,))
-                )
-                # Update the MoE module's NVFP4 buffers in-place
-                buf_packed = getattr(moe, f'_{param_name}_packed')
-                buf_scale = getattr(moe, f'_{param_name}_scale')
-                buf_gs = getattr(moe, f'_{param_name}_gs')
-                buf_packed.copy_(new_packed)
-                buf_scale.copy_(new_scale.to(buf_scale.dtype))
-                # _pack_nvfp4_e2m1 returns global_scale=1.0 but shape may differ
-                # from original buf_gs. Just fill with 1.0.
-                buf_gs.fill_(1.0)
-            else:
-                # Legacy path: store dequantized NVFP4 value as BF16
-                p.data.copy_(w_hat.to(p.dtype))
-
-            # 10. Requantize m to FP8 for storage (always)
-            st["exp_avg"], st["exp_avg_scale"] = _quantize_to_fp8_e5m2(m)
-            # Requantize v to FP8 only when NOT using factored_v
-            # (factored_v stores v_row/v_col as FP32, already updated in-place above)
-            if not self._factored_v:
-                st["exp_avg_sq"], st["exp_avg_sq_scale"] = _quantize_to_fp8_e4m3(v)
-
-        # Refresh weight caches for MoE modules (blockscaled GEMM)
-        for moe in self._moes:
-            if hasattr(moe, 'refresh_weight_cache'):
-                try:
-                    moe.refresh_weight_cache()
-                except Exception:
-                    pass
-
-        return None
-
-    def state_dict(self):
-        """Save optimizer state."""
-        sd = super().state_dict()
-        sd['eco_config'] = {
-            'stochastic_rounding': self._stochastic_rounding,
-            'error_feedback': self._error_feedback,
-            'step_count': self._step_count,
-        }
-        return sd
-
-    def load_state_dict(self, state_dict):
-        """Load optimizer state."""
-        eco_config = state_dict.get('eco_config', {})
-        # Filter out eco_config before passing to parent (avoid mutating caller's dict)
-        sd = {k: v for k, v in state_dict.items() if k != 'eco_config'}
-        super().load_state_dict(sd)
-        self._step_count = eco_config.get('step_count', 0)
-        # Keep construction-time SR/EF settings (don't override from checkpoint)
-        for st in self.state.values():
-            step = st.get("step", None)
-            if torch.is_tensor(step) and step.is_cuda:
-                st["step"] = step.cpu()
-
-
-# ============================================================================
-# Builder function
-# ============================================================================
-
-def build_eco_optimizer(
-    model: nn.Module,
-    cfg,
-) -> ECOAdamW:
-    """Build ECO optimizer for MoE expert weights.
-
-    Args:
-        model: Transformer model with MoE blocks.
-        cfg: Config with eco_* settings.
-
-    Returns:
-        ECOAdamW optimizer for expert parameters.
-    """
-    moes = []
-    for blk in getattr(model, "blocks", []):
-        ffn = getattr(blk, "ffn", None)
-        if ffn is not None and hasattr(ffn, "W1") and hasattr(ffn, "W3") and hasattr(ffn, "W2"):
-            moes.append(ffn)
-
-    if not moes:
-        raise ValueError("No MoE modules found in model for ECO optimizer")
-
-    sr = getattr(cfg, 'eco_stochastic_rounding', True)
-    ef = getattr(cfg, 'eco_error_feedback', True)
-    fv = getattr(cfg, 'eco_factored_v', False)
-
-    eco = ECOAdamW(
-        moe_modules=moes,
-        cfg=cfg,
-        stochastic_rounding=sr,
-        error_feedback=ef,
-        factored_v=fv,
+# Fail fast if PyTorch lacks FP8 support — silent BF16 fallback is a 10x perf trap.
+if not hasattr(torch, 'float8_e5m2') or not hasattr(torch, 'float8_e4m3fn'):
+    raise ImportError(
+        f"PyTorch {torch.__version__} does not support FP8 dtypes (float8_e5m2, float8_e4m3fn). "
+        f"ECO requires PyTorch >= 2.1. Upgrade PyTorch or disable ECO."
     )
-
-    logger.info(
-        f"ECO optimizer built: {len(moes)} MoE modules, "
-        f"{sum(p.numel() for p in eco.param_groups[0]['params']):,} expert params, "
-        f"SR={sr}, EF={ef}, factored_v={fv}"
-    )
-
-    return eco
 
 
 # ============================================================================
@@ -929,16 +132,168 @@ class FusedBackwardECO:
         # FP8 optimizer states: keyed by (id(moe), param_name)
         self._states: dict[tuple[int, str], dict] = {}
 
+        # Gradient accumulation state
+        self._accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
+        self._current_microstep = 0  # Set by training loop via set_microstep()
+
+        # CUDA kernel requirement: fail fast if kernels are unavailable
+        self._require_cuda = getattr(cfg, 'eco_require_cuda', True)
+        if self._require_cuda:
+            try:
+                from nmoe.csrc import rdep as _rdep
+            except ImportError as e:
+                raise ImportError(
+                    "eco_require_cuda=True but nmoe.csrc.rdep is not importable. "
+                    "Build the CUDA extension with `python setup.py build_ext --inplace`. "
+                    "Set eco_require_cuda=False to allow Python fallback (10x slower)."
+                ) from e
+
+            missing = []
+            for name in ('eco_adam_nvfp4_update', 'eco_mv_accumulate'):
+                if not hasattr(_rdep, name):
+                    missing.append(name)
+            if self._factored_v:
+                for name in ('eco_adam_nvfp4_fv_update', 'eco_mv_accumulate_fv'):
+                    if not hasattr(_rdep, name):
+                        missing.append(name)
+            if missing:
+                raise RuntimeError(
+                    f"eco_require_cuda=True but CUDA bindings missing: {missing}. "
+                    f"Rebuild the CUDA extension or set eco_require_cuda=False."
+                )
+            self._rdep = _rdep
+            logger.info("FusedBackwardECO: CUDA kernels validated at init")
+
         logger.info(
             f"FusedBackwardECO initialized: {len(self._moes)} MoE modules, "
             f"SR={self._stochastic_rounding}, EF={self._error_feedback}, "
-            f"factored_v={self._factored_v}"
+            f"factored_v={self._factored_v}, "
+            f"accum_steps={self._accum_steps}, "
+            f"require_cuda={self._require_cuda}"
         )
 
     def set_dp_group(self, dp_group, dp_size: int):
         """Set the DP process group for gradient AllReduce."""
         self._dp_group = dp_group
         self._dp_size = dp_size
+
+    def set_microstep(self, microstep: int, total_microsteps: int):
+        """Set the current micro-step index for gradient accumulation.
+
+        Called by the training loop before each micro-batch forward/backward pass.
+
+        Args:
+            microstep: Current micro-step index (0 to total_microsteps - 1).
+            total_microsteps: Total number of micro-steps (= gradient_accumulation_steps).
+        """
+        self._current_microstep = microstep
+        self._accum_steps = total_microsteps
+
+    @property
+    def is_accumulating(self) -> bool:
+        """True if gradient accumulation is active and this is not the final micro-step."""
+        return self._accum_steps > 1 and self._current_microstep < self._accum_steps - 1
+
+    @property
+    def is_final_microstep(self) -> bool:
+        """True if this is the final micro-step (should run full Adam update)."""
+        return self._accum_steps <= 1 or self._current_microstep == self._accum_steps - 1
+
+    def _cuda_mv_accumulate(
+        self, moe: nn.Module, param_name: str, grad: torch.Tensor, st: dict,
+        beta1_frac: float, beta2_frac: float,
+    ) -> None:
+        """Accumulate gradient into FP8 m/v states using AdamA CUDA kernel.
+
+        Non-final micro-steps call this instead of the full Adam update.
+        Updates m and v with fractional betas β₁^(1/K) and β₂^(1/K):
+          m = β₁_frac * m + (1 - β₁_frac) * g
+          v = β₂_frac * v + (1 - β₂_frac) * g²
+
+        Raises RuntimeError if CUDA kernel requirements are not met.
+        """
+        _rdep = getattr(self, '_rdep', None)
+        if _rdep is None:
+            raise RuntimeError("CUDA kernel required but _rdep not initialized")
+
+        packed = getattr(moe, f'_{param_name}_packed')
+        E = packed.shape[0]
+        out_dim = packed.shape[1]
+        in_dim = packed.shape[2] * 2
+
+        def _fail(msg):
+            raise RuntimeError(f"eco_mv_accumulate CUDA kernel: {msg}")
+
+        # Alignment check
+        if (out_dim & 31) != 0 or (in_dim & 31) != 0:
+            return _fail(f"dims not 32-aligned: out_dim={out_dim}, in_dim={in_dim}")
+
+        expected = (E, in_dim, out_dim)
+        if grad.shape != expected:
+            return _fail(f"grad shape {grad.shape} != expected {expected}")
+        if not grad.is_contiguous():
+            grad = grad.contiguous()
+
+        m_data = st["exp_avg"]
+        m_sc = st["exp_avg_scale"]
+        if m_data.dtype not in (torch.uint8, torch.float8_e5m2):
+            return _fail(f"m dtype {m_data.dtype} not FP8 E5M2")
+        if m_data.shape != expected:
+            return _fail(f"m shape {m_data.shape} != expected {expected}")
+        if not m_data.is_contiguous():
+            return _fail("m not contiguous")
+
+        m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
+        m_sc_flat = m_sc.reshape(-1).contiguous()
+        stream = torch.cuda.current_stream(packed.device)
+
+        if self._factored_v:
+            v_row = st["v_row"]
+            v_col = st["v_col"]
+            if v_row.shape != (E, in_dim) or v_col.shape != (E, out_dim):
+                return _fail(f"v_row/v_col shape mismatch")
+            if not v_row.is_contiguous() or not v_col.is_contiguous():
+                return _fail("v_row/v_col not contiguous")
+            if "v_rms" not in st:
+                st["v_rms"] = torch.zeros(E, device=packed.device, dtype=torch.float32)
+            v_rms = st["v_rms"]
+
+            _rdep.eco_mv_accumulate_fv(
+                m_u8.data_ptr(),
+                m_sc_flat.data_ptr(),
+                v_row.data_ptr(),
+                v_col.data_ptr(),
+                v_rms.data_ptr(),
+                grad.data_ptr(),
+                E, in_dim, out_dim,
+                beta1_frac, beta2_frac,
+                stream,
+            )
+            st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
+        else:
+            v_data = st["exp_avg_sq"]
+            v_sc = st["exp_avg_sq_scale"]
+            if v_data.dtype not in (torch.uint8, torch.float8_e4m3fn):
+                return _fail(f"v dtype {v_data.dtype} not FP8 E4M3")
+            if v_data.shape != expected:
+                return _fail(f"v shape {v_data.shape} != expected {expected}")
+            if not v_data.is_contiguous():
+                return _fail("v not contiguous")
+            v_u8 = v_data.view(torch.uint8) if v_data.dtype != torch.uint8 else v_data
+            v_sc_flat = v_sc.reshape(-1).contiguous()
+
+            _rdep.eco_mv_accumulate(
+                m_u8.data_ptr(),
+                m_sc_flat.data_ptr(),
+                v_u8.data_ptr(),
+                v_sc_flat.data_ptr(),
+                grad.data_ptr(),
+                E, in_dim, out_dim,
+                beta1_frac, beta2_frac,
+                stream,
+            )
+            st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
+            st["exp_avg_sq_scale"] = v_sc_flat.reshape(v_sc.shape)
 
     def attach(self, model: nn.Module):
         """Attach to model: disable gradients on expert params, free BF16 storage.
@@ -989,29 +344,17 @@ class FusedBackwardECO:
             state = {
                 "step": torch.tensor(0.0, dtype=torch.float32),
             }
-            if hasattr(torch, 'float8_e5m2'):
-                state["exp_avg"] = torch.zeros(shape, dtype=torch.float8_e5m2, device=device)
-                state["exp_avg_scale"] = torch.ones(scale_shape, device=device, dtype=torch.float32) * 1e-30
-            else:
-                state["exp_avg"] = torch.zeros(shape, dtype=torch.bfloat16, device=device)
-                state["exp_avg_scale"] = torch.ones(scale_shape, device=device, dtype=torch.float32) * 1e-30
+            state["exp_avg"] = torch.zeros(shape, dtype=torch.float8_e5m2, device=device)
+            state["exp_avg_scale"] = torch.ones(scale_shape, device=device, dtype=torch.float32) * 1e-30
 
             if self._factored_v:
-                # Adafactor-style factored second moment.
-                # shape = (E, in_dim, out_dim) in nmoe layout.
-                #   v_row: [E, in_dim] — EMA of mean(grad^2, dim=-1)
-                #   v_col: [E, out_dim] — EMA of mean(grad^2, dim=-2)
                 v_row_shape = shape[:-1]   # (E, in_dim)
                 v_col_shape = shape[:-2] + shape[-1:]  # (E, out_dim)
                 state["v_row"] = torch.zeros(v_row_shape, device=device, dtype=torch.float32)
                 state["v_col"] = torch.zeros(v_col_shape, device=device, dtype=torch.float32)
             else:
-                if hasattr(torch, 'float8_e4m3fn'):
-                    state["exp_avg_sq"] = torch.zeros(shape, dtype=torch.float8_e4m3fn, device=device)
-                    state["exp_avg_sq_scale"] = torch.ones(scale_shape, device=device, dtype=torch.float32) * 1e-30
-                else:
-                    state["exp_avg_sq"] = torch.zeros(shape, dtype=torch.bfloat16, device=device)
-                    state["exp_avg_sq_scale"] = torch.ones(scale_shape, device=device, dtype=torch.float32) * 1e-30
+                state["exp_avg_sq"] = torch.zeros(shape, dtype=torch.float8_e4m3fn, device=device)
+                state["exp_avg_sq_scale"] = torch.ones(scale_shape, device=device, dtype=torch.float32) * 1e-30
 
             self._states[key] = state
 
@@ -1065,35 +408,31 @@ class FusedBackwardECO:
             norm_sq = 0.0
         self._prev_global_norm = math.sqrt(max(norm_sq, 1e-30))
 
-    def _try_cuda_fused_update(
+    def _cuda_fused_update(
         self, moe: nn.Module, param_name: str, grad: torch.Tensor, st: dict,
+        beta1_eff: float | None = None, beta2_eff: float | None = None,
     ) -> bool:
-        """Attempt to run the fused CUDA kernel. Returns True on success.
+        """Run the fused CUDA kernel for the full ECO AdamW step.
 
         The CUDA kernel (eco_adam.cu) does the entire ECO AdamW step — dequant
         NVFP4 → AdamW → SR → ECO error → requant — in registers/shared memory,
         with zero FP32 global memory materialization (~7 bytes/element vs ~68).
 
-        When factored_v=True, calls the factored-v variant which runs reduction
-        kernels (v_row/v_col update) followed by the main kernel with on-the-fly
-        v reconstruction from v_row * v_col / v_rms.
-
-        Requirements for the CUDA path:
-          - nmoe.csrc.rdep module has eco_adam_nvfp4_update binding
-          - out_dim and in_dim are multiples of 32
-          - FP8 m states stored as uint8 with per-row FP32 scale
-          - For non-factored: FP8 v states as uint8 with per-row FP32 scale
-          - For factored_v: v_row, v_col as FP32, v_rms scratch buffer
-
-        Falls back to Python if any requirement is unmet.
+        Raises RuntimeError if requirements are not met.
+        Returns False if the kernel cannot handle the given shapes.
         """
-        try:
-            from nmoe.csrc import rdep as _rdep
-            if not hasattr(_rdep, 'eco_adam_nvfp4_update'):
-                return False
-            if self._factored_v and not hasattr(_rdep, 'eco_adam_nvfp4_fv_update'):
-                return False
-        except ImportError:
+        b1 = beta1_eff if beta1_eff is not None else self.beta1
+        b2 = beta2_eff if beta2_eff is not None else self.beta2
+
+        _rdep = getattr(self, '_rdep', None)
+        if _rdep is None:
+            if self._require_cuda:
+                raise RuntimeError("CUDA kernel required but _rdep not initialized")
+            return False
+
+        def _fail(msg):
+            if self._require_cuda:
+                raise RuntimeError(f"eco_adam_nvfp4_update CUDA kernel: {msg}")
             return False
 
         packed = getattr(moe, f'_{param_name}_packed')
@@ -1101,71 +440,48 @@ class FusedBackwardECO:
         gs_buf = getattr(moe, f'_{param_name}_gs')
         group_size = getattr(moe, '_nvfp4_group_size', 16)
 
-        # Dimensions from packed buffer: [E, out_dim, in_dim/2]
         E = packed.shape[0]
         out_dim = packed.shape[1]
         in_dim = packed.shape[2] * 2
 
-        # Alignment check (kernel tiles at 32-element boundaries)
         if (out_dim & 31) != 0 or (in_dim & 31) != 0:
-            return False
+            return _fail(f"dims not 32-aligned: out_dim={out_dim}, in_dim={in_dim}")
         if in_dim % group_size != 0:
-            return False
+            return _fail(f"in_dim={in_dim} not divisible by group_size={group_size}")
 
-        # FP8 m state must be uint8 with FP32 per-row scale
         m_data = st["exp_avg"]
         m_sc = st["exp_avg_scale"]
         if m_data.dtype not in (torch.uint8, torch.float8_e5m2):
-            return False
+            return _fail(f"m dtype {m_data.dtype} not FP8 E5M2")
 
-        # Shape validation: grad must be [E, in_dim, out_dim] (nmoe layout)
-        expected_grad_shape = (E, in_dim, out_dim)
-        if grad.shape != expected_grad_shape:
-            logger.warning(
-                "CUDA eco_adam: grad shape %s != expected %s, falling back",
-                grad.shape, expected_grad_shape,
-            )
-            return False
-
-        # Contiguity: kernel reads raw pointers assuming C-contiguous layout
+        expected = (E, in_dim, out_dim)
+        if grad.shape != expected:
+            return _fail(f"grad shape {grad.shape} != expected {expected}")
         if not grad.is_contiguous():
             grad = grad.contiguous()
-
-        # Shape validation: m must be [E, in_dim, out_dim] (nmoe layout)
-        expected_mv_shape = (E, in_dim, out_dim)
-        if m_data.shape != expected_mv_shape:
-            return False
-
-        # View FP8 m as uint8 for the kernel (requires contiguous)
+        if m_data.shape != expected:
+            return _fail(f"m shape {m_data.shape} != expected {expected}")
         if not m_data.is_contiguous():
-            return False
-        m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
+            return _fail("m not contiguous")
 
-        # Flatten per-row scale to [E * in_dim] (from [E, in_dim, 1])
+        m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
         m_sc_flat = m_sc.reshape(-1).contiguous()
 
-        # PRNG seeds for stochastic rounding (baked into Philox counter[2:3])
         _param_offset = {'W1': 0, 'W2': 1, 'W3': 2}[param_name]
         idx = self._moe_to_idx[id(moe)]
         prng_seed0 = (self._step_count * 1000003 + idx * 7 + _param_offset) & 0xFFFFFFFF
         prng_seed1 = (self._step_count * 7919 + idx * 31 + _param_offset * 127) & 0xFFFFFFFF
 
-        # Keep references alive across async kernel execution
         scale_u8 = scale_buf.view(torch.uint8)
         stream = torch.cuda.current_stream(packed.device)
 
         if self._factored_v:
-            # Factored-v path: v_row/v_col/v_rms instead of v_data/v_scale
             v_row = st["v_row"]
             v_col = st["v_col"]
-
-            # Shape validation
             if v_row.shape != (E, in_dim) or v_col.shape != (E, out_dim):
-                return False
+                return _fail(f"v_row/v_col shape mismatch")
             if not v_row.is_contiguous() or not v_col.is_contiguous():
-                return False
-
-            # Allocate v_rms scratch buffer [E] (reused across calls via state)
+                return _fail("v_row/v_col not contiguous")
             if "v_rms" not in st:
                 st["v_rms"] = torch.zeros(E, device=packed.device, dtype=torch.float32)
             v_rms = st["v_rms"]
@@ -1181,7 +497,7 @@ class FusedBackwardECO:
                 v_rms.data_ptr(),
                 grad.data_ptr(),
                 E, out_dim, in_dim, group_size,
-                self.lr, self.beta1, self.beta2,
+                self.lr, b1, b2,
                 self.weight_decay, self.eps,
                 self._step_size, self._inv_bc2_sqrt,
                 self._eco_alpha,
@@ -1190,20 +506,17 @@ class FusedBackwardECO:
                 prng_seed0, prng_seed1,
                 stream,
             )
-
-            # Write updated per-row scales back to state (m only; v is factored)
             st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
 
         else:
-            # Standard path: full FP8 v
             v_data = st["exp_avg_sq"]
             v_sc = st["exp_avg_sq_scale"]
             if v_data.dtype not in (torch.uint8, torch.float8_e4m3fn):
-                return False
-            if v_data.shape != expected_mv_shape:
-                return False
+                return _fail(f"v dtype {v_data.dtype} not FP8 E4M3")
+            if v_data.shape != expected:
+                return _fail(f"v shape {v_data.shape} != expected {expected}")
             if not v_data.is_contiguous():
-                return False
+                return _fail("v not contiguous")
             v_u8 = v_data.view(torch.uint8) if v_data.dtype != torch.uint8 else v_data
             v_sc_flat = v_sc.reshape(-1).contiguous()
 
@@ -1217,7 +530,7 @@ class FusedBackwardECO:
                 v_sc_flat.data_ptr(),
                 grad.data_ptr(),
                 E, out_dim, in_dim, group_size,
-                self.lr, self.beta1, self.beta2,
+                self.lr, b1, b2,
                 self.weight_decay, self.eps,
                 self._step_size, self._inv_bc2_sqrt,
                 self._eco_alpha,
@@ -1226,9 +539,6 @@ class FusedBackwardECO:
                 prng_seed0, prng_seed1,
                 stream,
             )
-
-            # Write updated per-row scales back to state (kernel modifies them in-place
-            # via the k_fp8_recompute_row_scale pass).
             st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
             st["exp_avg_sq_scale"] = v_sc_flat.reshape(v_sc.shape)
 
@@ -1241,9 +551,26 @@ class FusedBackwardECO:
         Called from _MoEBlockscaledFused.backward() immediately after computing
         the weight gradient. Consumes the gradient — caller should free it after.
 
-        Tries the fused CUDA kernel first (zero FP32 materialization). Falls back
-        to the Python implementation if the kernel is unavailable or dimensions
-        are incompatible.
+        Uses Adam Accumulation (AdamA, arXiv:2305.19982) for gradient accumulation:
+        instead of maintaining separate FP8 gradient buffers (~5.85 GiB), we
+        accumulate directly into the existing FP8 m/v optimizer states using
+        fractional betas β₁^(1/K) and β₂^(1/K) where K = accum_steps.
+
+        After K micro-steps with fractional betas, the result is mathematically
+        equivalent to standard Adam with the full β₁, β₂:
+          m_K = β₁^(1/K) · m_{K-1} + (1 - β₁^(1/K)) · g_K  (repeated K times)
+        is equivalent to:
+          m = β₁ · m + (1 - β₁) · g̅  (where g̅ is the mean gradient)
+
+        Bias correction is unchanged: 1 - (β^(1/K))^(t·K) = 1 - β^t.
+
+        When gradient accumulation is active (accum_steps > 1):
+        - Non-final micro-steps: AllReduce + update m/v only (no weight update).
+          Zero additional memory — reuses existing FP8 optimizer states.
+        - Final micro-step: AllReduce + full ECO Adam step with fractional betas.
+
+        Dispatches to the fused CUDA kernel (zero FP32 materialization).
+        Raises RuntimeError if the kernel fails.
 
         Args:
             moe: The MoE module containing NVFP4 buffers.
@@ -1259,10 +586,34 @@ class FusedBackwardECO:
         assert param_name in ('W1', 'W2', 'W3'), f"Invalid param_name: {param_name}"
 
         # DP AllReduce in FP32 to preserve gradient precision during averaging.
+        # AllReduce happens every micro-step (each micro-batch's gradient is averaged
+        # across DP ranks before accumulation, matching the semantics of averaging
+        # a larger batch).
         grad = grad_bf16.float()
         del grad_bf16
         if self._dp_size > 1 and self._dp_group is not None:
             dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self._dp_group)
+
+        # AdamA fractional betas: β^(1/K) for K micro-steps.
+        # When K=1 (no accumulation), β^(1/1) = β — standard Adam.
+        K = self._accum_steps
+        beta1_frac = self.beta1 ** (1.0 / K)
+        beta2_frac = self.beta2 ** (1.0 / K)
+
+        # Get or init optimizer state (needed for both accumulate and full step)
+        st = self._get_or_init_state(moe, param_name)
+
+        # Non-final micro-steps: update m/v with fractional betas only, no weight update.
+        if self.is_accumulating:
+            self._cuda_mv_accumulate(moe, param_name, grad, st,
+                                     beta1_frac, beta2_frac)
+            del grad
+            return
+
+        # Final micro-step (or no accumulation): full ECO Adam step.
+        # The fractional betas make the kernel's EMA update equivalent to standard
+        # Adam over the accumulated K micro-steps.
+        st["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
 
         # Gradient clipping using previous step's global norm estimate.
         if self.grad_clip > 0:
@@ -1276,139 +627,16 @@ class FusedBackwardECO:
                 if clip_coeff < 1.0:
                     grad.mul_(clip_coeff)
 
-        # Get or init optimizer state
-        st = self._get_or_init_state(moe, param_name)
-        st["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
-
-        # Try CUDA fused kernel (zero FP32 materialization)
-        if self._try_cuda_fused_update(moe, param_name, grad, st):
+        # CUDA fused kernel with fractional betas (zero FP32 materialization)
+        if self._cuda_fused_update(moe, param_name, grad, st,
+                                    beta1_eff=beta1_frac, beta2_eff=beta2_frac):
             del grad
             return
 
-
-        # ===== Python fallback =====
-
-        # 1. Dequant NVFP4 buffers -> FP32 (HF layout, then transpose to nmoe)
-        packed = getattr(moe, f'_{param_name}_packed')
-        scale_buf = getattr(moe, f'_{param_name}_scale')
-        gs_buf = getattr(moe, f'_{param_name}_gs')
-        group_size = getattr(moe, '_nvfp4_group_size', 16)
-
-        w = _dequant_nvfp4_buffers_to_fp32(packed, scale_buf, gs_buf, group_size)
-        # Transpose HF [E, out_features, in_features] -> nmoe [E, in_dim, out_dim]
-        w = w.transpose(-1, -2).contiguous()
-
-        # 2. Dequant FP8 momentum
-        m = _dequantize_fp8_e5m2(st["exp_avg"], st["exp_avg_scale"])
-
-        # 3. Decoupled weight decay
-        if self.weight_decay > 0:
-            w.mul_(1.0 - self.lr * self.weight_decay)
-
-        # 4. Adam EMA updates (momentum always full)
-        m.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
-
-        # 5. Variance update + adaptive denominator
-        effective_eps = max(self.eps, 1e-6)
-
-        if self._factored_v:
-            # Adafactor-style factored second moment update.
-            grad_sq = grad * grad
-            del grad  # Free FP32 gradient
-
-            v_row = st["v_row"]
-            v_col = st["v_col"]
-            v_row.mul_(self.beta2).add_(grad_sq.mean(dim=-1), alpha=1.0 - self.beta2)
-            v_col.mul_(self.beta2).add_(grad_sq.mean(dim=-2), alpha=1.0 - self.beta2)
-            del grad_sq
-
-            # Reconstruct v on-the-fly: v[i,j] = v_row[i] * v_col[j] / mean(v_row)
-            # v_row: [*batch, in_dim] -> [*batch, in_dim, 1]
-            # v_col: [*batch, out_dim] -> [*batch, 1, out_dim]
-            rms = v_row.mean(dim=-1, keepdim=True).clamp(min=1e-30)
-            v_row_3d = v_row.unsqueeze(-1)
-            v_col_3d = v_col.unsqueeze(v_col.ndim - 1)
-            v_reconstructed = (v_row_3d * v_col_3d) / rms.unsqueeze(-1)
-            del v_row_3d, v_col_3d
-
-            # Compute denominator from reconstructed v
-            v_reconstructed.sqrt_().mul_(self._inv_bc2_sqrt).add_(effective_eps)
-            denom = v_reconstructed  # reconstructed v is now the denominator
-        else:
-            v = _dequantize_fp8_e4m3(st["exp_avg_sq"], st["exp_avg_sq_scale"])
-            v.mul_(self.beta2).addcmul_(grad, grad, value=1.0 - self.beta2)
-            del grad  # Free FP32 gradient
-
-            # Requantize v to FP8 early (before in-place denom computation consumes it)
-            st["exp_avg_sq"], st["exp_avg_sq_scale"] = _quantize_to_fp8_e4m3(v)
-
-            # Adaptive denominator (computed in-place over v to save ~900 MiB FP32)
-            v.sqrt_().mul_(self._inv_bc2_sqrt).add_(effective_eps)
-            denom = v  # v is now the denominator; original v is consumed
-
-        # 7. Apply Adam update
-        w.addcdiv_(m, denom, value=-self._step_size)
-
-        # Precompute ECO injection coefficient and free denom early (~896 MiB).
-        if self._error_feedback and self._eco_alpha != 0.0:
-            denom.mul_(self._eco_alpha)
-            eco_coeff = denom
-        else:
-            del denom
-
-        # 8. NVFP4 quantization in HF layout for packing.
-        w_hf = w.transpose(-1, -2).contiguous()
-        del w
-        hf_shape = w_hf.shape
-        K_hf = hf_shape[-1]
-
-        pad_k = (SF_VEC - K_hf % SF_VEC) % SF_VEC
-        if pad_k > 0:
-            w_padded = torch.nn.functional.pad(w_hf.reshape(-1, K_hf), (0, pad_k))
-        else:
-            w_padded = w_hf.reshape(-1, K_hf)
-
-        w_blocks = w_padded.reshape(-1, w_padded.shape[-1] // SF_VEC, SF_VEC)
-        scale = _compute_e8m0_scale(w_blocks)
-
-        if self._stochastic_rounding:
-            _param_offset = {'W1': 0, 'W2': 1, 'W3': 2}[param_name]
-            idx = self._moe_to_idx[id(moe)]
-            self._generator.manual_seed(
-                self._step_count * 1000003 + idx * 7 + _param_offset
-            )
-            w_hat_blocks = _quantize_nvfp4_sr(w_blocks, scale, self._generator)
-        else:
-            w_hat_blocks = _quantize_nvfp4_rtn(w_blocks, scale)
-
-        w_hat_hf = w_hat_blocks.reshape(w_padded.shape)
-        if pad_k > 0:
-            w_hat_hf = w_hat_hf[:, :K_hf]
-        w_hat_hf = w_hat_hf.reshape(hf_shape)
-
-        # 9. ECO error injection into momentum (nmoe layout).
-        if self._error_feedback and self._eco_alpha != 0.0:
-            error_hf = w_hf - w_hat_hf
-            del w_hf
-            error = error_hf.transpose(-1, -2).contiguous()
-            del error_hf
-            m.add_(eco_coeff * error)
-            del error, eco_coeff
-        else:
-            del w_hf
-
-        # 10. Pack updated weights to NVFP4 buffers in-place
-        new_packed, new_scale, new_gs = _pack_nvfp4_e2m1(
-            w_hat_hf, scale.reshape(hf_shape[:-1] + (-1,))
+        raise RuntimeError(
+            "BUG: _cuda_fused_update returned False. "
+            "CUDA kernel is required for production (eco_require_cuda=True)."
         )
-        packed.copy_(new_packed)
-        scale_buf.copy_(new_scale.to(scale_buf.dtype))
-        gs_buf.fill_(1.0)
-        del w_hat_hf, new_packed, new_scale, new_gs
-
-        # 11. Requantize m to FP8
-        st["exp_avg"], st["exp_avg_scale"] = _quantize_to_fp8_e5m2(m)
-        del m
 
     def refresh_layer_cache(self, moe: nn.Module):
         """Invalidate blockscaled _W_cache after fused update.

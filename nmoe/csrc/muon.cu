@@ -70,7 +70,7 @@ static __host__ __device__ inline ABC coeff_simple() {
   return {3.4445f, -4.7750f, 2.0315f};
 }
 
-[[maybe_unused]] static const ABC COEFF_QUINTIC[5] = {
+static const ABC COEFF_QUINTIC[5] = {
   {4.0848f, -6.8946f, 2.9270f},
   {3.9505f, -6.3029f, 2.6377f},
   {3.7418f, -5.5913f, 2.3037f},
@@ -78,8 +78,7 @@ static __host__ __device__ inline ABC coeff_simple() {
   {2.8366f, -3.0525f, 1.2012f},
 };
 
-// Optional: Polar Express set (unused by default)
-[[maybe_unused]] static const ABC COEFF_POLAR_EXPRESS[8] = {
+static const ABC COEFF_POLAR_EXPRESS[8] = {
   {7.2086f, -15.5131f, 9.0178f},
   {3.9623f,  -2.5813f, 0.4542f},
   {3.9466f,  -2.5765f, 0.4544f},
@@ -271,10 +270,8 @@ struct MuonPlan {
   int M{0};
   int N{0};
   int S{0};
-  // cuBLAS handles
+  // cuBLAS handle
   cublasHandle_t h{nullptr};
-  // Reserve Lt handle for next diff (gemm via Lt)
-  cublasLtHandle_t lt{nullptr};
   // Workspaces sized for Bmax tiles
   float* d_A{nullptr};
   float* d_T{nullptr};
@@ -376,8 +373,14 @@ extern "C" void muon_plan_run(void* plan,
   const cudaDataType F32 = CUDA_R_32F;
   const cublasComputeType_t compute = CUBLAS_COMPUTE_32F_FAST_TF32;
 
-  // Coefficients per blog/nanochat: fixed (a,b,c) each iteration
-  auto get_coeff = [&](int /*iter*/) -> ABC { return coeff_simple(); };
+  // Coefficient dispatch: 0=simple (fixed), 1=quintic (per-iteration), 2=polar_express (per-iteration)
+  auto get_coeff = [&](int iter) -> ABC {
+    switch (coeff_mode) {
+      case 1:  return COEFF_QUINTIC[iter < 5 ? iter : 4];
+      case 2:  return COEFF_POLAR_EXPRESS[iter < 8 ? iter : 7];
+      default: return coeff_simple();
+    }
+  };
 
   for (int64_t start = 0; start < B; start += tileB_max) {
     int tileB = (int) ((start + tileB_max <= B) ? tileB_max : (B - start));
@@ -495,17 +498,3 @@ extern "C" void muon_plan_run(void* plan,
   }
 }
 
-// Backwards compat single-shot entry (kept temporarily)
-extern "C" void muon(void* x_bf16,
-                     long long B,
-                     int M, int N,
-                     int steps,
-                     int coeff_mode,
-                     cudaStream_t stream) {
-  // Create a tiny plan with Bmax= min(B, 32) and destroy after run.
-  int Bmax = (int)((B < 32) ? B : 32);
-  void* plan = muon_plan_create(Bmax, M, N);
-  if (!plan) return;
-  muon_plan_run(plan, x_bf16, B, M, N, steps, coeff_mode, stream);
-  muon_plan_destroy(plan);
-}

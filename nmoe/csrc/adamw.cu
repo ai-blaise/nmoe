@@ -443,8 +443,6 @@ inline cudaError_t launch_expert_adamw_step(
     cudaStream_t stream) {
   if ((H & 127) != 0) return cudaErrorInvalidValue;
   if ((Dff & 127) != 0) return cudaErrorInvalidValue;
-  if ((H & 31) != 0) return cudaErrorInvalidValue;
-  if ((Dff & 31) != 0) return cudaErrorInvalidValue;
 
   const dim3 block(THREADS_X, THREADS_Y, 1);
 

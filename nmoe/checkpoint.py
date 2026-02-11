@@ -1,5 +1,7 @@
+import logging
 import os
 import json
+import pickle
 import sys
 import threading
 import queue
@@ -13,7 +15,9 @@ import subprocess
 import torch
 import torch.distributed as dist
 
-from nmoe.data.mixture import MixturePlan, resolve_plan
+_log = logging.getLogger(__name__)
+
+from nmoe.data.mixture import MixturePlan
 
 
 # Checkpoint format versioning for backwards compatibility
@@ -58,13 +62,13 @@ def write_tracker(base: str | Path, step: int) -> None:
         try:
             os.fsync(f.fileno())
         except Exception:
-            pass
+            _log.debug("fsync failed for tracker tmp file %s", tmp, exc_info=True)
     os.replace(tmp, out)
     try:
         _fsync_file(out)
         _fsync_dir(str(Path(base)))
     except Exception:
-        pass
+        _log.debug("fsync failed after writing tracker %s", out, exc_info=True)
 
 
 def read_tracker(base: str | Path) -> int:
@@ -72,16 +76,29 @@ def read_tracker(base: str | Path) -> int:
         with open(tracker_path(base), "r") as f:
             txt = f.read().strip()
             return int(txt)
-    except Exception:
+    except FileNotFoundError:
+        return -1
+    except (OSError, IOError) as e:
+        _log.warning("Failed to read tracker at %s: %s", tracker_path(base), e)
+        return -1
+    except (ValueError, TypeError) as e:
+        _log.error("Corrupt tracker file at %s: %s", tracker_path(base), e)
         return -1
 
 
 def _safe_load(path: str) -> Optional[dict]:
-    """Best-effort torch.load that never throws and maps to CPU."""
+    """Best-effort torch.load for metadata reads. Logs errors instead of silencing."""
     try:
         return torch.load(path, map_location='cpu', weights_only=False)
-    except Exception:
+    except (OSError, IOError) as e:
+        _log.warning("Failed to load checkpoint file %s: %s", path, e)
         return None
+    except (pickle.UnpicklingError, RuntimeError) as e:
+        _log.error("Corrupt checkpoint data in %s: %s", path, e)
+        return None
+    except Exception:
+        _log.error("Unexpected error loading %s", path, exc_info=True)
+        raise
 
 
 def get_checkpoint_version(state: dict) -> int:
@@ -109,45 +126,6 @@ def validate_checkpoint_version(state: dict, max_version: int = CHECKPOINT_FORMA
             f"Checkpoint format version {version} is newer than supported version {max_version}. "
             f"Please upgrade nmoe to load this checkpoint."
         )
-
-
-def read_checkpoint_version(path: str | Path) -> Optional[int]:
-    """Read checkpoint version from a checkpoint file.
-
-    Args:
-        path: Path to checkpoint file (rd.pt or dp_rank_*.pt).
-
-    Returns:
-        Version number, or None if file cannot be read.
-    """
-    state = _safe_load(str(path))
-    if state is None:
-        return None
-    return get_checkpoint_version(state)
-
-
-def read_latest_rd_info(base: str | Path) -> Optional[dict]:
-    """Read run_info from the latest checkpoint's rd.pt, if present.
-
-    Returns a dict including the original run_info fields plus 'step' when
-    available, or None if no readable rd.pt is found.
-    """
-    step = read_tracker(base)
-    if step <= 0:
-        return None
-    rd_path = os.path.join(iteration_dir(base, step), 'rd.pt')
-    rd = _safe_load(rd_path)
-    if not rd:
-        return None
-    info = rd.get('run_info')
-    if isinstance(info, dict):
-        out = dict(info)
-        try:
-            out['step'] = int(rd.get('step', 0))
-        except Exception:
-            pass
-        return out
-    return None
 
 
 # =============================================================================
@@ -344,16 +322,12 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
-def _iter_dir(base: str | Path, step: int) -> str:
-    return iteration_dir(base, step)
-
-
 def _rd_path(base: str | Path, step: int) -> str:
-    return os.path.join(_iter_dir(base, step), 'rd.pt')
+    return os.path.join(iteration_dir(base, step), 'rd.pt')
 
 
 def _dp_path(base: str | Path, step: int, rank: int) -> str:
-    return os.path.join(_iter_dir(base, step), f'dp_rank_{rank:03d}.pt')
+    return os.path.join(iteration_dir(base, step), f'dp_rank_{rank:03d}.pt')
 
 
 def _read_git_sha_from_rd(base: str | Path, step: int) -> str:
@@ -371,14 +345,15 @@ def _read_world_from_rd(base: str | Path, step: int) -> int:
     info = rd.get('run_info', {}) if isinstance(rd, dict) else {}
     try:
         return int(info.get('world', -1))
-    except Exception:
+    except (ValueError, TypeError) as e:
+        _log.warning("Invalid 'world' value in checkpoint metadata at step %d: %s", step, e)
         return -1
 
 
 def _all_dp_present(base: str | Path, step: int, world: int) -> bool:
     if world <= 0:
         return False
-    it = _iter_dir(base, step)
+    it = iteration_dir(base, step)
     if not os.path.isdir(it):
         return False
     for r in range(world):
@@ -388,7 +363,7 @@ def _all_dp_present(base: str | Path, step: int, world: int) -> bool:
 
 
 def _write_manifest(base: str | Path, step: int, world: int) -> None:
-    it_dir = _iter_dir(base, step)
+    it_dir = iteration_dir(base, step)
     os.makedirs(it_dir, exist_ok=True)
     rd = _rd_path(base, step)
     files = [rd] + [_dp_path(base, step, r) for r in range(world)]
@@ -397,7 +372,7 @@ def _write_manifest(base: str | Path, step: int, world: int) -> None:
         try:
             bytes_total += os.path.getsize(p)
         except Exception:
-            pass
+            _log.debug("Could not stat file %s for manifest byte count", p, exc_info=True)
     git_sha = _read_git_sha_from_rd(base, step)
     manifest = {
         'step': int(step),
@@ -435,6 +410,7 @@ def try_finalize_step(base: str | Path, step: int) -> bool:
         write_tracker(base, step)
         return True
     except Exception:
+        _log.error("Failed to finalize checkpoint step=%d at %s", step, base, exc_info=True)
         return False
 
 
@@ -459,7 +435,7 @@ class _AsyncSaver(threading.Thread):
                     try:
                         self._on_saved(bytes_written, ms, item.step)
                     except Exception:
-                        pass
+                        _log.debug("on_saved callback failed for step=%d", item.step, exc_info=True)
             except Exception as e:
                 if self._error is None:
                     self._error = e
@@ -468,7 +444,7 @@ class _AsyncSaver(threading.Thread):
                     sys.stderr.write(f"[ckpt] async save failed step={item.step} path={item.path}: {e}\n")
                     sys.stderr.flush()
                 except Exception:
-                    pass
+                    _log.debug("Failed to write async save error to stderr", exc_info=True)
             finally:
                 self.q.task_done()
 
@@ -492,11 +468,12 @@ class _AsyncSaver(threading.Thread):
         try:
             self.q.put(None)
         except Exception:
+            _log.debug("Failed to enqueue shutdown sentinel for async saver", exc_info=True)
             return
         try:
             self.join(timeout=60.0)
         except Exception:
-            pass
+            _log.debug("Failed to join async saver thread during close", exc_info=True)
 
     def wait(self) -> None:
         # Wait until all queued tasks are processed
@@ -518,7 +495,7 @@ class _AsyncSaver(threading.Thread):
                 _fsync_file(path)
                 _fsync_dir(base)
             except Exception:
-                pass
+                _log.debug("fsync failed after atomic save of %s", path, exc_info=True)
         except FileNotFoundError:
             # Temp may not be visible yet on some backends; try a direct save as a fallback
             try:
@@ -529,18 +506,19 @@ class _AsyncSaver(threading.Thread):
                     _fsync_file(path)
                     _fsync_dir(base)
                 except Exception:
-                    pass
+                    _log.debug("fsync failed in fallback save path for %s", path, exc_info=True)
             finally:
                 # Cleanup temp if present
                 try:
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 except Exception:
-                    pass
+                    _log.debug("Failed to clean up temp file %s", tmp, exc_info=True)
         ms = (time.perf_counter() - t0) * 1000.0
         try:
             size = os.path.getsize(path)
         except Exception:
+            _log.debug("Could not stat saved checkpoint %s", path, exc_info=True)
             size = 0
         return size, ms
 
@@ -587,11 +565,10 @@ class _Purger(threading.Thread):
                     try:
                         sub.rmdir()
                     except Exception:
-                        pass
+                        _log.debug("Failed to remove subdirectory %s during purge", sub, exc_info=True)
                 p.rmdir()
             except Exception:
-                # Best-effort purge
-                pass
+                _log.debug("Best-effort purge failed for %s", p, exc_info=True)
 
 
 class Checkpointer:
@@ -624,7 +601,7 @@ class Checkpointer:
                 if _rank() == 0:
                     try_finalize_step(self.base, step)
             except Exception:
-                pass
+                _log.debug("Opportunistic finalize failed for step=%d", step, exc_info=True)
         # Ensure capacity for rd.pt + dp_rank_XXX.pt on rank 0 without dropping
         max_q = max(2, async_max_queue)
         self._saver = _AsyncSaver(max_queue=max_q, on_saved=_on_saved) if async_io else None
@@ -700,7 +677,7 @@ class Checkpointer:
         for p in iters:
             try:
                 s = int(p.name.split("_", 1)[1])
-            except Exception:
+            except (ValueError, IndexError):
                 continue
             if not (p / "manifest.json").exists():
                 continue
@@ -734,7 +711,10 @@ class Checkpointer:
                 try:
                     try_finalize_step(self.base, int(self._last_requested_step))
                 except Exception:
-                    pass
+                    _log.error(
+                        "Failed to finalize step=%d during checkpointer close",
+                        self._last_requested_step, exc_info=True,
+                    )
             self._saver.close()
 
 
@@ -942,6 +922,94 @@ def dequantize_nvfp4_state_dict(
     return result
 
 
+def dequantize_nvfp4_state_dict_gpu(
+    state_dict: Dict[str, torch.Tensor],
+    group_size: int = 16,
+    print_fn=print,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Dequantize all NVFP4 triplets in a state dict to BF16 on GPU.
+
+    Like dequantize_nvfp4_state_dict but performs dequantization on GPU to avoid
+    CPU float32 intermediates.  Returns a state dict with BF16 tensors (on GPU)
+    suitable for resharding or direct load_state_dict.
+
+    This is used for resharding paths where dequantize_nvfp4_to_model_gpu()
+    cannot be used because the caller needs BF16 tensors in a dict for
+    expert slicing before loading into the model.
+
+    Args:
+        state_dict: State dict potentially containing NVFP4 triplets (CPU tensors).
+        group_size: NVFP4 group size (default 16).
+        print_fn: Logging function.
+        device: GPU device to use for dequantization. If None, uses current CUDA device.
+
+    Returns:
+        New state dict with NVFP4 triplets replaced by BF16 tensors (on GPU).
+    """
+    if device is None:
+        device = torch.device('cuda', torch.cuda.current_device())
+
+    packed_keys = [k for k in state_dict if k.endswith('.weight_packed')]
+    if not packed_keys:
+        return state_dict  # No NVFP4 data
+
+    result = {}
+    consumed = set()
+    dequant_count = 0
+
+    for pk in packed_keys:
+        base = pk[:-len('.weight_packed')]
+        sk = base + '.weight_scale'
+        gk = base + '.weight_global_scale'
+
+        if sk not in state_dict or gk not in state_dict:
+            print_fn(f"[nvfp4] WARNING: Incomplete triplet for {base}, "
+                     f"missing scale={sk not in state_dict} global_scale={gk not in state_dict}")
+            result[pk] = state_dict[pk]
+            continue
+
+        # Move triplet to GPU for dequant (small: NVFP4 is 4x compressed)
+        packed_gpu = state_dict[pk].to(device=device, non_blocking=True)
+        scale_gpu = state_dict[sk].to(device=device, non_blocking=True)
+        gs_gpu = state_dict[gk].to(device=device, non_blocking=True)
+
+        # Dequantize on GPU
+        bf16_weight = dequantize_compressed_tensors_nvfp4(
+            packed_gpu, scale_gpu, gs_gpu, group_size,
+        )
+
+        # Free GPU temporaries for the compressed inputs
+        del packed_gpu, scale_gpu, gs_gpu
+
+        # Determine output key and whether transpose is needed
+        base_parts = base.split('.')
+        last_part = base_parts[-1] if base_parts else ''
+
+        if last_part in ('W1', 'W3', 'W2'):
+            out_key = base
+            if bf16_weight.ndim >= 2:
+                bf16_weight = bf16_weight.transpose(-1, -2).contiguous()
+        else:
+            out_key = base + '.weight'
+
+        result[out_key] = bf16_weight
+        consumed.add(pk)
+        consumed.add(sk)
+        consumed.add(gk)
+        dequant_count += 1
+
+    # Copy non-triplet keys
+    for k, v in state_dict.items():
+        if k not in consumed and k not in result:
+            result[k] = v
+
+    if dequant_count > 0:
+        print_fn(f"[nvfp4] Dequantized {dequant_count} NVFP4 triplets to BF16 (GPU)")
+
+    return result
+
+
 def dequantize_nvfp4_to_model_gpu(
     state_dict: Dict[str, torch.Tensor],
     model: torch.nn.Module,
@@ -1128,11 +1196,6 @@ def dequantize_nvfp4_to_model_gpu(
 def _is_nvfp4_checkpoint(state: dict) -> bool:
     """Check if a checkpoint contains NVFP4 compressed_tensors data."""
     return state.get('nvfp4_format') == 'compressed_tensors'
-
-
-def _has_nvfp4_triplets(state_dict: dict) -> bool:
-    """Check if state dict contains NVFP4 triplets (weight_packed keys)."""
-    return any(k.endswith('.weight_packed') for k in state_dict)
 
 
 def _get_nvfp4_group_size(state: dict) -> int:
@@ -1372,6 +1435,7 @@ def build_states(
             stderr=subprocess.DEVNULL,
         ).decode().strip()
     except Exception:
+        _log.debug("Could not determine git SHA for checkpoint metadata", exc_info=True)
         git_sha = 'unknown'
 
     rd_state: Optional[dict[str, Any]] = {
@@ -1551,7 +1615,9 @@ def load_state(
         except RuntimeError:
             raise
         except Exception:
-            pass  # Best effort: import errors, missing config module, etc.
+            _log.warning(
+                "Config fingerprint validation skipped due to error", exc_info=True
+            )
     else:
         print_fn("[checkpoint] Skipping fingerprint validation for imported checkpoint (no stored fingerprint)")
 
@@ -1674,9 +1740,8 @@ def load_state_with_ep_check(
     it_dir = os.path.dirname(path)
     rd_path = os.path.join(it_dir, 'rd.pt')
 
-    # Always load to CPU first — NVFP4 dequantization creates large float32
-    # intermediates that would OOM on GPU.  load_state_dict() copies BF16
-    # tensors to GPU parameters one-by-one which is memory-safe.
+    # Always torch.load to CPU first (standard practice). NVFP4 dequantization
+    # is then performed on GPU via CUDA kernel, avoiding CPU float32 intermediates.
 
     # Load dp_rank checkpoint first to check EP sharding
     print_fn(f'Loading checkpoint: {path}')
@@ -1733,7 +1798,9 @@ def load_state_with_ep_check(
         except RuntimeError:
             raise
         except Exception:
-            pass  # Best effort
+            _log.warning(
+                "Config fingerprint validation skipped due to error", exc_info=True
+            )
     else:
         print_fn("[checkpoint] Skipping fingerprint validation for imported checkpoint (no stored fingerprint)")
 
@@ -1747,13 +1814,13 @@ def load_state_with_ep_check(
         print_fn(f"[nvfp4] Loading expert NVFP4 triplets directly to GPU buffers (Option C)...")
         loaded = load_nvfp4_expert_buffers(expert_sd, model, gs, print_fn)
         if not loaded:
-            print_fn("[nvfp4] WARNING: No NVFP4 triplets found in expert state, falling back to dequant")
-            expert_sd = dequantize_nvfp4_state_dict(expert_sd, gs, print_fn)
+            print_fn("[nvfp4] WARNING: No NVFP4 triplets found in expert state, falling back to GPU dequant")
+            expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, gs, print_fn)
             model.load_state_dict(expert_sd, strict=False)
     elif ckpt_is_nvfp4:
         group_size_dp = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else group_size
-        print_fn(f"[nvfp4] Dequantizing expert NVFP4 triplets on CPU...")
-        expert_sd = dequantize_nvfp4_state_dict(expert_sd, group_size_dp, print_fn)
+        print_fn(f"[nvfp4] Dequantizing expert NVFP4 triplets via GPU kernel...")
+        expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, group_size_dp, print_fn)
         model.load_state_dict(expert_sd, strict=False)
     else:
         model.load_state_dict(expert_sd, strict=False)
@@ -1954,21 +2021,21 @@ def load_with_resharding(
     it_dir = os.path.dirname(path)
     rd_path = os.path.join(it_dir, 'rd.pt')
 
-    # Always load to CPU first — NVFP4 dequantization creates large float32
-    # intermediates that would OOM on GPU.  load_state_dict() copies BF16
-    # tensors to GPU parameters one-by-one which is memory-safe.
+    # Always torch.load to CPU first (standard practice for checkpoint loading).
+    # NVFP4 dequantization is then performed on GPU via CUDA kernel, avoiding
+    # CPU float32 intermediates entirely.
 
     # Load rd.pt (dense weights)
     rd = torch.load(rd_path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(rd)
     dense_sd = rd['model_dense']
 
-    # Detect NVFP4 and dequantize
+    # Detect NVFP4 and dequantize on GPU
     is_nvfp4 = _is_nvfp4_checkpoint(rd)
     if is_nvfp4:
         group_size = _get_nvfp4_group_size(rd)
-        print_fn(f"[reshard/nvfp4] Dequantizing dense NVFP4 triplets on CPU (group_size={group_size})")
-        dense_sd = dequantize_nvfp4_state_dict(dense_sd, group_size, print_fn)
+        print_fn(f"[reshard/nvfp4] Dequantizing dense NVFP4 triplets via GPU kernel (group_size={group_size})")
+        dense_sd = dequantize_nvfp4_to_model_gpu(dense_sd, model, group_size, print_fn)
 
     model.load_state_dict(dense_sd, strict=False)
     del dense_sd
@@ -1989,7 +2056,9 @@ def load_with_resharding(
         except RuntimeError:
             raise
         except Exception:
-            pass  # Best effort
+            _log.warning(
+                "Config fingerprint validation skipped due to error", exc_info=True
+            )
     else:
         print_fn("[reshard] Skipping fingerprint validation for imported checkpoint (no stored fingerprint)")
 
@@ -2019,8 +2088,8 @@ def load_with_resharding(
         print_fn(f"[reshard] EP config matches, loading directly")
         expert_sd = ckpt['model_expert']
         if is_nvfp4:
-            print_fn(f"[reshard/nvfp4] Dequantizing expert NVFP4 triplets...")
-            expert_sd = dequantize_nvfp4_state_dict(expert_sd, nvfp4_group_size, print_fn)
+            print_fn(f"[reshard/nvfp4] Dequantizing expert NVFP4 triplets via GPU kernel...")
+            expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, nvfp4_group_size, print_fn)
         model.load_state_dict(expert_sd, strict=False)
         del expert_sd
         # Restore optimizer state if available
@@ -2036,7 +2105,7 @@ def load_with_resharding(
             # Single shard contains all experts - can reshard directly
             expert_sd = ckpt['model_expert']
             if is_nvfp4:
-                expert_sd = dequantize_nvfp4_state_dict(expert_sd, nvfp4_group_size, print_fn)
+                expert_sd = dequantize_nvfp4_state_dict_gpu(expert_sd, nvfp4_group_size, print_fn)
             resharded = reshard_expert_weights(
                 expert_sd, saved_ep_info, target_ep_size, target_ep_rank, print_fn
             )
@@ -2067,7 +2136,7 @@ def load_with_resharding(
                 src_ckpt = torch.load(src_path, map_location='cpu', weights_only=False)
                 src_expert_sd = src_ckpt['model_expert']
                 if is_nvfp4:
-                    src_expert_sd = dequantize_nvfp4_state_dict(src_expert_sd, nvfp4_group_size, print_fn)
+                    src_expert_sd = dequantize_nvfp4_state_dict_gpu(src_expert_sd, nvfp4_group_size, print_fn)
                 resharded = reshard_expert_weights(
                     src_expert_sd, src_info, target_ep_size, target_ep_rank, print_fn
                 )
@@ -2179,4 +2248,4 @@ def save_checkpoint(
                 if done:
                     print_fn(f"[ckpt] complete step={step}")
             except Exception:
-                pass
+                _log.error("Failed to finalize checkpoint step=%d", step, exc_info=True)
