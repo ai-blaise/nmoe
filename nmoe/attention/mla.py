@@ -466,13 +466,10 @@ class MLA(nn.Module):
     k[..., self.qk_nope_head_dim:].copy_(k_pe.expand(-1, -1, self.n_heads, -1))
     with record_function("attn.kernel[mla]"):
       if cu_seqlens is not None:
-        # Packed sequences: use document-isolated attention
-        if _USE_SDPA:
-          # FlexAttention with block-diagonal causal mask
-          output = _mla_sdpa_packed_forward(q, k, v, self.softmax_scale, cu_seqlens)
-        else:
-          # FlashMLA varlen: zero-mask-memory document isolation
-          output = _MlaFlashMlaVarlenPacked.apply(q, k, v, self.softmax_scale, cu_seqlens)
+        # Packed sequences: always use FlashMLA varlen to avoid O(S²) mask
+        # materialization.  PyTorch FlexAttention's create_block_mask() attempts
+        # to allocate [B,H,Q,KV] intermediates which OOMs on large models.
+        output = _MlaFlashMlaVarlenPacked.apply(q, k, v, self.softmax_scale, cu_seqlens)
       else:
         # Standard causal attention (no packing)
         if _USE_SDPA:
