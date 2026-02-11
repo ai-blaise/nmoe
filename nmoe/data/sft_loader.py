@@ -695,6 +695,13 @@ class SFTLoader:
                 "datasets library required: pip install datasets"
             )
 
+        # Columns the SFT loader actually needs (chat messages).
+        # We request only these to avoid schema-cast errors from complex
+        # nested columns (tool schemas, function defs, etc.) that some
+        # agentic datasets include.
+        _needed_cols = {"messages", "conversations", "instruction", "output",
+                        "prompt", "completion"}
+
         if os.path.isdir(dataset_path):
             # Local directory with JSON/JSONL/Parquet files
             dataset = load_dataset(
@@ -704,11 +711,39 @@ class SFTLoader:
             )
         else:
             # HuggingFace Hub dataset
-            dataset = load_dataset(
-                dataset_path,
-                split=split,
-                trust_remote_code=True,
-            )
+            try:
+                dataset = load_dataset(
+                    dataset_path,
+                    split=split,
+                    trust_remote_code=True,
+                )
+            except Exception:
+                # Retry in streaming mode and materialise — avoids
+                # Arrow schema-cast failures on deeply-nested columns.
+                logger.warning(
+                    "Standard load failed; retrying with streaming mode "
+                    "to work around nested-schema issues"
+                )
+                ds_iter = load_dataset(
+                    dataset_path,
+                    split=split,
+                    trust_remote_code=True,
+                    streaming=True,
+                )
+                # Materialise only the columns we need
+                rows = []
+                for row in ds_iter:
+                    keep = {k: v for k, v in row.items() if k in _needed_cols}
+                    if keep:
+                        rows.append(keep)
+                from datasets import Dataset
+                dataset = Dataset.from_list(rows)
+
+        # Drop columns we don't need (reduces memory and avoids
+        # downstream serialization issues with complex Arrow types).
+        drop = [c for c in dataset.column_names if c not in _needed_cols]
+        if drop:
+            dataset = dataset.remove_columns(drop)
 
         if max_examples is not None:
             dataset = dataset.select(range(min(max_examples, len(dataset))))
