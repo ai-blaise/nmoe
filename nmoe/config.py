@@ -44,6 +44,7 @@ class Config:
   n_activated_experts: int = None  # Top-K routing
   n_shared_experts: int = 2  # Shared experts (default 2)
   n_dense_layers: int = 1  # First N layers are dense
+  rdep_capacity: int = 0  # RDEP buffer capacity (0=auto-compute)
 
   # Attention (MLA defaults)
   attn: str = "mla"  # Global attention type
