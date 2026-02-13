@@ -74,3 +74,9 @@ tmp/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Local data (Jari/Niwa task trackers)
+.jari/
+.niwa/
+experiments.db
+metrics/
