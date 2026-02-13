@@ -412,6 +412,18 @@ def main():
 
   cfg = Config(**cfg_dict)
 
+  # === Enhanced startup logging ===
+  import os
+  rank = int(os.environ.get('RANK', 0))
+  local_rank = int(os.environ.get('LOCAL_RANK', 0))
+  world_size = int(os.environ.get('WORLD_SIZE', 1))
+  print(f"[TRAIN] rank={rank} local_rank={local_rank} world_size={world_size}")
+  print(f"[TRAIN] config: steps={cfg.steps} batch_size={cfg.batch_size} seq_len={cfg.seq_len}")
+  print(f"[TRAIN] dtype={cfg.dtype} rdep_capacity={getattr(cfg, 'rdep_capacity', 'N/A')}")
+  print(f"[TRAIN] n_routed_experts={cfg.n_routed_experts} n_activated_experts={cfg.n_activated_experts}")
+  print(f"[TRAIN] gradient_accumulation_steps={cfg.gradient_accumulation_steps}")
+  sys.stdout.flush()
+
   try:
     train(cfg)
   finally:

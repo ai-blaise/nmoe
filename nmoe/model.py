@@ -57,31 +57,33 @@ def _create_rdep(config, ep_size: int) -> Rdep:
   """Create RDEP dispatcher for MoE layers.
 
   Uses ep_size (not world_size) to determine local expert count. With EP=8 and
-  128 routed experts, each GPU gets 128/8 = 16 local experts.
-
-  Args:
-      config: Model configuration with MoE parameters
-      ep_size: Expert parallelism group size
-
-  Returns:
-      Configured Rdep instance
+  128 routed experts: n_local = 128 // 8 = 16 experts per GPU.
   """
-  _validate_moe_config(config, ep_size)
+  import sys
+  dp = dist.get_world_size() // max(1, ep_size) if dist.is_initialized() else 1
   n_local = config.n_routed_experts // max(1, ep_size)
   # Capacity = max token-expert slots per GPU in one micro-batch.
-  # Global batch is split across DP ranks and gradient accumulation steps.
-  dp = config.dp_size if config.dp_size else 1
   micro_batch = max(1, config.batch_size // (dp * config.gradient_accumulation_steps))
-  # Use explicit rdep_capacity if set, otherwise compute from batch geometry
-  if hasattr(config, 'rdep_capacity') and config.rdep_capacity > 0:
+  # Auto-compute: T * K * ep_size (worst-case dispatch)
+  auto_capacity = int(micro_batch * config.seq_len * config.n_activated_experts * max(1, ep_size))
+  if hasattr(config, "rdep_capacity") and config.rdep_capacity > 0:
     capacity = int(config.rdep_capacity)
   else:
-    capacity = int(micro_batch * config.seq_len * config.n_activated_experts * max(1, ep_size))
+    capacity = auto_capacity
+  # --- Enhanced RDEP logging ---
+  rank = int(dist.get_rank()) if dist.is_initialized() else 0
+  if rank == 0:
+    mem_est_gb = capacity * config.dim * 2 * n_local / (1024**3)  # bf16 estimate
+    print(f"[RDEP] capacity={capacity:,} (auto={auto_capacity:,})", flush=True)
+    print(f"[RDEP] micro_batch={micro_batch} seq_len={config.seq_len} K={config.n_activated_experts} ep={ep_size} dp={dp}", flush=True)
+    print(f"[RDEP] n_local={n_local} dim={config.dim} dtype={config.dtype}", flush=True)
+    print(f"[RDEP] estimated_buffer_mem={mem_est_gb:.2f} GiB (bf16, {n_local} experts)", flush=True)
+    sys.stdout.flush()
   ep_group = _get_ep_group()
   return Rdep(
     config.dim,
     n_local,
-    config.n_activated_experts,
+    config.n_routed_experts,
     profile=config.dtype,
     capacity=capacity,
     ep_group=ep_group,
