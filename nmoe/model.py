@@ -72,7 +72,11 @@ def _create_rdep(config, ep_size: int) -> Rdep:
   # Global batch is split across DP ranks and gradient accumulation steps.
   dp = config.dp_size if config.dp_size else 1
   micro_batch = max(1, config.batch_size // (dp * config.gradient_accumulation_steps))
-  capacity = int(micro_batch * config.seq_len * config.n_activated_experts)
+  # Use explicit rdep_capacity if set, otherwise compute from batch geometry
+  if hasattr(config, 'rdep_capacity') and config.rdep_capacity > 0:
+    capacity = int(config.rdep_capacity)
+  else:
+    capacity = int(micro_batch * config.seq_len * config.n_activated_experts * max(1, ep_size))
   ep_group = _get_ep_group()
   return Rdep(
     config.dim,
