@@ -215,10 +215,11 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     E = int(rdep.n_local)
     is_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
     if is_dist:
-      need = int(T) * int(K) * int(dist.get_world_size())
+      # Use rdep.world (EP group size) for consistency with forward pass and auto-compute
+      need = int(T) * int(K) * int(rdep.world)
       if rdep.capacity < need:
         raise RuntimeError(
-          f"[RDEP] capacity too small: capacity={rdep.capacity:,} need>={need:,} (T={T:,} K={K} world={dist.get_world_size()}). "
+          f"[RDEP] capacity too small: capacity={rdep.capacity:,} need>={need:,} (T={T:,} K={K} world={rdep.world}). "
           "Set capacity to worst-case T*K*world (no silent truncation)."
         )
 
