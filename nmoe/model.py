@@ -609,8 +609,19 @@ class Transformer(nn.Module):
       # Standard sequential positions
       cos = self.rope.cos[:seqlen]
       sin = self.rope.sin[:seqlen]
-    for block in self.blocks:
+    if dist.is_initialized() and dist.get_rank() == 0:
+      print("[FWD] starting forward pass", flush=True)
+    _n_blocks = len(self.blocks)
+    for i, block in enumerate(self.blocks):
+      if i == 0 and dist.is_initialized() and dist.get_rank() == 0:
+        print("[FWD] layer 0 start", flush=True)
+      if i == _n_blocks - 1 and dist.is_initialized() and dist.get_rank() == 0:
+        print(f"[FWD] layer {i} (last) start", flush=True)
       x = block(x, cos, sin, cu_seqlens=cu_seqlens)
+      if i == 0 and dist.is_initialized() and dist.get_rank() == 0:
+        print("[FWD] layer 0 done", flush=True)
+      if i == _n_blocks - 1 and dist.is_initialized() and dist.get_rank() == 0:
+        print(f"[FWD] layer {i} (last) done", flush=True)
     with torch.no_grad():
       moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
       if moe_layers:
@@ -624,6 +635,8 @@ class Transformer(nn.Module):
         loads = loads / loads.sum(dim=-1, keepdim=True).clamp_min(1.0)
         for m, l in zip(moe_layers, loads):
           m.last_loads = l
+    if dist.is_initialized() and dist.get_rank() == 0:
+      print("[FWD] all layers done, computing lm_head", flush=True)
     with record_function("norm_f"):
       x = self.norm(x)
     # Dynamic amax scaling handles range - no clamp needed (TorchTitan/Megatron pattern)

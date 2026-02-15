@@ -88,6 +88,9 @@ def dequant_nvfp4_to_bf16_transient(
     return out_bf16
 
 
+_moe_fwd_count = 0
+
+
 class _MoEBlockscaledFused(torch.autograd.Function):
   @staticmethod
   def forward(ctx, rdep: Rdep, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
@@ -121,6 +124,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     M_host.zero_()
     align = 128  # Required for blockscaled SF swizzle
 
+    global _moe_fwd_count
+    _do_fwd_log = _moe_fwd_count == 0 and dist.is_initialized() and dist.get_rank() == 0
+
+    if _do_fwd_log:
+      print("[MOE-FWD] weight cache start", flush=True)
+      print("[MOE-FWD] weight cache done", flush=True)
+      print("[MOE-FWD] dispatch start", flush=True)
+
     with cuda_error_context("dispatch_meta_blockscaled"):
       M_recv = _C.dispatch_meta_blockscaled(
         x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
@@ -128,6 +139,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         offs_pad.data_ptr(), M_host.data_ptr(),
         stream,
       )
+
+    if _do_fwd_log:
+      print("[MOE-FWD] dispatch done", flush=True)
 
     # Check for dropped tokens periodically (avoid per-call GPU-CPU sync)
     if not hasattr(_MoEBlockscaledFused, '_dispatch_count'):
@@ -162,6 +176,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         ctx.save_for_backward(x, eid, gates, _e0, _e0, _e0)
       else:
         ctx.save_for_backward(x, eid, gates, W1, W3, W2)
+      _moe_fwd_count += 1
       return out_f32.to(dtype=torch.bfloat16)
 
     # P3.13: Use non-blocking query loop instead of blocking synchronize()
@@ -182,15 +197,23 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     _C.gather_xe_blockscaled(Xe_q.data_ptr(), Xe_sf.data_ptr(), int(M_recv), int(M_pad), stream)
 
     # Expert compute (blockscaled)
+    if _do_fwd_log:
+      print("[MOE-FWD] expert compute start", flush=True)
     from nmoe.blockscaled.grouped import expert_blockscaled
     Ye_pad = expert_blockscaled(Xe_q, Xe_sf, W_cache, offs_pad, capacity_rows=int(rdep.capacity))
+    if _do_fwd_log:
+      print("[MOE-FWD] expert compute done", flush=True)
 
+    if _do_fwd_log:
+      print("[MOE-FWD] return start", flush=True)
     _C.return_scatter_from_pad_blockscaled(
       Ye_pad.data_ptr(),
       out_f32.data_ptr(),
       int(M_recv), int(T), int(K),
       stream,
     )
+    if _do_fwd_log:
+      print("[MOE-FWD] return done", flush=True)
 
     ctx.rdep = rdep
     ctx.T = int(T)
@@ -205,6 +228,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       ctx.save_for_backward(x, eid, gates, _e0, _e0, _e0)
     else:
       ctx.save_for_backward(x, eid, gates, W1, W3, W2)
+    _moe_fwd_count += 1
     return out_f32.to(dtype=torch.bfloat16)
 
   @staticmethod
