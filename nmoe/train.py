@@ -301,6 +301,14 @@ def train(cfg: Config):
             logits = model(inputs, cu_seqlens=cu_seqlens)
           if rank == 0 and step_num == start_step:
             print("[TRAIN] forward done, logits computed", flush=True)
+            # Register backward hook on logits to trace when lm_head backward starts.
+            # The gradient flows: loss -> cross_entropy -> logits_fp32 -> .float() -> logits.
+            # This hook fires when gradient arrives at the BF16 logits tensor, meaning
+            # the lm_head weight gradient is about to be computed next.
+            if logits.requires_grad:
+              logits.register_hook(
+                lambda grad: print("[BWD] logits grad received (entering lm_head backward)", flush=True)
+              )
 
           # === NaN/Inf detection in logits (BEFORE loss computation) ===
           with torch.no_grad():

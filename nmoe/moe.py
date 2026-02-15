@@ -89,6 +89,7 @@ def dequant_nvfp4_to_bf16_transient(
 
 
 _moe_fwd_count = 0
+_moe_bwd_count = 0
 
 
 class _MoEBlockscaledFused(torch.autograd.Function):
@@ -233,6 +234,12 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, dOut: torch.Tensor):
+    global _moe_bwd_count
+    _do_bwd_log = (_moe_bwd_count == 0 and dist.is_initialized() and dist.get_rank() == 0)
+
+    if _do_bwd_log:
+      print("[MOE-BWD] backward start", flush=True)
+
     x, eid, gates, _W1, _W3, _W2 = ctx.saved_tensors
     rdep: Rdep = ctx.rdep
     fused_eco = ctx.fused_eco
@@ -269,6 +276,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     M_host.zero_()
     align = 128  # Required for blockscaled SF swizzle
 
+    if _do_bwd_log:
+      print("[MOE-BWD] dispatch_meta start", flush=True)
+
     M_recv = _C.dispatch_meta_bf16(
       x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
       int(T), int(K), align,
@@ -276,7 +286,12 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       stream,
     )
 
+    if _do_bwd_log:
+      print("[MOE-BWD] dispatch_meta done", flush=True)
+
     if M_recv <= 0:
+      if _do_bwd_log:
+        print("[MOE-BWD] M_recv=0 early return path", flush=True)
       dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
 
       # DeepEP collectiveness: still run distributed gather/scatter
@@ -319,11 +334,13 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         # stale momentum, corrupting weights on ranks with no routed tokens.
         # In practice M_recv=0 is unreachable with top-8 routing over 128 experts
         # (each rank's 16 experts would need to receive zero out of ~32k assignments).
+        _moe_bwd_count += 1
         return None, dX, None, dGates, None, None, None, None, None, None
 
       dW1 = torch.zeros_like(_W1)
       dW3 = torch.zeros_like(_W3)
       dW2 = torch.zeros_like(_W2)
+      _moe_bwd_count += 1
       return None, dX, None, dGates, dW1, dW3, dW2, None, None, None
 
     # When fused_eco is active, saved W1/W3/W2 are empty placeholders.
@@ -351,6 +368,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
     dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
 
+    if _do_bwd_log:
+      print("[MOE-BWD] gather_dy start", flush=True)
+
     if is_dist:
       # Distributed path: gather dYe across ranks with gate scaling (no dGate yet)
       _C.gather_dy_nogate_dist_bf16(
@@ -372,6 +392,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(M_recv), int(T), int(H), int(K),
         stream,
       )
+
+    if _do_bwd_log:
+      print("[MOE-BWD] gather_dy done", flush=True)
 
     dYe_pad = torch.zeros(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
     _C.scatter_sorted_to_pad_bf16(
@@ -474,6 +497,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       del H1, H3, dA  # Consumed by swiglu_bwd + dgate; free before wgrad
 
       # Phase A: dW2 = wgrad_w2(A, dYe) → fused_update → free dW2, A, dYe
+      if _do_bwd_log:
+        print("[MOE-BWD] dW2 compute start", flush=True)
       dW2 = torch.empty(int(E), int(Dff), int(H), device=device, dtype=torch.bfloat16)
       _C.bf16_wgrad_w2_cublaslt(
         A.data_ptr(),
@@ -483,8 +508,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(E), int(H), int(Dff),
         stream,
       )
+      if _do_bwd_log:
+        print("[MOE-BWD] dW2 compute done", flush=True)
       del A, dYe_pad  # Free ~(max_pad*Dff + max_pad*H)*2 bytes
+      if _do_bwd_log:
+        print("[MOE-BWD] eco_update W2 start", flush=True)
       fused_eco.fused_update(moe_ref, 'W2', dW2)
+      if _do_bwd_log:
+        print("[MOE-BWD] eco_update W2 done", flush=True)
       del dW2  # Free ~448 MiB
 
       # Phase B: dX from W1.T — re-dequant W1 (was freed after H1 recompute).
@@ -495,6 +526,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       del W1  # Free ~1.3 GiB
 
       # Phase C: dW1 = wgrad_w13(Xe, dH1) → fused_update → free
+      if _do_bwd_log:
+        print("[MOE-BWD] dW1 compute start", flush=True)
       dW1 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
       _C.bf16_wgrad_w13_cublaslt(
         Xe_pad.data_ptr(),
@@ -504,12 +537,20 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(E), int(H), int(Dff),
         stream,
       )
+      if _do_bwd_log:
+        print("[MOE-BWD] dW1 compute done", flush=True)
       del dH1
+      if _do_bwd_log:
+        print("[MOE-BWD] eco_update W1 start", flush=True)
       fused_eco.fused_update(moe_ref, 'W1', dW1)
+      if _do_bwd_log:
+        print("[MOE-BWD] eco_update W1 done", flush=True)
       del dW1
 
       # Phase D: dW3 = wgrad_w13(Xe, dH3) → fused_update → free Xe_pad (~1.2 GiB)
       # Done BEFORE dX+=W3.T so Xe_pad is freed, making room for grouped_mm temp.
+      if _do_bwd_log:
+        print("[MOE-BWD] dW3 compute start", flush=True)
       dW3 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
       _C.bf16_wgrad_w13_cublaslt(
         Xe_pad.data_ptr(),
@@ -519,8 +560,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(E), int(H), int(Dff),
         stream,
       )
+      if _do_bwd_log:
+        print("[MOE-BWD] dW3 compute done", flush=True)
       del Xe_pad  # Free ~1.2 GiB before grouped_mm allocation
+      if _do_bwd_log:
+        print("[MOE-BWD] eco_update W3 start", flush=True)
       fused_eco.fused_update(moe_ref, 'W3', dW3)
+      if _do_bwd_log:
+        print("[MOE-BWD] eco_update W3 done", flush=True)
       del dW3
 
       # Phase E: dX += W3.T contribution — re-dequant W3 (was freed after H3 recompute).
@@ -533,6 +580,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
     else:
       # Standard backward (no fused ECO): compute wgrad, dX, return gradients
+      if _do_bwd_log:
+        print("[MOE-BWD] dW2 compute start", flush=True)
       dW2 = torch.empty(int(E), int(Dff), int(H), device=device, dtype=torch.bfloat16)
       _C.bf16_wgrad_w2_cublaslt(
         A.data_ptr(),
@@ -542,7 +591,11 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(E), int(H), int(Dff),
         stream,
       )
+      if _do_bwd_log:
+        print("[MOE-BWD] dW2 compute done", flush=True)
 
+      if _do_bwd_log:
+        print("[MOE-BWD] dW1 compute start", flush=True)
       dW1 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
       _C.bf16_wgrad_w13_cublaslt(
         Xe_pad.data_ptr(),
@@ -552,7 +605,11 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(E), int(H), int(Dff),
         stream,
       )
+      if _do_bwd_log:
+        print("[MOE-BWD] dW1 compute done", flush=True)
 
+      if _do_bwd_log:
+        print("[MOE-BWD] dW3 compute start", flush=True)
       dW3 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
       _C.bf16_wgrad_w13_cublaslt(
         Xe_pad.data_ptr(),
@@ -562,10 +619,15 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(E), int(H), int(Dff),
         stream,
       )
+      if _do_bwd_log:
+        print("[MOE-BWD] dW3 compute done", flush=True)
 
       dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
       dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
       del W1, W3, A, dH1, dH3, Xe_pad, dYe_pad
+
+    if _do_bwd_log:
+      print("[MOE-BWD] scatter_dx start", flush=True)
 
     dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
@@ -587,7 +649,15 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         stream,
       )
 
+    if _do_bwd_log:
+      print("[MOE-BWD] scatter_dx done", flush=True)
+
     dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
+
+    if _do_bwd_log:
+      print("[MOE-BWD] backward done", flush=True)
+
+    _moe_bwd_count += 1
 
     if fused_eco is not None:
       return None, dX, None, dGates, None, None, None, None, None, None
