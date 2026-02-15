@@ -412,8 +412,11 @@ def log_step_torchtitan(
     # Loss: mean across ranks (cheap scalar allreduce) for stable logging.
     loss_t = loss_value.detach().float()
     if world > 1 and dist.is_available() and dist.is_initialized():
+        # Move to CUDA for NCCL backend, then back to CPU
+        loss_t = loss_t.cuda()
         dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
         loss_t.div_(float(world))
+        loss_t = loss_t.cpu()
     loss_f = float(loss_t.item()) if is_rank0 else 0.0
 
     # Grad L2 norm
@@ -422,7 +425,10 @@ def log_step_torchtitan(
         local_norm = get_total_norm(grads, norm_type=2.0, foreach=True)
         norm2 = local_norm.float() * local_norm.float()
         if world > 1 and dist.is_available() and dist.is_initialized():
+            # Move to CUDA for NCCL backend, then back to CPU
+            norm2 = norm2.cuda()
             dist.all_reduce(norm2, op=dist.ReduceOp.SUM)
+            norm2 = norm2.cpu()
         grad_norm = float(norm2.sqrt().item()) if is_rank0 else 0.0
     else:
         grad_norm = 0.0
