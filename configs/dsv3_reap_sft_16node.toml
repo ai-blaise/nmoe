@@ -105,6 +105,7 @@ seq_len = 2048                   # Reduced from 4096 to further reduce activatio
 gradient_accumulation_steps = 2  # B=1 micro-batch per GPU (batch=32 / dp=16 / accum=2 = 1)
 resume = true
 grad_clip = 1.0
+log_every = 1                    # Log every step (default=10 is too coarse for short runs)
 
 # =============================================================================
 # Checkpointing

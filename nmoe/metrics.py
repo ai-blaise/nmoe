@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 import time
@@ -772,9 +773,18 @@ def start_metrics(run_id: Optional[str] = None,
                 id=rid,
                 resume="allow",
             )
+            if wandb_run is not None:
+                # Configure wandb to sync more frequently
+                wandb_run.define_metric("step", step_metric="step")
+                wandb_run.define_metric("loss", step_metric="step")
+                wandb_run.define_metric("grad_norm", step_metric="step")
         except Exception:
             logger.warning("metrics: W&B init failed, continuing without W&B", exc_info=True)
             wandb_run = None
+
+    # Safety net: ensure wandb data is flushed even if stop_metrics() is never called
+    if wandb_run is not None:
+        atexit.register(lambda: _wandb.finish() if _wandb is not None else None)
 
     return MetricsContext(
         writer=writer,
@@ -800,9 +810,20 @@ def stop_metrics(ctx: Optional[MetricsContext]) -> None:
         logger.debug("metrics: DuckDB writer close on stop", exc_info=True)
     try:
         if ctx.wandb_run is not None and _wandb is not None:
-            _wandb.finish()
+            print("[metrics] wandb.finish() starting – flushing buffered data …")
+            try:
+                _wandb.finish(timeout=60)
+            except TypeError:
+                # wandb < 0.25 does not support timeout kwarg
+                _wandb.finish()
+            print("[metrics] wandb.finish() completed successfully.")
     except Exception:
-        logger.debug("metrics: W&B finish", exc_info=True)
+        logger.warning("metrics: W&B finish failed or timed out, attempting fallback", exc_info=True)
+        try:
+            if _wandb is not None:
+                _wandb.finish(exit_code=1)
+        except Exception:
+            logger.debug("metrics: W&B fallback finish also failed", exc_info=True)
 
 
 def collect_router_stats(model: torch.nn.Module):
