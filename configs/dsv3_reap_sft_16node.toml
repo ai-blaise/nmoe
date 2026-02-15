@@ -100,9 +100,9 @@ gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a tim
 # =============================================================================
 steps = 10000
 dtype = "nvfp4"
-batch_size = 256                 # Global batch size (256 / DP=16 / accum=8 = 2 per micro-batch)
+batch_size = 256                 # Global batch size (256 / DP=16 / accum=16 = 1 per micro-batch)
 seq_len = 4096
-gradient_accumulation_steps = 8  # B=2 micro-batch per GPU (8.7 GiB activation headroom)
+gradient_accumulation_steps = 16 # B=1 micro-batch per GPU (reduced from 8 for OOM fix)
 resume = true
 grad_clip = 1.0
 
@@ -124,7 +124,7 @@ sft_packing_enabled = false      # Disabled for debugging - test basic SFT first
 
 # RDEP capacity override (worst-case token-expert dispatch slots per GPU)
 # Set to 0 to use auto-computed capacity: micro_batch * seq_len * K * ep_size
-# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 256 / (16 * 8) = 2
-# T per forward = micro_batch * seq_len = 2 * 4096 = 8,192
-# Auto-compute: 8192 * 8 * 8 = 524,288 (fits in GPU memory)
+# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 256 / (16 * 16) = 1
+# T per forward = micro_batch * seq_len = 1 * 4096 = 4,096
+# Auto-compute: 4096 * 8 * 8 = 262,144 (halved from 524,288 for OOM fix)
 rdep_capacity = 0
