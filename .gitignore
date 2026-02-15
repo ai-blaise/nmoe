@@ -80,3 +80,13 @@ Thumbs.db
 .niwa/
 experiments.db
 metrics/
+
+# LMDB databases (can be large)
+*.lmdb
+
+# Lock files
+uv.lock
+
+# Test scripts and utilities (local only)
+test_*.py
+run_sanitizer.sh
