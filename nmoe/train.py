@@ -251,7 +251,11 @@ def train(cfg: Config):
               logger.warning(f"[NAN] step={step_num} micro={micro_step}: logits contain NaN={nan_count} Inf={inf_count} (total={logits.numel()}, valid_max={logits_max:.4f})")
 
           with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
-            loss_unreduced = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
+            # Cast logits to FP32 before cross_entropy: BF16 softmax over vocab_size=129,280
+            # causes catastrophic precision loss, producing NaN gradients in the backward pass.
+            # The .float() is intentionally placed before .reshape() so the full tensor is in FP32
+            # and both the forward softmax and backward gradient computation use FP32 precision.
+            loss_unreduced = F.cross_entropy(logits.float().reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
             if loss_mask is not None:
               # SFT: use per-token loss mask from chat template (0=prompt, 1=response)
               mask = loss_mask.reshape(-1)
