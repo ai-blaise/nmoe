@@ -85,6 +85,10 @@ def _validate_training_config(cfg: Config, world: int) -> None:
 
 def train(cfg: Config):
   """Train MoE model. One clear path: forward → loss → backward → step → log → checkpoint."""
+  # Force line-buffered stdout so all print() output is immediately visible
+  # in log files (Python defaults to block-buffering when stdout is redirected)
+  sys.stdout.reconfigure(line_buffering=True)
+
   ep_size = getattr(cfg, 'ep_size', 1)
   rank, world = runtime.init(cfg.seed, ep_size=ep_size)
   _validate_training_config(cfg, world)
@@ -210,12 +214,16 @@ def train(cfg: Config):
         nan_weight_params.append(f"{name}(nan={nan_count},inf={inf_count},numel={p.numel()})")
     if nan_weight_params:
       logger.warning("[NAN] Model weights contain NaN/Inf after checkpoint load:")
+      print("[NAN] Model weights contain NaN/Inf after checkpoint load:", flush=True)
       for param_info in nan_weight_params[:20]:
         logger.warning(f"[NAN]   {param_info}")
+        print(f"[NAN]   {param_info}", flush=True)
       if len(nan_weight_params) > 20:
         logger.warning(f"[NAN]   ... and {len(nan_weight_params) - 20} more parameters")
+        print(f"[NAN]   ... and {len(nan_weight_params) - 20} more parameters", flush=True)
     else:
       logger.info("[NAN] Model weights sanity check passed: no NaN/Inf detected")
+      print("[NAN] Model weights sanity check passed: no NaN/Inf detected", flush=True)
 
   try:
     with nvtx_ctx('train/run'):
@@ -249,7 +257,9 @@ def train(cfg: Config):
             inf_count = torch.isinf(logits).sum().item()
             if nan_count > 0 or inf_count > 0:
               logits_max = logits[~torch.isnan(logits) & ~torch.isinf(logits)].abs().max().item() if (nan_count + inf_count) < logits.numel() else float('nan')
-              logger.warning(f"[NAN] step={step_num} micro={micro_step}: logits contain NaN={nan_count} Inf={inf_count} (total={logits.numel()}, valid_max={logits_max:.4f})")
+              _nan_msg = f"[NAN] step={step_num} micro={micro_step}: logits contain NaN={nan_count} Inf={inf_count} (total={logits.numel()}, valid_max={logits_max:.4f})"
+              logger.warning(_nan_msg)
+              print(_nan_msg, flush=True)
 
           with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
             # Cast logits to FP32 before cross_entropy: BF16 softmax over vocab_size=129,280
@@ -270,7 +280,9 @@ def train(cfg: Config):
 
           # === NaN/Inf detection in loss (BEFORE backward) ===
           if torch.isnan(loss) or torch.isinf(loss):
-            logger.warning(f"[NAN] step={step_num} micro={micro_step}: loss={loss.item()} (mask_sum={mask.sum().item():.0f}, loss_unreduced_max={loss_unreduced.max().item():.4f})")
+            _nan_msg = f"[NAN] step={step_num} micro={micro_step}: loss={loss.item()} (mask_sum={mask.sum().item():.0f}, loss_unreduced_max={loss_unreduced.max().item():.4f})"
+            logger.warning(_nan_msg)
+            print(_nan_msg, flush=True)
 
           # Zero gradients: on first micro-step, zero everything. On subsequent
           # micro-steps, only zero if no accumulation for dense params is needed.
@@ -317,12 +329,17 @@ def train(cfg: Config):
                         grad_stats = f", valid_max={valid_grads.abs().max().item():.4e}, valid_mean={valid_grads.abs().mean().item():.4e}"
                     nan_params.append(f"{name}(nan={nan_count},inf={inf_count},numel={p.grad.numel()}{grad_stats})")
         if nan_params:
-            logger.warning(f"[NAN] step={step_num}: total_nan={total_nan_count} total_inf={total_inf_count}")
+            _nan_msg = f"[NAN] step={step_num}: total_nan={total_nan_count} total_inf={total_inf_count}"
+            logger.warning(_nan_msg)
+            print(_nan_msg, flush=True)
             # Log first 10 affected params with details
             for param_info in nan_params[:10]:
                 logger.warning(f"[NAN]   {param_info}")
+                print(f"[NAN]   {param_info}", flush=True)
             if len(nan_params) > 10:
-                logger.warning(f"[NAN]   ... and {len(nan_params) - 10} more parameters with NaN/Inf gradients")
+                _nan_msg = f"[NAN]   ... and {len(nan_params) - 10} more parameters with NaN/Inf gradients"
+                logger.warning(_nan_msg)
+                print(_nan_msg, flush=True)
 
         # Gradient clipping (important for SFT stability with quantized training)
         # When fused_eco is active, expert grads are already consumed — only clip dense params.

@@ -463,6 +463,12 @@ def log_step_torchtitan(
         except Exception:
             logger.debug("metrics: node_tps computation", exc_info=True)
     print_fn(line)
+    # Ensure step metrics are immediately visible in log files
+    try:
+        import sys as _sys
+        _sys.stdout.flush()
+    except Exception:
+        pass
 
     out = {
         'tps': float(tps),
@@ -507,6 +513,12 @@ def log_router_stats(model: torch.nn.Module, print_fn: Callable[[str], None]) ->
         print_fn(f"router: aux {aux:.4f}  cv {cv_str}  max {mx:.2f}%  bias[{bmin:.2f},{bmax:.2f}]")
     else:
         print_fn(f"router: cv {cv_str}  max {mx:.2f}%  bias[{bmin:.2f},{bmax:.2f}]")
+    # Ensure router stats are immediately visible in log files
+    try:
+        import sys as _sys
+        _sys.stdout.flush()
+    except Exception:
+        pass
 
 
 # ==========================
