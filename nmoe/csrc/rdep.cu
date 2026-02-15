@@ -375,8 +375,12 @@ static void rdep_ensure_ipc_shared_buffer(size_t bytes_needed) {
     if (bytes_needed <= g_ipc_shared_bytes) return;
     if (g_ipc_handles_opened) {
         fprintf(stderr,
-                "RDEP ERROR: cannot resize IPC shared buffer after IPC handles are opened "
-                "(requested=%zu current=%zu). Allocate all profiles before opening handles.\n",
+                "RDEP FATAL: cannot resize IPC shared buffer after IPC handles are opened "
+                "(requested=%zu current=%zu). This indicates a configuration change between "
+                "alloc() and the current dispatch. Possible causes:\n"
+                "  1. rdep_alloc_bf16/blockscaled called with different capacity after IPC open\n"
+                "  2. Model configuration changed between init and training\n"
+                "Fix: ensure alloc() is called with final capacity BEFORE open_ipc_handles().\n",
                 bytes_needed, g_ipc_shared_bytes);
         abort();
     }
@@ -625,6 +629,10 @@ extern "C" void rdep_alloc_bf16(size_t capacity, int H, int n_local) {
 
 // Allocate local buffer (Blockscaled path)
 	extern "C" void rdep_alloc_blockscaled(size_t capacity, int H, int n_local, int profile) {
+    if (profile < 0 || profile > 1) {
+        fprintf(stderr, "RDEP FATAL: invalid profile=%d in rdep_alloc_blockscaled (must be 0=fp8 or 1=nvfp4)\n", profile);
+        abort();
+    }
     int pack_factor = (profile == 0) ? 2 : 4;
     int Hp = H / pack_factor;
     int Hsf = (H + SF_VEC - 1) / SF_VEC;
@@ -704,6 +712,38 @@ extern "C" void rdep_alloc_bf16(size_t capacity, int H, int n_local) {
 	        rdep_sync_buffer_ptrs_bf16();
 	    }
 	}
+
+// Read total dropped tokens from all ranks' buffers (BF16 path).
+// Must be called after dispatch_meta_bf16 with a stream sync.
+extern "C" int rdep_get_dropped_bf16(cudaStream_t stream) {
+    if (!g_bf16.initialized) return 0;
+    size_t x_off, meta_off, counter_off, dropped_off, barrier_off, buf_ptrs_off, sig_ptrs_off, tok_y_off, tok_gate_off, total_size;
+    bf16_buffer_offsets(g_bf16.capacity, g_bf16.Ha, g_bf16.world,
+                        &x_off, &meta_off, &counter_off, &dropped_off,
+                        &barrier_off, &buf_ptrs_off, &sig_ptrs_off,
+                        &tok_y_off, &tok_gate_off, &total_size);
+    // Read local dropped counter only (tokens dropped trying to write to OUR buffer)
+    char* local_buf = static_cast<char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
+    int dropped = 0;
+    cudaMemcpyAsync(&dropped, local_buf + dropped_off, sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    return dropped;
+}
+
+// Read total dropped tokens from all ranks' buffers (blockscaled path).
+extern "C" int rdep_get_dropped_blockscaled(cudaStream_t stream) {
+    if (!g_block.initialized) return 0;
+    size_t x_off, sfa_off, y_off, meta_off, counter_off, dropped_off, barrier_off, buf_ptrs_off, sig_ptrs_off, tok_y_off, tok_gate_off, total_size;
+    blockscaled_buffer_offsets(g_block.capacity, g_block.H, g_block.Hp, g_block.Hsf, g_block.world,
+                               &x_off, &sfa_off, &y_off, &meta_off, &counter_off, &dropped_off,
+                               &barrier_off, &buf_ptrs_off, &sig_ptrs_off,
+                               &tok_y_off, &tok_gate_off, &total_size);
+    char* local_buf = static_cast<char*>(g_block.buffer_ptrs[g_block.rank]);
+    int dropped = 0;
+    cudaMemcpyAsync(&dropped, local_buf + dropped_off, sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    return dropped;
+}
 
 // ============================================================================
 // IPC Dispatch Kernel - Direct P2P writes via IPC pointers
@@ -1128,6 +1168,12 @@ __global__ void k_dispatch_blockscaled(
     int num_warps = (gridDim.x * blockDim.x) / 32;
     int M = T * K;
 
+    // profile validated at alloc time; assert here for defense-in-depth
+    if (profile != 0 && profile != 1) {
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            printf("RDEP BUG: invalid profile=%d in k_dispatch_blockscaled\n", profile);
+        return;
+    }
     float dtype_max = (profile == 0) ? FP8_MAX : FP4_MAX;
 
     for (int i = warp_id; i < M; i += num_warps) {
@@ -4553,13 +4599,6 @@ extern "C" void rdep_scatter_dx_dist_bf16(
         int threads = 256;
         int blocks = std::max(1, (M * 32 + threads - 1) / threads);
 
-        // DEBUG: print parameters and buffer pointers before send kernel
-        fprintf(stderr, "DEBUG scatter_dx rank=%d: M=%d T=%d H=%d Ha=%d K=%d blocks=%d tok_y_off=%zu capacity=%zu\n",
-                g_bf16.rank, M, T, H, Ha, K, blocks, tok_y_off, g_bf16.capacity);
-        for (int r = 0; r < g_bf16.world; r++) {
-            fprintf(stderr, "  buffer_ptrs[%d] = %p\n", r, g_bf16.buffer_ptrs[r]);
-        }
-
         k_send_dx_tokslot_bf16<<<blocks, threads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(dXe_sorted),
             row_id,
@@ -4567,21 +4606,7 @@ extern "C" void rdep_scatter_dx_dist_bf16(
             g_bf16.world,
             tok_y_off);
 
-        // DEBUG: sync and check after send kernel
-        cudaError_t err1 = cudaStreamSynchronize(stream);
-        if (err1 != cudaSuccess) {
-            fprintf(stderr, "RDEP DEBUG: k_send_dx_tokslot_bf16 failed rank=%d err=%d (%s)\n",
-                    g_bf16.rank, err1, cudaGetErrorString(err1));
-        }
-
         ipc_barrier_bf16(stream);
-
-        // DEBUG: sync and check after barrier
-        cudaError_t err2 = cudaStreamSynchronize(stream);
-        if (err2 != cudaSuccess) {
-            fprintf(stderr, "RDEP DEBUG: ipc_barrier_bf16 failed rank=%d err=%d (%s)\n",
-                    g_bf16.rank, err2, cudaGetErrorString(err2));
-        }
 
         const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
         const uint16_t* tok_y = reinterpret_cast<const uint16_t*>(local_buf + tok_y_off);
@@ -4590,12 +4615,6 @@ extern "C" void rdep_scatter_dx_dist_bf16(
             static_cast<float*>(dX_out),
             T, H, Ha, K);
 
-        // DEBUG: sync and check after reduce kernel
-        cudaError_t err3 = cudaStreamSynchronize(stream);
-        if (err3 != cudaSuccess) {
-            fprintf(stderr, "RDEP DEBUG: k_reduce_tokslot_sum_bf16 failed rank=%d err=%d (%s)\n",
-                    g_bf16.rank, err3, cudaGetErrorString(err3));
-        }
         return;
     }
 

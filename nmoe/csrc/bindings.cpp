@@ -100,6 +100,10 @@ extern "C" {
   // Blockscaled path
   void rdep_alloc_blockscaled(size_t capacity, int H, int n_local, int profile);
 
+  // Dropped token counters (for capacity overflow detection)
+  int rdep_get_dropped_bf16(cudaStream_t stream);
+  int rdep_get_dropped_blockscaled(cudaStream_t stream);
+
   // Quantization and swizzle (dense/weights usage only)
   cudaError_t quant_fp8(const void* x, int ldx,
                         void* out, int ld_out,
@@ -538,6 +542,16 @@ PYBIND11_MODULE(rdep, m) {
     rdep_alloc_blockscaled(capacity, H, n_local, profile);
   }, py::arg("capacity"), py::arg("H"), py::arg("n_local"), py::arg("profile"),
      "Allocate blockscaled dispatch buffers (profile: 0=fp8, 1=nvfp4)");
+
+  m.def("get_dropped_bf16", [](py::object stream) {
+    return rdep_get_dropped_bf16(to_stream(stream));
+  }, py::arg("stream") = py::none(),
+     "Get count of tokens dropped due to capacity overflow (BF16 path)");
+
+  m.def("get_dropped_blockscaled", [](py::object stream) {
+    return rdep_get_dropped_blockscaled(to_stream(stream));
+  }, py::arg("stream") = py::none(),
+     "Get count of tokens dropped due to capacity overflow (blockscaled path)");
 
   m.def("dispatch_meta_blockscaled", [](uintptr_t x_ptr, uintptr_t eids_ptr, uintptr_t gates_ptr,
                                        int T, int K,

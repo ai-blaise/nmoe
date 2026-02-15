@@ -39,7 +39,10 @@ namespace ptx {
 // byte 254 = 2^127 (maximum, byte 255 reserved for NaN/Inf)
 
 __device__ __forceinline__ uint8_t e8m0_encode_from_pos_f32(float s) {
-    if (!(s > 0.0f)) return 0;
+    // Return neutral scale 2^0=1.0 (byte 127) for zero/negative input.
+    // Byte 0 would give 2^-127 ≈ 5.9e-39, causing near-zero inverse scale
+    // and effective data loss when quantizing an all-zero block.
+    if (!(s > 0.0f)) return 127;
     // Fast path: avoid log2f/exp2f. For normalized FP32:
     //   s = 2^(E-127) * (1.mantissa)
     //   ceil(log2(s)) = (E-127) + (mantissa != 0)
