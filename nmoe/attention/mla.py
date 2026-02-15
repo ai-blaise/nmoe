@@ -431,16 +431,14 @@ class MLA(nn.Module):
     q = q.view(bsz, seqlen, self.n_heads, self.qk_head_dim)
     q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
     q_pe = rotate_pe(q_pe, cos, sin)
-    q[..., self.qk_nope_head_dim:].copy_(q_pe)
+    q = torch.cat([q_nope, q_pe], dim=-1)
     kv = self.wkv_a(x)
     kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_pe = rotate_pe(k_pe.unsqueeze(2), cos, sin)
     kv = self.wkv_b(self.kv_norm(kv))
     kv = kv.view(bsz, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
     k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-    k = torch.empty((bsz, seqlen, self.n_heads, self.qk_head_dim), device=x.device, dtype=k_nope.dtype)
-    k[..., :self.qk_nope_head_dim].copy_(k_nope)
-    k[..., self.qk_nope_head_dim:].copy_(k_pe.expand(-1, -1, self.n_heads, -1))
+    k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
     with record_function("attn.kernel[mla]"):
       if cu_seqlens is not None:
         # Packed sequences: per-document SDPA with is_causal=True.

@@ -374,6 +374,18 @@ def train(cfg: Config):
           if fused_eco is not None:
             fused_eco.post_backward()
 
+          # === Per-micro-step NaN gradient diagnostic (first step only, rank 0) ===
+          if rank == 0 and step_num == start_step:
+            _micro_nan_params = 0
+            _micro_nan_total = 0
+            for _mn_name, _mn_p in model.named_parameters():
+              if _mn_p.grad is not None:
+                _mn_cnt = torch.isnan(_mn_p.grad).sum().item()
+                if _mn_cnt > 0:
+                  _micro_nan_params += 1
+                  _micro_nan_total += _mn_cnt
+            print(f"[MICRO-NAN] micro_step={micro_step}: nan_params={_micro_nan_params}, total_nan={_micro_nan_total}", flush=True)
+
           accumulated_loss += loss.detach().item() * (accum_steps if accum_steps > 1 else 1)
 
         # End of micro-batch loop. Now do optimizer step.
