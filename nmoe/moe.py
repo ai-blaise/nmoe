@@ -129,15 +129,19 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         stream,
       )
 
-    # Check for dropped tokens (capacity overflow)
-    dropped = _C.get_dropped_blockscaled(stream)
-    if dropped > 0:
-      import logging
-      logging.getLogger(__name__).warning(
-        f"[RDEP] {dropped:,} tokens dropped due to capacity overflow "
-        f"(capacity={rdep.capacity:,}, T={T}, K={K}). "
-        f"Increase rdep_capacity or reduce batch_size."
-      )
+    # Check for dropped tokens periodically (avoid per-call GPU-CPU sync)
+    if not hasattr(_MoEBlockscaledFused, '_dispatch_count'):
+      _MoEBlockscaledFused._dispatch_count = 0
+    _MoEBlockscaledFused._dispatch_count += 1
+    if _MoEBlockscaledFused._dispatch_count % 100 == 1:  # Check on 1st call and every 100th
+      dropped = _C.get_dropped_blockscaled(stream)
+      if dropped > 0:
+        import logging
+        logging.getLogger(__name__).warning(
+          f"[RDEP] {dropped:,} tokens dropped due to capacity overflow "
+          f"(capacity={rdep.capacity:,}, T={T}, K={K}). "
+          f"Increase rdep_capacity or reduce batch_size."
+        )
 
     out_f32 = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if M_recv <= 0:
