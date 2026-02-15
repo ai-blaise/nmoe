@@ -193,6 +193,29 @@ def train(cfg: Config):
     logger.info("Gradient accumulation: %d micro-steps per optimizer step", accum_steps)
     logger.info("Effective batch size: %d (micro_batch=%d x %d)", cfg.batch_size, cfg.batch_size // accum_steps, accum_steps)
 
+  # === Enable gradient anomaly detection for debugging (set NMOE_DETECT_ANOMALY=1) ===
+  if os.getenv('NMOE_DETECT_ANOMALY', '0') == '1':
+    torch.autograd.set_detect_anomaly(True)
+    if rank == 0:
+      logger.warning("[NAN] torch.autograd.detect_anomaly() ENABLED - expect 2-3x slower backward")
+
+  # === One-time model weight sanity check (after checkpoint load) ===
+  if rank == 0:
+    nan_weight_params = []
+    for name, p in model.named_parameters():
+      nan_count = torch.isnan(p.data).sum().item()
+      inf_count = torch.isinf(p.data).sum().item()
+      if nan_count > 0 or inf_count > 0:
+        nan_weight_params.append(f"{name}(nan={nan_count},inf={inf_count},numel={p.numel()})")
+    if nan_weight_params:
+      logger.warning("[NAN] Model weights contain NaN/Inf after checkpoint load:")
+      for param_info in nan_weight_params[:20]:
+        logger.warning(f"[NAN]   {param_info}")
+      if len(nan_weight_params) > 20:
+        logger.warning(f"[NAN]   ... and {len(nan_weight_params) - 20} more parameters")
+    else:
+      logger.info("[NAN] Model weights sanity check passed: no NaN/Inf detected")
+
   try:
     with nvtx_ctx('train/run'):
       for step_num in range(start_step, cfg.steps):
@@ -219,6 +242,14 @@ def train(cfg: Config):
           with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
             logits = model(inputs, cu_seqlens=cu_seqlens)
 
+          # === NaN/Inf detection in logits (BEFORE loss computation) ===
+          with torch.no_grad():
+            nan_count = torch.isnan(logits).sum().item()
+            inf_count = torch.isinf(logits).sum().item()
+            if nan_count > 0 or inf_count > 0:
+              logits_max = logits[~torch.isnan(logits) & ~torch.isinf(logits)].abs().max().item() if (nan_count + inf_count) < logits.numel() else float('nan')
+              logger.warning(f"[NAN] step={step_num} micro={micro_step}: logits contain NaN={nan_count} Inf={inf_count} (total={logits.numel()}, valid_max={logits_max:.4f})")
+
           with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
             loss_unreduced = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
             if loss_mask is not None:
@@ -231,6 +262,10 @@ def train(cfg: Config):
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
+
+          # === NaN/Inf detection in loss (BEFORE backward) ===
+          if torch.isnan(loss) or torch.isinf(loss):
+            logger.warning(f"[NAN] step={step_num} micro={micro_step}: loss={loss.item()} (mask_sum={mask.sum().item():.0f}, loss_unreduced_max={loss_unreduced.max().item():.4f})")
 
           # Zero gradients: on first micro-step, zero everything. On subsequent
           # micro-steps, only zero if no accumulation for dense params is needed.
@@ -258,11 +293,31 @@ def train(cfg: Config):
         # End of micro-batch loop. Now do optimizer step.
         loader_wait_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Detect NaN/Inf gradients for debugging (before clipping)
+        # === Enhanced NaN/Inf gradient detection (before clipping) ===
+        nan_params = []
+        total_nan_count = 0
+        total_inf_count = 0
         for name, p in model.named_parameters():
             if p.grad is not None:
-                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
-                    logger.warning(f"[GRAD] NaN/Inf detected in {name} (shape={p.grad.shape}, dtype={p.grad.dtype})")
+                nan_count = torch.isnan(p.grad).sum().item()
+                inf_count = torch.isinf(p.grad).sum().item()
+                if nan_count > 0 or inf_count > 0:
+                    total_nan_count += nan_count
+                    total_inf_count += inf_count
+                    # Get gradient statistics for valid elements
+                    valid_mask = ~torch.isnan(p.grad) & ~torch.isinf(p.grad)
+                    valid_grads = p.grad[valid_mask]
+                    grad_stats = ""
+                    if valid_grads.numel() > 0:
+                        grad_stats = f", valid_max={valid_grads.abs().max().item():.4e}, valid_mean={valid_grads.abs().mean().item():.4e}"
+                    nan_params.append(f"{name}(nan={nan_count},inf={inf_count},numel={p.grad.numel()}{grad_stats})")
+        if nan_params:
+            logger.warning(f"[NAN] step={step_num}: total_nan={total_nan_count} total_inf={total_inf_count}")
+            # Log first 10 affected params with details
+            for param_info in nan_params[:10]:
+                logger.warning(f"[NAN]   {param_info}")
+            if len(nan_params) > 10:
+                logger.warning(f"[NAN]   ... and {len(nan_params) - 10} more parameters with NaN/Inf gradients")
 
         # Gradient clipping (important for SFT stability with quantized training)
         # When fused_eco is active, expert grads are already consumed — only clip dense params.
