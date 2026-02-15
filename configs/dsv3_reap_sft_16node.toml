@@ -100,9 +100,9 @@ gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a tim
 # =============================================================================
 steps = 10000
 dtype = "nvfp4"
-batch_size = 256                 # Global batch size (256 / DP=16 / accum=16 = 1 per micro-batch)
+batch_size = 128                 # Global batch size (128 / DP=16 / accum=8 = 1 per micro-batch) - reduced from 256 for OOM fix
 seq_len = 4096
-gradient_accumulation_steps = 16 # B=1 micro-batch per GPU (reduced from 8 for OOM fix)
+gradient_accumulation_steps = 8  # B=1 micro-batch per GPU (batch=128 / dp=16 / accum=8 = 1)
 resume = true
 grad_clip = 1.0
 
