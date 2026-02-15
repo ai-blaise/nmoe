@@ -301,14 +301,10 @@ def train(cfg: Config):
             logits = model(inputs, cu_seqlens=cu_seqlens)
           if rank == 0 and step_num == start_step:
             print("[TRAIN] forward done, logits computed", flush=True)
-            # Register backward hook on logits to trace when lm_head backward starts.
+            # Register backward hooks to trace where NaN enters the gradient flow.
             # The gradient flows: loss -> cross_entropy -> logits_fp32 -> .float() -> logits.
-            # This hook fires when gradient arrives at the BF16 logits tensor, meaning
-            # the lm_head weight gradient is about to be computed next.
             if logits.requires_grad:
-              logits.register_hook(
-                lambda grad: print("[BWD] logits grad received (entering lm_head backward)", flush=True)
-              )
+              logits.register_hook(lambda grad: print(f"[GRAD-CHECK] logits grad: nan={grad.isnan().sum().item()}/{grad.numel()} inf={grad.isinf().sum().item()} max={grad[~grad.isnan()].abs().max().item() if (~grad.isnan()).any() else 'all_nan'}", flush=True))
 
           # === NaN/Inf detection in logits (BEFORE loss computation) ===
           with torch.no_grad():
@@ -341,6 +337,11 @@ def train(cfg: Config):
               loss = loss / accum_steps
           if rank == 0 and step_num == start_step:
             print("[TRAIN] loss computed", flush=True)
+            # Register gradient flow diagnostic hooks on FP32 logits and loss_unreduced
+            if logits_fp32.requires_grad:
+              logits_fp32.register_hook(lambda grad: print(f"[GRAD-CHECK] logits_fp32 grad: nan={grad.isnan().sum().item()}/{grad.numel()} inf={grad.isinf().sum().item()}", flush=True))
+            if loss_unreduced.requires_grad:
+              loss_unreduced.register_hook(lambda grad: print(f"[GRAD-CHECK] loss_unreduced grad: nan={grad.isnan().sum().item()}/{grad.numel()} inf={grad.isinf().sum().item()}", flush=True))
 
           # === NaN/Inf detection in loss (BEFORE backward) ===
           if torch.isnan(loss) or torch.isinf(loss):
@@ -409,21 +410,29 @@ def train(cfg: Config):
                 logger.warning(_nan_msg)
                 print(_nan_msg, flush=True)
 
-        # Gradient clipping (important for SFT stability with quantized training)
-        # When fused_eco is active, expert grads are already consumed — only clip dense params.
-        # Dense gradients accumulate across micro-steps (autograd adds them).
-        grad_clip = getattr(cfg, 'grad_clip', 0.0)
-        if grad_clip > 0:
-          if fused_eco is not None:
-            # Only clip dense parameters (expert grads already consumed in backward)
-            dense_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-            if dense_params:
-              torch.nn.utils.clip_grad_norm_(dense_params, grad_clip)
-          else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # NaN gradient guard: skip optimizer step to prevent weight corruption
+        if total_nan_count > 0 or total_inf_count > 0:
+            if rank == 0:
+                print(f"[NAN-GUARD] Skipping optimizer step {step_num} due to {total_nan_count} NaN + {total_inf_count} Inf gradient elements", flush=True)
+            # Zero out all gradients to prevent stale NaN from accumulating
+            model.zero_grad(set_to_none=True)
+        else:
+            # Only clip and step when gradients are clean
+            # Gradient clipping (important for SFT stability with quantized training)
+            # When fused_eco is active, expert grads are already consumed — only clip dense params.
+            # Dense gradients accumulate across micro-steps (autograd adds them).
+            grad_clip = getattr(cfg, 'grad_clip', 0.0)
+            if grad_clip > 0:
+              if fused_eco is not None:
+                # Only clip dense parameters (expert grads already consumed in backward)
+                dense_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+                if dense_params:
+                  torch.nn.utils.clip_grad_norm_(dense_params, grad_clip)
+              else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        with nvtx_ctx('train/opt_step'), time_ctx('time_ms/opt_step'):
-          step(model, optimizer, dense_groups, zero2_state, cfg, world)
+            with nvtx_ctx('train/opt_step'), time_ctx('time_ms/opt_step'):
+              step(model, optimizer, dense_groups, zero2_state, cfg, world)
 
         tokens_this_step = int(inputs.numel()) * accum_steps
         tokens_seen += cfg.batch_size * cfg.seq_len

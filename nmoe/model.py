@@ -627,6 +627,8 @@ class Transformer(nn.Module):
           print("[FWD] layer 0 done", flush=True)
         if i == _n_blocks - 1:
           print(f"[FWD] layer {i} (last) done", flush=True)
+      if _is_first and _rank0 and i in (0, 30, 60):
+        x.register_hook(lambda g, layer=i: print(f"[GRAD-CHECK] layer {layer} output grad: nan={g.isnan().sum().item()}/{g.numel()} inf={g.isinf().sum().item()}", flush=True))
     with torch.no_grad():
       moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
       if moe_layers:
@@ -644,6 +646,9 @@ class Transformer(nn.Module):
       print("[FWD] all layers done, computing lm_head", flush=True)
     with record_function("norm_f"):
       x = self.norm(x)
+    # Hook on lm_head input to trace gradient flow through the final norm -> lm_head boundary
+    if _is_first and _rank0:
+      x.register_hook(lambda g: print(f"[GRAD-CHECK] lm_head_input (after last layer) grad: nan={g.isnan().sum().item()}/{g.numel()} inf={g.isinf().sum().item()}", flush=True))
     # Dynamic amax scaling handles range - no clamp needed (TorchTitan/Megatron pattern)
     with record_function("lm_head"):
       logits = self.lm_head(x) * self.logits_scale_factor
