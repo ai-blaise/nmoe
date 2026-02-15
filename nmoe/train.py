@@ -250,6 +250,8 @@ def train(cfg: Config):
 
           with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
             logits = model(inputs, cu_seqlens=cu_seqlens)
+          if rank == 0 and step_num == start_step:
+            print("[TRAIN] forward done, logits computed", flush=True)
 
           # === NaN/Inf detection in logits (BEFORE loss computation) ===
           with torch.no_grad():
@@ -266,7 +268,10 @@ def train(cfg: Config):
             # causes catastrophic precision loss, producing NaN gradients in the backward pass.
             # The .float() is intentionally placed before .reshape() so the full tensor is in FP32
             # and both the forward softmax and backward gradient computation use FP32 precision.
-            loss_unreduced = F.cross_entropy(logits.float().reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
+            logits_fp32 = logits.float()
+            if rank == 0 and step_num == start_step:
+              print("[TRAIN] logits cast to FP32", flush=True)
+            loss_unreduced = F.cross_entropy(logits_fp32.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
             if loss_mask is not None:
               # SFT: use per-token loss mask from chat template (0=prompt, 1=response)
               mask = loss_mask.reshape(-1)
@@ -277,6 +282,8 @@ def train(cfg: Config):
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
+          if rank == 0 and step_num == start_step:
+            print("[TRAIN] loss computed", flush=True)
 
           # === NaN/Inf detection in loss (BEFORE backward) ===
           if torch.isnan(loss) or torch.isinf(loss):
@@ -300,8 +307,12 @@ def train(cfg: Config):
             fused_eco.set_lr(lr_expert)
             fused_eco.set_microstep(micro_step, accum_steps)
             fused_eco.pre_backward(step_num)
+          if rank == 0 and step_num == start_step:
+            print("[TRAIN] starting backward", flush=True)
           with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
             loss.backward()
+          if rank == 0 and step_num == start_step:
+            print("[TRAIN] backward done", flush=True)
           if fused_eco is not None:
             fused_eco.post_backward()
 
@@ -410,6 +421,8 @@ def train(cfg: Config):
           checkpointer, s, tokens_seen, model, optimizer, loader, plan,
           zero2_state, cfg, rank, config_fingerprint, checkpoint_every, print
         )
+        if rank == 0 and step_num == start_step:
+          print("[TRAIN] step done", flush=True)
 
     if rank == 0:
       logger.info("Training complete. %s tokens.", f"{tokens_seen:,}")

@@ -511,6 +511,7 @@ class Transformer(nn.Module):
     # μP scaling (validated via proxy sweep - both scales needed for proper gradient flow)
     self.mup_scale_factor = 10.667
     self.logits_scale_factor = 0.125
+    self._fwd_call_count = 0  # instrumentation: track forward calls for first-step-only prints
 
   def init_weights(self):
     nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
@@ -609,19 +610,23 @@ class Transformer(nn.Module):
       # Standard sequential positions
       cos = self.rope.cos[:seqlen]
       sin = self.rope.sin[:seqlen]
-    if dist.is_initialized() and dist.get_rank() == 0:
+    _is_first = self._fwd_call_count == 0
+    _rank0 = dist.is_initialized() and dist.get_rank() == 0
+    if _rank0 and _is_first:
       print("[FWD] starting forward pass", flush=True)
     _n_blocks = len(self.blocks)
     for i, block in enumerate(self.blocks):
-      if i == 0 and dist.is_initialized() and dist.get_rank() == 0:
-        print("[FWD] layer 0 start", flush=True)
-      if i == _n_blocks - 1 and dist.is_initialized() and dist.get_rank() == 0:
-        print(f"[FWD] layer {i} (last) start", flush=True)
+      if _rank0 and _is_first:
+        if i == 0:
+          print("[FWD] layer 0 start", flush=True)
+        if i == _n_blocks - 1:
+          print(f"[FWD] layer {i} (last) start", flush=True)
       x = block(x, cos, sin, cu_seqlens=cu_seqlens)
-      if i == 0 and dist.is_initialized() and dist.get_rank() == 0:
-        print("[FWD] layer 0 done", flush=True)
-      if i == _n_blocks - 1 and dist.is_initialized() and dist.get_rank() == 0:
-        print(f"[FWD] layer {i} (last) done", flush=True)
+      if _rank0 and _is_first:
+        if i == 0:
+          print("[FWD] layer 0 done", flush=True)
+        if i == _n_blocks - 1:
+          print(f"[FWD] layer {i} (last) done", flush=True)
     with torch.no_grad():
       moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
       if moe_layers:
@@ -635,14 +640,17 @@ class Transformer(nn.Module):
         loads = loads / loads.sum(dim=-1, keepdim=True).clamp_min(1.0)
         for m, l in zip(moe_layers, loads):
           m.last_loads = l
-    if dist.is_initialized() and dist.get_rank() == 0:
+    if _rank0 and _is_first:
       print("[FWD] all layers done, computing lm_head", flush=True)
     with record_function("norm_f"):
       x = self.norm(x)
     # Dynamic amax scaling handles range - no clamp needed (TorchTitan/Megatron pattern)
     with record_function("lm_head"):
       logits = self.lm_head(x) * self.logits_scale_factor
+    if _rank0 and _is_first:
+      print("[FWD] lm_head done, returning logits", flush=True)
 
+    self._fwd_call_count += 1
     return logits
 
   def get_router_aux_loss(self) -> torch.Tensor:
