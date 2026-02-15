@@ -299,13 +299,37 @@ class FusedBackwardECO:
         """Attach to model: disable gradients on expert params, free BF16 storage.
 
         Must be called AFTER checkpoint loading (so NVFP4 buffers are populated).
+
+        Raises:
+            RuntimeError: If any MoE module does not have NVFP4 primary buffers set.
+                          eco_fused_backward requires ALL MoE modules to be in NVFP4
+                          primary mode. This ensures the fused backward path is used
+                          consistently across all layers.
         """
-        for moe in self._moes:
-            if not getattr(moe, '_nvfp4_primary', False):
+        failed_modules = []
+        attached_count = 0
+
+        for i, moe in enumerate(self._moes):
+            # Check NVFP4 primary mode
+            nvfp4_primary = getattr(moe, '_nvfp4_primary', False)
+            has_w1_packed = getattr(moe, '_W1_packed', None) is not None
+
+            if not nvfp4_primary:
+                # Log diagnostic info for debugging
                 logger.warning(
-                    f"MoE module does not have NVFP4 primary buffers set. "
-                    f"Call set_nvfp4_buffers() or load checkpoint first."
+                    f"MoE module {i} does not have _nvfp4_primary=True. "
+                    f"has_W1_packed={has_w1_packed}, "
+                    f"W1.shape={getattr(moe.W1, 'shape', 'N/A') if hasattr(moe, 'W1') else 'N/A'}"
                 )
+                failed_modules.append(i)
+                continue
+
+            if not has_w1_packed:
+                logger.warning(
+                    f"MoE module {i} has _nvfp4_primary=True but _W1_packed is None. "
+                    f"This indicates incomplete NVFP4 buffer initialization."
+                )
+                failed_modules.append(i)
                 continue
 
             # Disable gradient tracking on expert params
@@ -318,10 +342,23 @@ class FusedBackwardECO:
 
             # Set the fused_eco reference on the module
             moe._fused_eco = self
+            attached_count += 1
+
+        # CRITICAL: Fail if any modules didn't attach. eco_fused_backward requires
+        # ALL MoE modules to use the fused path. Partial attachment would cause
+        # crashes in backward (standard path with freed BF16 params).
+        if failed_modules:
+            raise RuntimeError(
+                f"eco_fused_backward=True but {len(failed_modules)}/{len(self._moes)} "
+                f"MoE modules failed to attach (indices: {failed_modules[:10]}{'...' if len(failed_modules) > 10 else ''}). "
+                f"NVFP4 primary buffers must be set for ALL MoE modules before attach(). "
+                f"Check that: 1) checkpoint has NVFP4 data, 2) load_checkpoint() ran successfully, "
+                f"3) EP sharding matches between checkpoint and current config."
+            )
 
         logger.info(
             f"FusedBackwardECO attached: freed BF16 expert params, "
-            f"disabled requires_grad on {len(self._moes)} MoE modules"
+            f"disabled requires_grad on {attached_count}/{len(self._moes)} MoE modules"
         )
 
     def _get_or_init_state(self, moe: nn.Module, param_name: str) -> dict:

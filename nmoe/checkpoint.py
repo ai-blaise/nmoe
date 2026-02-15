@@ -1293,10 +1293,13 @@ def load_nvfp4_expert_buffers(
         # `if self._W_cache is None: self.refresh_weight_cache()`.  By forward time,
         # the freed BF16 memory provides ample headroom for cache construction.
         freed_bytes = 0
-        for moe in moe_modules.values():
+        nvfp4_set_count = 0
+        nvfp4_missing_count = 0
+        for layer_id, moe in moe_modules.items():
             if moe._W1_packed is not None:
                 moe._nvfp4_primary = True
                 moe._nvfp4_group_size = group_size
+                nvfp4_set_count += 1
                 # Do NOT call refresh_weight_cache() here — defer to first forward
                 # pass when GPU memory pressure is much lower.
                 moe._W_cache = None
@@ -1313,15 +1316,23 @@ def load_nvfp4_expert_buffers(
                     freed_bytes += param.data.nelement() * param.data.element_size()
                     param.data = torch.empty(0, dtype=torch.bfloat16, device=dev)
                     param.requires_grad_(False)
+            else:
+                nvfp4_missing_count += 1
+                print_fn(f"[nvfp4] WARNING: MoE layer {layer_id} has _W1_packed=None after loading!")
 
         freed_gib = freed_bytes / (1024 ** 3)
         print_fn(f"[nvfp4] Loaded {loaded_count} NVFP4 triplets directly to GPU buffers "
                  f"(Option C: NVFP4 primary, no BF16 master)")
+        print_fn(f"[nvfp4] Set _nvfp4_primary=True for {nvfp4_set_count}/{len(moe_modules)} MoE modules")
+        if nvfp4_missing_count > 0:
+            print_fn(f"[nvfp4] WARNING: {nvfp4_missing_count} MoE modules have no NVFP4 buffers!")
         if freed_bytes > 0:
             print_fn(f"[nvfp4] Freed {freed_gib:.1f} GiB of redundant BF16 expert parameters")
         print_fn(f"[nvfp4] Weight cache deferred to first forward pass (lazy build)")
         return True
 
+    print_fn(f"[nvfp4] WARNING: No NVFP4 triplets loaded (loaded_count=0). "
+             f"Total MoE modules found: {len(moe_modules)}")
     return False
 
 
@@ -2196,10 +2207,13 @@ def load_checkpoint(
     tokens_seen = 0
     zero2_state = {}
 
+    eco_fused = getattr(cfg, 'eco_fused_backward', False)
     if getattr(cfg, 'resume', True):
         step, path = checkpointer.find_latest()
         if path is not None:
-            nvfp4_direct = getattr(cfg, 'eco_enabled', False) or getattr(cfg, 'eco_fused_backward', False)
+            nvfp4_direct = getattr(cfg, 'eco_enabled', False) or eco_fused
+            if rank == 0 and nvfp4_direct:
+                print_fn(f"[checkpoint] Loading with nvfp4_direct=True (eco_fused_backward={eco_fused})")
             start_step, tokens_seen, z2 = load_state(
                 path, model, optimizer, loader, print_fn,
                 nvfp4_direct=nvfp4_direct,
@@ -2208,6 +2222,12 @@ def load_checkpoint(
                 zero2_state = z2
             if rank == 0:
                 print_fn(f"[nmoe] Resumed from step {start_step}, {tokens_seen:,} tokens")
+        elif rank == 0:
+            print_fn(f"[checkpoint] No checkpoint found at {checkpointer.base}")
+            if eco_fused:
+                print_fn(f"[checkpoint] WARNING: eco_fused_backward=True requires a valid NVFP4 checkpoint!")
+    elif rank == 0:
+        print_fn(f"[checkpoint] resume=False, starting fresh")
 
     return start_step, tokens_seen, zero2_state
 
