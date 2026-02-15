@@ -120,7 +120,7 @@ sft_enabled = true
 sft_data_path = "/home/nourdine/sft_data"
 sft_mask_prompt_loss = true      # Only compute loss on assistant response tokens
 sft_prompt_format = "deepseekv32"
-sft_packing_enabled = true       # FFD bin-packing: 2-3x throughput, zero memory cost
+sft_packing_enabled = false      # Disabled for debugging - test basic SFT first
 
 # RDEP capacity override (worst-case token-expert dispatch slots per GPU)
 # Set to 0 to use auto-computed capacity: micro_batch * seq_len * K * ep_size
