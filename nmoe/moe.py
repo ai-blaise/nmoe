@@ -534,9 +534,13 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
       dX_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
+      # DEBUG: print params before gather_from_pad
+      import sys
+      print(f"[DEBUG] gather_from_pad: M_recv={M_recv} H={H} dX_pad.shape={dX_pad.shape}", file=sys.stderr, flush=True)
       _C.gather_from_pad_bf16(dX_pad.data_ptr(), dX_sorted.data_ptr(), int(M_recv), int(H), stream)
       # DEBUG: sync and check error after gather_from_pad
       torch.cuda.synchronize()
+      print(f"[DEBUG] gather_from_pad done, calling scatter_dx_dist: M_recv={M_recv} T={T} H={H} K={K}", file=sys.stderr, flush=True)
       _C.scatter_dx_dist_bf16(
         dX_sorted.data_ptr(),
         row_id.data_ptr(),
@@ -545,7 +549,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         stream,
       )
       # DEBUG: sync and check error after scatter_dx_dist
+      print(f"[DEBUG] scatter_dx_dist done, syncing...", file=sys.stderr, flush=True)
       torch.cuda.synchronize()
+      print(f"[DEBUG] scatter_dx_dist sync complete", file=sys.stderr, flush=True)
     else:
       _C.scatter_dx_bf16_internal(
         dX_pad.data_ptr(),
