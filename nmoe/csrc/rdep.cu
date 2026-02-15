@@ -4538,6 +4538,11 @@ extern "C" void rdep_scatter_dx_dist_bf16(
 
         int threads = 256;
         int blocks = std::max(1, (M * 32 + threads - 1) / threads);
+
+        // DEBUG: print parameters before send kernel
+        fprintf(stderr, "DEBUG scatter_dx rank=%d: M=%d T=%d H=%d Ha=%d K=%d blocks=%d tok_y_off=%zu\n",
+                g_bf16.rank, M, T, H, Ha, K, blocks, tok_y_off);
+
         k_send_dx_tokslot_bf16<<<blocks, threads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(dXe_sorted),
             row_id,
@@ -4545,7 +4550,21 @@ extern "C" void rdep_scatter_dx_dist_bf16(
             g_bf16.world,
             tok_y_off);
 
+        // DEBUG: sync and check after send kernel
+        cudaError_t err1 = cudaStreamSynchronize(stream);
+        if (err1 != cudaSuccess) {
+            fprintf(stderr, "RDEP DEBUG: k_send_dx_tokslot_bf16 failed rank=%d err=%d (%s)\n",
+                    g_bf16.rank, err1, cudaGetErrorString(err1));
+        }
+
         ipc_barrier_bf16(stream);
+
+        // DEBUG: sync and check after barrier
+        cudaError_t err2 = cudaStreamSynchronize(stream);
+        if (err2 != cudaSuccess) {
+            fprintf(stderr, "RDEP DEBUG: ipc_barrier_bf16 failed rank=%d err=%d (%s)\n",
+                    g_bf16.rank, err2, cudaGetErrorString(err2));
+        }
 
         const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
         const uint16_t* tok_y = reinterpret_cast<const uint16_t*>(local_buf + tok_y_off);
@@ -4553,6 +4572,13 @@ extern "C" void rdep_scatter_dx_dist_bf16(
             tok_y,
             static_cast<float*>(dX_out),
             T, H, Ha, K);
+
+        // DEBUG: sync and check after reduce kernel
+        cudaError_t err3 = cudaStreamSynchronize(stream);
+        if (err3 != cudaSuccess) {
+            fprintf(stderr, "RDEP DEBUG: k_reduce_tokslot_sum_bf16 failed rank=%d err=%d (%s)\n",
+                    g_bf16.rank, err3, cudaGetErrorString(err3));
+        }
         return;
     }
 
