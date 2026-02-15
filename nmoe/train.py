@@ -32,6 +32,7 @@ from nmoe import runtime
 from nmoe.eval.hooks import maybe_schedule_eval
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
