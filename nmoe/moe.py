@@ -527,12 +527,16 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
       dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
       dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+      # DEBUG: sync after grouped_mm operations
+      torch.cuda.synchronize()
       del W1, W3, A, dH1, dH3, Xe_pad, dYe_pad
 
     dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
       dX_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
       _C.gather_from_pad_bf16(dX_pad.data_ptr(), dX_sorted.data_ptr(), int(M_recv), int(H), stream)
+      # DEBUG: sync and check error after gather_from_pad
+      torch.cuda.synchronize()
       _C.scatter_dx_dist_bf16(
         dX_sorted.data_ptr(),
         row_id.data_ptr(),
@@ -540,6 +544,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(M_recv), int(T), int(H), int(K),
         stream,
       )
+      # DEBUG: sync and check error after scatter_dx_dist
+      torch.cuda.synchronize()
     else:
       _C.scatter_dx_bf16_internal(
         dX_pad.data_ptr(),
