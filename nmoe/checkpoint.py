@@ -42,6 +42,26 @@ def _world_size() -> int:
     return dist.get_world_size() if _is_dist() else 1
 
 
+def _ep_rank() -> int:
+    """Get the EP rank for checkpoint loading.
+
+    With EP sharding, each DP replica loads the same checkpoint shard.
+    The EP rank determines which shard to load (0 to ep_size-1).
+
+    Uses the nmoe distributed init_groups module if available, falling back
+    to global rank if not (which works for EP=1 or non-EP configs).
+    """
+    try:
+        from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_ep_rank
+        if is_nmoe_parallel_initialized():
+            return get_ep_rank()
+    except ImportError:
+        pass
+
+    # Fallback: global rank (works for EP=1 or when nmoe groups not initialized)
+    return _rank()
+
+
 def iteration_dir(base: str | Path, step: int) -> str:
     return str(Path(base) / f"iter_{step:07d}")
 
@@ -661,8 +681,17 @@ class Checkpointer:
         return path
 
     def find_latest(self) -> tuple[int, str] | tuple[int, None]:
+        """Find the latest checkpoint for this rank.
+
+        With EP sharding (ep_size > 1), uses EP rank instead of global rank
+        to determine which dp_rank_XXX.pt file to load. This ensures that
+        all DP replicas of the same EP rank load the same checkpoint shard.
+        """
+        # Use EP rank for checkpoint file selection (handles EP>1 correctly)
+        ep_r = _ep_rank()
+
         def _candidate(step: int) -> str:
-            return os.path.join(iteration_dir(self.base, step), f"dp_rank_{_rank():03d}.pt")
+            return os.path.join(iteration_dir(self.base, step), f"dp_rank_{ep_r:03d}.pt")
 
         step = read_tracker(self.base)
         if step > 0:
@@ -681,7 +710,7 @@ class Checkpointer:
                 continue
             if not (p / "manifest.json").exists():
                 continue
-            path = str(p / f"dp_rank_{_rank():03d}.pt")
+            path = str(p / f"dp_rank_{ep_r:03d}.pt")
             if os.path.exists(path):
                 return s, path
         return -1, None
