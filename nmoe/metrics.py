@@ -813,7 +813,7 @@ def collect_router_stats(model: torch.nn.Module):
             m = l.mean()
             if m.item() != 0.0:
                 cv = (l.std(unbiased=False) / m * 100.0).item()
-            mx = (l.max() * 100.0).item()
+            mx = (l.max() / l.sum().clamp_min(1e-9) * 100.0).item()
             p = (l / l.sum().clamp_min(1e-9)).clamp_min(1e-12)
             ent = float((-p * p.log()).sum().item())
             dead_total += int((l <= 0).sum().item())

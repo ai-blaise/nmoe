@@ -258,6 +258,12 @@ def train(cfg: Config):
         # End of micro-batch loop. Now do optimizer step.
         loader_wait_ms = (time.perf_counter() - t0) * 1000.0
 
+        # Detect NaN/Inf gradients for debugging (before clipping)
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    logger.warning(f"[GRAD] NaN/Inf detected in {name} (shape={p.grad.shape}, dtype={p.grad.dtype})")
+
         # Gradient clipping (important for SFT stability with quantized training)
         # When fused_eco is active, expert grads are already consumed — only clip dense params.
         # Dense gradients accumulate across micro-steps (autograd adds them).
