@@ -567,19 +567,22 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       if _do_bwd_log:
         print("[MOE-BWD] dW3 compute done", flush=True)
       del Xe_pad  # Free ~1.2 GiB before grouped_mm allocation
+
+      # Phase E: dX += W3.T contribution — re-dequant W3 BEFORE fused_update
+      # modifies the NVFP4 buffers in-place, so dX uses the ORIGINAL W3.
+      # Xe_pad freed above; now we have room for grouped_mm temp (~1.23 GiB).
+      W3 = dequant_nvfp4_to_bf16_transient(
+        moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
+      dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+      del W3, dH3  # Free ~1.3 GiB + dH3
+
+      # Phase F: fused_update for W3 — AFTER dX has been computed from original W3.
       if _do_bwd_log:
         print("[MOE-BWD] eco_update W3 start", flush=True)
       fused_eco.fused_update(moe_ref, 'W3', dW3)
       if _do_bwd_log:
         print("[MOE-BWD] eco_update W3 done", flush=True)
       del dW3
-
-      # Phase E: dX += W3.T contribution — re-dequant W3 (was freed after H3 recompute).
-      # Xe_pad freed above; now we have room for grouped_mm temp (~1.23 GiB).
-      W3 = dequant_nvfp4_to_bf16_transient(
-        moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
-      dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
-      del W3, dH3  # Free ~1.3 GiB + dH3
       fused_eco.refresh_layer_cache(moe_ref)
 
     else:
