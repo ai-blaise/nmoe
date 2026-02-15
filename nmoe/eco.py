@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import math
 import logging
+from collections import deque
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
@@ -38,6 +40,19 @@ if not hasattr(torch, 'float8_e5m2') or not hasattr(torch, 'float8_e4m3fn'):
         f"PyTorch {torch.__version__} does not support FP8 dtypes (float8_e5m2, float8_e4m3fn). "
         f"ECO requires PyTorch >= 2.1. Upgrade PyTorch or disable ECO."
     )
+
+
+@dataclass
+class PendingAllReduce:
+    """Pending async all-reduce operation with deferred optimizer step."""
+    work: object  # dist.Work handle
+    grad: torch.Tensor  # FP32 gradient buffer (kept alive until work completes)
+    moe: object  # MoE module reference
+    param_name: str
+    state: dict  # optimizer state dict
+    beta1_eff: float
+    beta2_eff: float
+    is_accumulating: bool
 
 
 # ============================================================================
@@ -135,6 +150,10 @@ class FusedBackwardECO:
         # Gradient accumulation state
         self._accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
         self._current_microstep = 0  # Set by training loop via set_microstep()
+
+        # Async all-reduce queue: deferred optimizer steps overlapping with compute
+        self._pending_queue: deque[PendingAllReduce] = deque()
+        self._max_pending: int = 4  # Memory-bounded: 4 × ~896 MiB ≈ 3.6 GiB (fits in ~10 GiB headroom)
 
         # CUDA kernel requirement: fail fast if kernels are unavailable
         self._require_cuda = getattr(cfg, 'eco_require_cuda', True)
@@ -437,6 +456,11 @@ class FusedBackwardECO:
 
     def post_backward(self):
         """Finalize after backward pass. Call after loss.backward()."""
+        # Drain all pending async all-reduce ops before finalizing the step.
+        # This ensures every deferred optimizer step completes before we
+        # compute the global gradient norm for next step's clipping.
+        self._drain_all()
+
         # Update global norm estimate for next step's clipping.
         # Single .item() call here replaces 174 per-weight GPU-CPU syncs.
         if self._norm_sq_gpu is not None:
@@ -581,6 +605,69 @@ class FusedBackwardECO:
 
         return True
 
+    def _drain_one(self) -> None:
+        """Wait for the oldest pending async all-reduce and run its optimizer step.
+
+        Pops the oldest entry from _pending_queue, blocks until its all_reduce
+        completes, then runs gradient clipping + optimizer update (accumulate
+        or full Adam step). Frees the FP32 gradient buffer afterwards.
+        """
+        if not self._pending_queue:
+            return
+
+        pending = self._pending_queue.popleft()
+        pending.work.wait()
+
+        grad = pending.grad
+
+        # Gradient clipping using previous step's global norm estimate.
+        if self.grad_clip > 0 and not pending.is_accumulating:
+            grad_flat = grad.reshape(-1)
+            grad_norm_sq = torch.dot(grad_flat, grad_flat)
+            if self._norm_sq_gpu is None:
+                self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
+            self._norm_sq_gpu += grad_norm_sq
+            if self._step_count > 1:
+                clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
+                if clip_coeff < 1.0:
+                    grad.mul_(clip_coeff)
+
+        if pending.is_accumulating:
+            self._cuda_mv_accumulate(
+                pending.moe, pending.param_name, grad, pending.state,
+                pending.beta1_eff, pending.beta2_eff,
+            )
+        else:
+            pending.state["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
+            self._cuda_fused_update(
+                pending.moe, pending.param_name, grad, pending.state,
+                beta1_eff=pending.beta1_eff, beta2_eff=pending.beta2_eff,
+            )
+
+        del pending.grad  # Free FP32 buffer
+
+    def _drain_completed(self) -> None:
+        """Non-blockingly drain all entries whose NCCL ops have already completed.
+
+        Uses work.is_completed() to avoid CPU blocking. Processes entries in
+        FIFO order — stops at the first incomplete entry to maintain ordering.
+        """
+        while self._pending_queue:
+            entry = self._pending_queue[0]
+            if entry.work.is_completed():
+                self._drain_one()  # Instant — work.wait() returns immediately
+            else:
+                break
+
+    def _drain_all(self) -> None:
+        """Wait for and process all pending async all-reduce operations.
+
+        Called from post_backward() to ensure all deferred optimizer steps
+        complete before the training step ends.
+        """
+        while self._pending_queue:
+            self._drain_one()
+
     @torch.no_grad()
     def fused_update(self, moe: nn.Module, param_name: str, grad_bf16: torch.Tensor):
         """Apply one ECO AdamW step for a single expert weight, in-place.
@@ -622,17 +709,12 @@ class FusedBackwardECO:
         )
         assert param_name in ('W1', 'W2', 'W3'), f"Invalid param_name: {param_name}"
 
-        # DP AllReduce in FP32 to preserve gradient precision during averaging.
-        # AllReduce happens every micro-step (each micro-batch's gradient is averaged
-        # across DP ranks before accumulation, matching the semantics of averaging
-        # a larger batch).
+        # Cast to FP32 for precision during AllReduce averaging.
         grad = grad_bf16.float()
         del grad_bf16
-        if self._dp_size > 1 and self._dp_group is not None:
-            dist.all_reduce(grad, op=dist.ReduceOp.AVG, group=self._dp_group)
 
-        # AdamA fractional betas: β^(1/K) for K micro-steps.
-        # When K=1 (no accumulation), β^(1/1) = β — standard Adam.
+        # AdamA fractional betas: beta^(1/K) for K micro-steps.
+        # When K=1 (no accumulation), beta^(1/1) = beta — standard Adam.
         K = self._accum_steps
         beta1_frac = self.beta1 ** (1.0 / K)
         beta2_frac = self.beta2 ** (1.0 / K)
@@ -640,7 +722,29 @@ class FusedBackwardECO:
         # Get or init optimizer state (needed for both accumulate and full step)
         st = self._get_or_init_state(moe, param_name)
 
-        # Non-final micro-steps: update m/v with fractional betas only, no weight update.
+        if self._dp_size > 1 and self._dp_group is not None:
+            # --- Async path: enqueue all_reduce, defer optimizer step ---
+            # Opportunistic drain: process any completed ops without blocking.
+            self._drain_completed()
+            # Back-pressure: if queue is still full, block on oldest.
+            if len(self._pending_queue) >= self._max_pending:
+                self._drain_one()
+
+            work = dist.all_reduce(grad, op=dist.ReduceOp.AVG,
+                                   group=self._dp_group, async_op=True)
+            self._pending_queue.append(PendingAllReduce(
+                work=work,
+                grad=grad,
+                moe=moe,
+                param_name=param_name,
+                state=st,
+                beta1_eff=beta1_frac,
+                beta2_eff=beta2_frac,
+                is_accumulating=self.is_accumulating,
+            ))
+            return  # Optimizer step deferred to _drain_one/_drain_all
+
+        # --- Synchronous path (single node, no DP): run optimizer step inline ---
         if self.is_accumulating:
             self._cuda_mv_accumulate(moe, param_name, grad, st,
                                      beta1_frac, beta2_frac)
@@ -648,8 +752,6 @@ class FusedBackwardECO:
             return
 
         # Final micro-step (or no accumulation): full ECO Adam step.
-        # The fractional betas make the kernel's EMA update equivalent to standard
-        # Adam over the accumulated K micro-steps.
         st["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
 
         # Gradient clipping using previous step's global norm estimate.

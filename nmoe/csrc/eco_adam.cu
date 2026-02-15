@@ -62,6 +62,7 @@ __host__ __device__ __forceinline__ int ceil_div(int a, int b) { return (a + b -
 //     in_dim, updates v_col[e, j] EMA.
 // ============================================================================
 
+// One BLOCK per (expert, row) pair. Threads collaboratively reduce across out_dim.
 __global__ void k_factored_v_row(
     const float* __restrict__ grad,    // [E, in_dim, out_dim] nmoe layout
     float* __restrict__ v_row,         // [E, in_dim]
@@ -71,8 +72,8 @@ __global__ void k_factored_v_row(
     int out_dim,
     float beta2)
 {
-    // One thread per (expert, row) pair
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // blockIdx.x = (expert * in_dim + row) index
+    const int idx = blockIdx.x;
     const int total = E * in_dim;
     if (idx >= total) return;
 
@@ -81,25 +82,42 @@ __global__ void k_factored_v_row(
 
     const float one_minus_b2 = 1.0f - beta2;
 
-    // Sum grad^2 across out_dim for row i of expert e
+    // Each thread sums a strided subset of out_dim
     const int64_t row_base = static_cast<int64_t>(e) * in_dim * out_dim
                            + static_cast<int64_t>(i) * out_dim;
-    float sum_sq = 0.0f;
-    for (int j = 0; j < out_dim; ++j) {
+    float thread_sum = 0.0f;
+    for (int j = threadIdx.x; j < out_dim; j += blockDim.x) {
         float g = grad[row_base + j];
-        sum_sq += g * g;
+        thread_sum += g * g;
     }
-    float grad_sq_row_mean = sum_sq / static_cast<float>(out_dim);
 
-    // EMA update: v_row[e, i] = beta2 * v_row[e, i] + (1 - beta2) * mean
-    const int64_t vr_idx = static_cast<int64_t>(e) * in_dim + i;
-    float vr = beta2 * v_row[vr_idx] + one_minus_b2 * grad_sq_row_mean;
-    v_row[vr_idx] = vr;
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
 
-    // Accumulate into v_rms[e] via atomicAdd (will divide by in_dim later)
-    atomicAdd(&v_rms[e], vr);
+    // Shared memory reduction across warps
+    __shared__ float sdata[8];  // max 256 threads = 8 warps
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) sdata[warp_id] = thread_sum;
+    __syncthreads();
+
+    // Final reduction by first warp
+    if (warp_id == 0) {
+        float val = (lane < (blockDim.x >> 5)) ? sdata[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        if (lane == 0) {
+            float grad_sq_row_mean = val / static_cast<float>(out_dim);
+            const int64_t vr_idx = static_cast<int64_t>(e) * in_dim + i;
+            float vr = beta2 * v_row[vr_idx] + one_minus_b2 * grad_sq_row_mean;
+            v_row[vr_idx] = vr;
+            atomicAdd(&v_rms[e], vr);
+        }
+    }
 }
 
+// One BLOCK per (expert, col) pair. Threads collaboratively reduce across in_dim.
 __global__ void k_factored_v_col(
     const float* __restrict__ grad,    // [E, in_dim, out_dim] nmoe layout
     float* __restrict__ v_col,         // [E, out_dim]
@@ -108,8 +126,8 @@ __global__ void k_factored_v_col(
     int out_dim,
     float beta2)
 {
-    // One thread per (expert, col) pair
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // blockIdx.x = (expert * out_dim + col) index
+    const int idx = blockIdx.x;
     const int total = E * out_dim;
     if (idx >= total) return;
 
@@ -118,18 +136,36 @@ __global__ void k_factored_v_col(
 
     const float one_minus_b2 = 1.0f - beta2;
 
-    // Sum grad^2 across in_dim for column j of expert e
+    // Each thread sums a strided subset of in_dim
     const int64_t expert_base = static_cast<int64_t>(e) * in_dim * out_dim;
-    float sum_sq = 0.0f;
-    for (int i = 0; i < in_dim; ++i) {
+    float thread_sum = 0.0f;
+    for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
         float g = grad[expert_base + static_cast<int64_t>(i) * out_dim + j];
-        sum_sq += g * g;
+        thread_sum += g * g;
     }
-    float grad_sq_col_mean = sum_sq / static_cast<float>(in_dim);
 
-    // EMA update: v_col[e, j] = beta2 * v_col[e, j] + (1 - beta2) * mean
-    const int64_t vc_idx = static_cast<int64_t>(e) * out_dim + j;
-    v_col[vc_idx] = beta2 * v_col[vc_idx] + one_minus_b2 * grad_sq_col_mean;
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        thread_sum += __shfl_down_sync(0xFFFFFFFF, thread_sum, offset);
+
+    // Shared memory reduction across warps
+    __shared__ float sdata[8];  // max 256 threads = 8 warps
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) sdata[warp_id] = thread_sum;
+    __syncthreads();
+
+    // Final reduction by first warp
+    if (warp_id == 0) {
+        float val = (lane < (blockDim.x >> 5)) ? sdata[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        if (lane == 0) {
+            float grad_sq_col_mean = val / static_cast<float>(in_dim);
+            const int64_t vc_idx = static_cast<int64_t>(e) * out_dim + j;
+            v_col[vc_idx] = beta2 * v_col[vc_idx] + one_minus_b2 * grad_sq_col_mean;
+        }
+    }
 }
 
 // Finalize v_rms: divide accumulated sum by in_dim to get mean
@@ -158,9 +194,10 @@ inline cudaError_t launch_factored_v_update(
     constexpr int THREADS = 256;
 
     // Sub-kernel 1: row means + v_row update + v_rms accumulation
+    // One block per (expert, row) pair; threads reduce across out_dim in parallel
     {
         const int total = E * in_dim;
-        const dim3 grid(ceil_div(total, THREADS));
+        const dim3 grid(total);
         k_factored_v_row<<<grid, THREADS, 0, stream>>>(
             grad, v_row, v_rms, E, in_dim, out_dim, beta2);
         err = cudaGetLastError();
@@ -168,9 +205,10 @@ inline cudaError_t launch_factored_v_update(
     }
 
     // Sub-kernel 2: column means + v_col update
+    // One block per (expert, col) pair; threads reduce across in_dim in parallel
     {
         const int total = E * out_dim;
-        const dim3 grid(ceil_div(total, THREADS));
+        const dim3 grid(total);
         k_factored_v_col<<<grid, THREADS, 0, stream>>>(
             grad, v_col, E, in_dim, out_dim, beta2);
         err = cudaGetLastError();
@@ -559,9 +597,8 @@ __global__ void k_eco_adam_nvfp4_update(
 // scale, this kernel recomputes the correct per-row scale by scanning all
 // out_dim elements per row, then rescales the FP8 values accordingly.
 //
-// Grid: one thread per row = (E * in_dim) threads, each handles out_dim elements.
-// This is fast because it's just O(E * in_dim * out_dim) scalar ops with no
-// inter-thread dependencies.
+// Grid: one block per row = (E * in_dim) blocks, 256 threads per block.
+// Threads collaboratively reduce across out_dim for amax, then rescale in parallel.
 
 template <bool kIsE5M2>
 __global__ void k_fp8_recompute_row_scale(
@@ -572,7 +609,8 @@ __global__ void k_fp8_recompute_row_scale(
     int out_dim)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    // One block per row. blockIdx.x = row index.
+    const int row = blockIdx.x;
     const int total_rows = E * in_dim;
     if (row >= total_rows) return;
 
@@ -581,9 +619,9 @@ __global__ void k_fp8_recompute_row_scale(
     const float old_scale = row_scale[row];
     const int64_t row_base = static_cast<int64_t>(row) * out_dim;
 
-    // Pass 1: dequant all elements, find new amax
-    float amax = 0.0f;
-    for (int j = 0; j < out_dim; ++j) {
+    // Pass 1: parallel amax reduction across out_dim
+    float thread_amax = 0.0f;
+    for (int j = threadIdx.x; j < out_dim; j += blockDim.x) {
         uint8_t byte = data[row_base + j];
         float val;
         if constexpr (kIsE5M2) {
@@ -591,16 +629,38 @@ __global__ void k_fp8_recompute_row_scale(
         } else {
             val = ptx::e4m3_byte_to_f32(byte) * old_scale;
         }
-        amax = fmaxf(amax, fabsf(val));
+        thread_amax = fmaxf(thread_amax, fabsf(val));
     }
 
-    float new_scale = amax / FP8_MAX;
-    new_scale = fmaxf(new_scale, 1e-30f);
-    row_scale[row] = new_scale;
+    // Warp-level max reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        thread_amax = fmaxf(thread_amax, __shfl_down_sync(0xFFFFFFFF, thread_amax, offset));
 
-    // Pass 2: rescale all elements with new scale
-    float ratio = old_scale / new_scale;
-    for (int j = 0; j < out_dim; ++j) {
+    // Cross-warp reduction via shared memory
+    __shared__ float sdata[8];  // max 256 threads = 8 warps
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) sdata[warp_id] = thread_amax;
+    __syncthreads();
+
+    // Final reduction + broadcast scale
+    __shared__ float sh_ratio;
+    if (warp_id == 0) {
+        float val = (lane < (blockDim.x >> 5)) ? sdata[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+        if (lane == 0) {
+            float amax = val;
+            float new_scale = fmaxf(amax / FP8_MAX, 1e-30f);
+            row_scale[row] = new_scale;
+            sh_ratio = old_scale / new_scale;
+        }
+    }
+    __syncthreads();
+
+    // Pass 2: parallel rescale
+    float ratio = sh_ratio;
+    for (int j = threadIdx.x; j < out_dim; j += blockDim.x) {
         uint8_t byte = data[row_base + j];
         float val;
         if constexpr (kIsE5M2) {
@@ -680,18 +740,16 @@ inline cudaError_t launch_eco_adam_nvfp4_update(
     auto err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
-    // FP8 scale recomputation pass for m and v
+    // FP8 scale recomputation pass for m and v (one block per row, parallel reduction)
     const int total_rows = E * in_dim;
     constexpr int RECOMP_THREADS = 256;
-    const dim3 recomp_grid(ceil_div(total_rows, RECOMP_THREADS));
-    const dim3 recomp_block(RECOMP_THREADS);
 
-    k_fp8_recompute_row_scale<true><<<recomp_grid, recomp_block, 0, stream>>>(
+    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
         m_data, m_scale_f32, E, in_dim, out_dim);
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
-    k_fp8_recompute_row_scale<false><<<recomp_grid, recomp_block, 0, stream>>>(
+    k_fp8_recompute_row_scale<false><<<total_rows, RECOMP_THREADS, 0, stream>>>(
         v_data, v_scale_f32, E, in_dim, out_dim);
     return cudaGetLastError();
 }
@@ -762,13 +820,11 @@ inline cudaError_t launch_eco_adam_nvfp4_fv_update(
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
-    // FP8 scale recomputation pass for m only (v is factored, no FP8 v)
+    // FP8 scale recomputation pass for m only (one block per row, parallel reduction)
     const int total_rows = E * in_dim;
     constexpr int RECOMP_THREADS = 256;
-    const dim3 recomp_grid(ceil_div(total_rows, RECOMP_THREADS));
-    const dim3 recomp_block(RECOMP_THREADS);
 
-    k_fp8_recompute_row_scale<true><<<recomp_grid, recomp_block, 0, stream>>>(
+    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
         m_data, m_scale_f32, E, in_dim, out_dim);
     return cudaGetLastError();
 }
@@ -878,17 +934,16 @@ inline cudaError_t launch_eco_mv_accumulate(
     auto err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
-    // FP8 scale recomputation for m and v
+    // FP8 scale recomputation for m and v (one block per row, parallel reduction)
     const int total_rows = E * in_dim;
     constexpr int RECOMP_THREADS = 256;
-    const dim3 recomp_grid(ceil_div(total_rows, RECOMP_THREADS));
 
-    k_fp8_recompute_row_scale<true><<<recomp_grid, RECOMP_THREADS, 0, stream>>>(
+    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
         m_data, m_scale, E, in_dim, out_dim);
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
-    k_fp8_recompute_row_scale<false><<<recomp_grid, RECOMP_THREADS, 0, stream>>>(
+    k_fp8_recompute_row_scale<false><<<total_rows, RECOMP_THREADS, 0, stream>>>(
         v_data, v_scale, E, in_dim, out_dim);
     return cudaGetLastError();
 }
@@ -920,12 +975,11 @@ inline cudaError_t launch_eco_mv_accumulate_fv(
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
 
-    // FP8 scale recomputation for m only (v is factored)
+    // FP8 scale recomputation for m only (one block per row, parallel reduction)
     const int total_rows = E * in_dim;
     constexpr int RECOMP_THREADS = 256;
-    const dim3 recomp_grid(ceil_div(total_rows, RECOMP_THREADS));
 
-    k_fp8_recompute_row_scale<true><<<recomp_grid, RECOMP_THREADS, 0, stream>>>(
+    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
         m_data, m_scale, E, in_dim, out_dim);
     return cudaGetLastError();
 }
