@@ -334,12 +334,16 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         # stale momentum, corrupting weights on ranks with no routed tokens.
         # In practice M_recv=0 is unreachable with top-8 routing over 128 experts
         # (each rank's 16 experts would need to receive zero out of ~32k assignments).
+        if dist.is_initialized() and dist.get_rank() == 0:
+          print(f"[BWD-PROGRESS] moe_bwd #{_moe_bwd_count}", flush=True)
         _moe_bwd_count += 1
         return None, dX, None, dGates, None, None, None, None, None, None
 
       dW1 = torch.zeros_like(_W1)
       dW3 = torch.zeros_like(_W3)
       dW2 = torch.zeros_like(_W2)
+      if dist.is_initialized() and dist.get_rank() == 0:
+        print(f"[BWD-PROGRESS] moe_bwd #{_moe_bwd_count}", flush=True)
       _moe_bwd_count += 1
       return None, dX, None, dGates, dW1, dW3, dW2, None, None, None
 
@@ -657,6 +661,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     if _do_bwd_log:
       print("[MOE-BWD] backward done", flush=True)
 
+    if dist.is_initialized() and dist.get_rank() == 0:
+      print(f"[BWD-PROGRESS] moe_bwd #{_moe_bwd_count}", flush=True)
     _moe_bwd_count += 1
 
     if fused_eco is not None:
