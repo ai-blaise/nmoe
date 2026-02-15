@@ -20,6 +20,25 @@ if TYPE_CHECKING:
   from nmoe.rdep import Rdep
 
 
+# ── NaN/Inf backward instrumentation ──────────────────────────────────
+_nan_check_count = 0
+
+def _nan_check(name, t, force=False):
+    """Check tensor for NaN/Inf. Only prints on rank 0, first backward call."""
+    global _nan_check_count
+    if t is None:
+        return
+    with torch.no_grad():
+        nc = torch.isnan(t).sum().item()
+        ic = torch.isinf(t).sum().item()
+        if nc > 0 or ic > 0 or force:
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                finite_mask = ~torch.isnan(t) & ~torch.isinf(t)
+                vmax = t[finite_mask].abs().max().item() if nc + ic < t.numel() else float('nan')
+                print(f"[BACKWARD-NAN] {name}: shape={list(t.shape)} nan={nc} inf={ic} valid_max={vmax:.4e}", flush=True)
+# ── End NaN/Inf instrumentation helper ────────────────────────────────
+
+
 def dequant_nvfp4_to_bf16_transient(
     packed: torch.Tensor,
     scale: torch.Tensor,
@@ -209,6 +228,10 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
   @staticmethod
   def backward(ctx, dOut: torch.Tensor):
+    global _nan_check_count
+    _nan_check_active = _nan_check_count == 0  # Only instrument first backward call
+    _nan_check_count += 1
+
     x, eid, gates, _W1, _W3, _W2 = ctx.saved_tensors
     rdep: Rdep = ctx.rdep
     fused_eco = ctx.fused_eco
@@ -216,6 +239,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
     device = dOut.device
     stream = torch.cuda.current_stream(device)
+
+    if _nan_check_active:
+      _nan_check("bwd.dOut_incoming", dOut)
 
     dOut = dOut.contiguous().bfloat16()
     x = x.contiguous().bfloat16()
@@ -318,6 +344,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     Xe_pad = torch.empty(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
     _C.gather_xe_bf16(Xe_pad.data_ptr(), int(M_recv), int(max_pad), stream)
 
+    if _nan_check_active:
+      _nan_check("bwd.Xe_pad(after_gather)", Xe_pad)
+
     # Get row_id and gate_sorted for backward computation
     row_id = torch.empty(int(M_recv), device=device, dtype=torch.int64)
     gate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
@@ -358,6 +387,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     )
     del dYe_sorted  # Consumed; free [M_recv, H] BF16
 
+    if _nan_check_active:
+      _nan_check("bwd.dYe_pad(after_gather_dy)", dYe_pad)
+
     # P3.14: Use pre-allocated pinned memory from Rdep for offs
     offs_pinned = rdep._pinned_offs
     offs_pinned.copy_(offs_pad, non_blocking=True)
@@ -371,25 +403,38 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       gs = getattr(moe_ref, '_nvfp4_group_size', 16)
       W1 = dequant_nvfp4_to_bf16_transient(
         moe_ref._W1_packed, moe_ref._W1_scale, moe_ref._W1_gs, gs, transpose=True)
+      if _nan_check_active:
+        _nan_check("bwd.W1_dequant(nvfp4)", W1)
       H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
       del W1  # Free ~1.3 GiB
 
       W3 = dequant_nvfp4_to_bf16_transient(
         moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
+      if _nan_check_active:
+        _nan_check("bwd.W3_dequant(nvfp4)", W3)
       H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
       del W3  # Free ~1.3 GiB
     else:
       H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
       H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
 
+    if _nan_check_active:
+      _nan_check("bwd.H1(recompute)", H1)
+      _nan_check("bwd.H3(recompute)", H3)
+
     # dA needs W2. Dequant W2 now, compute dA, free W2 immediately.
     if _nvfp4_stagger:
       W2 = dequant_nvfp4_to_bf16_transient(
         moe_ref._W2_packed, moe_ref._W2_scale, moe_ref._W2_gs, gs, transpose=True)
+      if _nan_check_active:
+        _nan_check("bwd.W2_dequant(nvfp4)", W2)
     Dff = int(W2.size(1))
     dA = torch._grouped_mm(dYe_pad, W2.transpose(1, 2), offs=offs_pad)
     if _nvfp4_stagger:
       del W2  # Free ~1.3 GiB
+
+    if _nan_check_active:
+      _nan_check("bwd.dA(after_W2T_mm)", dA)
 
     A = torch.empty_like(H1)
     dH1 = torch.empty_like(H1)
@@ -404,6 +449,11 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       int(max_pad), int(Dff),
       stream,
     )
+
+    if _nan_check_active:
+      _nan_check("bwd.A(after_swiglu_bwd)", A)
+      _nan_check("bwd.dH1(after_swiglu_bwd)", dH1)
+      _nan_check("bwd.dH3(after_swiglu_bwd)", dH3)
 
     # SonicMoE dGate identity: dGate = ⟨A, dA⟩ instead of ⟨dOut, Ye⟩
     # This avoids recomputing Ye_pad in both single-GPU and distributed modes.
@@ -432,6 +482,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(M_recv), int(T), int(K),
         stream,
       )
+
+    if _nan_check_active:
+      _nan_check("bwd.dGates_tk_f32(after_dgate)", dGates_tk_f32)
 
     # P3.13: Use non-blocking query loop instead of blocking synchronize()
     while not copy_event.query():
@@ -507,6 +560,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       del W3, dH3  # Free ~1.3 GiB + dH3
       fused_eco.refresh_layer_cache(moe_ref)
 
+      if _nan_check_active:
+        _nan_check("bwd.dX_pad(fused_eco_path)", dX_pad)
+
     else:
       # Standard backward (no fused ECO): compute wgrad, dX, return gradients
       dW2 = torch.empty(int(E), int(Dff), int(H), device=device, dtype=torch.bfloat16)
@@ -543,6 +599,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
       del W1, W3, A, dH1, dH3, Xe_pad, dYe_pad
 
+      if _nan_check_active:
+        _nan_check("bwd.dX_pad(standard_path)", dX_pad)
+
     dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
       dX_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
@@ -564,6 +623,13 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       )
 
     dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
+
+    if _nan_check_active:
+      _nan_check("bwd.dX(final)", dX)
+      _nan_check("bwd.dGates(final)", dGates)
+      if not dist.is_initialized() or dist.get_rank() == 0:
+        print("[BACKWARD-NAN] === first backward pass instrumentation complete ===", flush=True)
+
     if fused_eco is not None:
       return None, dX, None, dGates, None, None, None, None, None, None
     return None, dX, None, dGates, dW1, dW3, dW2, None, None, None
