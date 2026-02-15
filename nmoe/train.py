@@ -299,31 +299,12 @@ def train(cfg: Config):
 
           with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
             logits = model(inputs, cu_seqlens=cu_seqlens)
-          if rank == 0 and step_num == start_step:
-            print("[TRAIN] forward done, logits computed", flush=True)
-            # Register backward hooks to trace where NaN enters the gradient flow.
-            # The gradient flows: loss -> cross_entropy -> logits_fp32 -> .float() -> logits.
-            if logits.requires_grad:
-              logits.register_hook(lambda grad: print(f"[GRAD-CHECK] logits grad: nan={grad.isnan().sum().item()}/{grad.numel()} inf={grad.isinf().sum().item()} max={grad[~grad.isnan()].abs().max().item() if (~grad.isnan()).any() else 'all_nan'}", flush=True))
-
-          # === NaN/Inf detection in logits (BEFORE loss computation) ===
-          with torch.no_grad():
-            nan_count = torch.isnan(logits).sum().item()
-            inf_count = torch.isinf(logits).sum().item()
-            if nan_count > 0 or inf_count > 0:
-              logits_max = logits[~torch.isnan(logits) & ~torch.isinf(logits)].abs().max().item() if (nan_count + inf_count) < logits.numel() else float('nan')
-              _nan_msg = f"[NAN] step={step_num} micro={micro_step}: logits contain NaN={nan_count} Inf={inf_count} (total={logits.numel()}, valid_max={logits_max:.4f})"
-              logger.warning(_nan_msg)
-              print(_nan_msg, flush=True)
-
           with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
             # Cast logits to FP32 before cross_entropy: BF16 softmax over vocab_size=129,280
             # causes catastrophic precision loss, producing NaN gradients in the backward pass.
             # The .float() is intentionally placed before .reshape() so the full tensor is in FP32
             # and both the forward softmax and backward gradient computation use FP32 precision.
             logits_fp32 = logits.float()
-            if rank == 0 and step_num == start_step:
-              print("[TRAIN] logits cast to FP32", flush=True)
             loss_unreduced = F.cross_entropy(logits_fp32.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
             if loss_mask is not None:
               # SFT: use per-token loss mask from chat template (0=prompt, 1=response)
@@ -335,20 +316,6 @@ def train(cfg: Config):
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
-          if rank == 0 and step_num == start_step:
-            print("[TRAIN] loss computed", flush=True)
-            # Register gradient flow diagnostic hooks on FP32 logits and loss_unreduced
-            if logits_fp32.requires_grad:
-              logits_fp32.register_hook(lambda grad: print(f"[GRAD-CHECK] logits_fp32 grad: nan={grad.isnan().sum().item()}/{grad.numel()} inf={grad.isinf().sum().item()}", flush=True))
-            if loss_unreduced.requires_grad:
-              loss_unreduced.register_hook(lambda grad: print(f"[GRAD-CHECK] loss_unreduced grad: nan={grad.isnan().sum().item()}/{grad.numel()} inf={grad.isinf().sum().item()}", flush=True))
-
-          # === NaN/Inf detection in loss (BEFORE backward) ===
-          if torch.isnan(loss) or torch.isinf(loss):
-            _nan_msg = f"[NAN] step={step_num} micro={micro_step}: loss={loss.item()} (mask_sum={mask.sum().item():.0f}, loss_unreduced_max={loss_unreduced.max().item():.4f})"
-            logger.warning(_nan_msg)
-            print(_nan_msg, flush=True)
-
           # Zero gradients: on first micro-step, zero everything. On subsequent
           # micro-steps, only zero if no accumulation for dense params is needed.
           # With fused_eco, expert gradients are consumed in backward and don't
@@ -365,67 +332,24 @@ def train(cfg: Config):
             fused_eco.set_lr(lr_expert)
             fused_eco.set_microstep(micro_step, accum_steps)
             fused_eco.pre_backward(step_num)
-          if rank == 0 and step_num == start_step:
-            print("[TRAIN] starting backward", flush=True)
           with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
             loss.backward()
-          if rank == 0 and step_num == start_step:
-            print("[TRAIN] backward done", flush=True)
           if fused_eco is not None:
             fused_eco.post_backward()
-
-          # === Per-micro-step NaN gradient diagnostic (first step only, rank 0) ===
-          if rank == 0 and step_num == start_step:
-            _micro_nan_params = 0
-            _micro_nan_total = 0
-            for _mn_name, _mn_p in model.named_parameters():
-              if _mn_p.grad is not None:
-                _mn_cnt = torch.isnan(_mn_p.grad).sum().item()
-                if _mn_cnt > 0:
-                  _micro_nan_params += 1
-                  _micro_nan_total += _mn_cnt
-            print(f"[MICRO-NAN] micro_step={micro_step}: nan_params={_micro_nan_params}, total_nan={_micro_nan_total}", flush=True)
 
           accumulated_loss += loss.detach().item() * (accum_steps if accum_steps > 1 else 1)
 
         # End of micro-batch loop. Now do optimizer step.
         loader_wait_ms = (time.perf_counter() - t0) * 1000.0
 
-        # === Enhanced NaN/Inf gradient detection (before clipping) ===
-        nan_params = []
-        total_nan_count = 0
-        total_inf_count = 0
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                nan_count = torch.isnan(p.grad).sum().item()
-                inf_count = torch.isinf(p.grad).sum().item()
-                if nan_count > 0 or inf_count > 0:
-                    total_nan_count += nan_count
-                    total_inf_count += inf_count
-                    # Get gradient statistics for valid elements
-                    valid_mask = ~torch.isnan(p.grad) & ~torch.isinf(p.grad)
-                    valid_grads = p.grad[valid_mask]
-                    grad_stats = ""
-                    if valid_grads.numel() > 0:
-                        grad_stats = f", valid_max={valid_grads.abs().max().item():.4e}, valid_mean={valid_grads.abs().mean().item():.4e}"
-                    nan_params.append(f"{name}(nan={nan_count},inf={inf_count},numel={p.grad.numel()}{grad_stats})")
-        if nan_params:
-            _nan_msg = f"[NAN] step={step_num}: total_nan={total_nan_count} total_inf={total_inf_count}"
-            logger.warning(_nan_msg)
-            print(_nan_msg, flush=True)
-            # Log first 10 affected params with details
-            for param_info in nan_params[:10]:
-                logger.warning(f"[NAN]   {param_info}")
-                print(f"[NAN]   {param_info}", flush=True)
-            if len(nan_params) > 10:
-                _nan_msg = f"[NAN]   ... and {len(nan_params) - 10} more parameters with NaN/Inf gradients"
-                logger.warning(_nan_msg)
-                print(_nan_msg, flush=True)
-
-        # NaN gradient guard: skip optimizer step to prevent weight corruption
-        if total_nan_count > 0 or total_inf_count > 0:
+        # Lightweight NaN guard: compute grad_norm once and check for NaN/Inf
+        # instead of iterating all 200K+ parameters with .item() calls.
+        _grad_params = [p for p in model.parameters() if p.grad is not None]
+        grad_norm = torch.nn.utils.clip_grad_norm_(_grad_params, float('inf')) if _grad_params else torch.tensor(0.0)
+        _grad_norm_bad = (grad_norm != grad_norm) or (grad_norm == float('inf'))  # NaN or Inf
+        if _grad_norm_bad:
             if rank == 0:
-                print(f"[NAN-GUARD] Skipping optimizer step {step_num} due to {total_nan_count} NaN + {total_inf_count} Inf gradient elements", flush=True)
+                print(f"[NAN-GUARD] Skipping optimizer step {step_num} due to NaN/Inf grad_norm={grad_norm}", flush=True)
             # Zero out all gradients to prevent stale NaN from accumulating
             model.zero_grad(set_to_none=True)
         else:
@@ -499,8 +423,6 @@ def train(cfg: Config):
           checkpointer, s, tokens_seen, model, optimizer, loader, plan,
           zero2_state, cfg, rank, config_fingerprint, checkpoint_every, print
         )
-        if rank == 0 and step_num == start_step:
-          print("[TRAIN] step done", flush=True)
 
     if rank == 0:
       logger.info("Training complete. %s tokens.", f"{tokens_seen:,}")
