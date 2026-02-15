@@ -603,6 +603,7 @@ class SFTLoader:
         batch_size: int,
         dp_rank: int,
         dp_world_size: int,
+        gradient_accumulation_steps: int = 1,
         prompt_format: str = "deepseekv32",
         mask_prompt_loss: bool = True,
         device: str = "cuda",
@@ -621,6 +622,7 @@ class SFTLoader:
             batch_size: Number of sequences per batch (global, divided by dp_world_size).
             dp_rank: This rank's DP index (0 to dp_world_size-1).
             dp_world_size: Data parallelism group size (NOT total world size).
+            gradient_accumulation_steps: Number of micro-batches per optimizer step.
             prompt_format: Chat template format ('deepseekv32', 'chatml', 'llama3').
             mask_prompt_loss: If True, set loss_mask=0 for prompt tokens.
             device: Target device for tensors.
@@ -632,7 +634,10 @@ class SFTLoader:
         """
         self.seq_len = seq_len
         self.global_batch_size = batch_size
-        self.local_batch_size = batch_size // dp_world_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        # Per-DP-rank micro-batch size: batch_size / dp_world_size / accum_steps
+        # The training loop calls loader.next() once per micro-step.
+        self.local_batch_size = batch_size // (dp_world_size * gradient_accumulation_steps)
         self.dp_rank = dp_rank
         self.dp_world_size = dp_world_size
         self.mask_prompt_loss = mask_prompt_loss
@@ -1069,6 +1074,10 @@ def build_sft_loader(
     mask_prompt_loss = getattr(cfg, "sft_mask_prompt_loss", True)
     packing_enabled = getattr(cfg, "sft_packing_enabled", False)
     packing_max_docs = getattr(cfg, "sft_packing_max_docs_per_bin", 16)
+    accum_steps = int(getattr(cfg, "gradient_accumulation_steps", 1))
+
+    # Compute micro-batch size for logging
+    micro_batch_size = cfg.batch_size // (dp_world_size * accum_steps)
 
     if dp_rank == 0:
         print_fn(f"[SFT] dataset: {sft_data_path}")
@@ -1079,6 +1088,8 @@ def build_sft_loader(
         if packing_enabled:
             print_fn(f"[SFT] packing_max_docs_per_bin: {packing_max_docs}")
         print_fn(f"[SFT] dp_world_size: {dp_world_size} (each rank sees 1/{dp_world_size} of data)")
+        print_fn(f"[SFT] gradient_accumulation_steps: {accum_steps}")
+        print_fn(f"[SFT] micro_batch_size: {micro_batch_size} (T per fwd = {micro_batch_size * cfg.seq_len})")
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required for SFT data loader")
@@ -1089,6 +1100,7 @@ def build_sft_loader(
         batch_size=cfg.batch_size,
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
+        gradient_accumulation_steps=accum_steps,
         prompt_format=prompt_format,
         mask_prompt_loss=mask_prompt_loss,
         device="cuda" if torch.cuda.is_available() else "cpu",

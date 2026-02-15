@@ -120,10 +120,11 @@ sft_enabled = true
 sft_data_path = "/home/nourdine/sft_data"
 sft_mask_prompt_loss = true      # Only compute loss on assistant response tokens
 sft_prompt_format = "deepseekv32"
-sft_packing_enabled = false      # Disabled to avoid RDEP capacity explosion with packed sequences
+sft_packing_enabled = true       # FFD bin-packing: 2-3x throughput, zero memory cost
 
 # RDEP capacity override (worst-case token-expert dispatch slots per GPU)
 # Set to 0 to use auto-computed capacity: micro_batch * seq_len * K * ep_size
-# Without packing: T = micro_batch * seq_len = 2 * 4096 = 8,192
+# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 256 / (16 * 8) = 2
+# T per forward = micro_batch * seq_len = 2 * 4096 = 8,192
 # Auto-compute: 8192 * 8 * 8 = 524,288 (fits in GPU memory)
 rdep_capacity = 0
