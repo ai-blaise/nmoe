@@ -91,7 +91,7 @@ warmup_steps = 200               # Linear warmup over 200 steps (~2% of total)
 eco_enabled = true
 eco_error_feedback = true        # Error correction feedback into momentum
 eco_stochastic_rounding = true   # SR for NVFP4 E2M1 quantization
-eco_fused_backward = true        # Fuse optimizer into backward — CUDA kernel path, no Python fallback
+eco_fused_backward = false       # DISABLED for debugging - use standard backward
 eco_factored_v = true            # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
 gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a time
 
