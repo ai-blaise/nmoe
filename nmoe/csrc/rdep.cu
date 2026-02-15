@@ -498,11 +498,16 @@ extern "C" void rdep_open_ipc_handles_bf16(const void* handles, int world) {
         } else {
             // Open remote buffer
             memcpy(&g_ipc_handles_bf16[r], &all_handles[r], sizeof(cudaIpcMemHandle_t));
-            cudaIpcOpenMemHandle(&g_bf16.buffer_ptrs[r], g_ipc_handles_bf16[r],
+            cudaError_t err = cudaIpcOpenMemHandle(&g_bf16.buffer_ptrs[r], g_ipc_handles_bf16[r],
                                  cudaIpcMemLazyEnablePeerAccess);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "RDEP ERROR: cudaIpcOpenMemHandle failed for rank %d: %s (err=%d)\n",
+                        r, cudaGetErrorString(err), (int)err);
+                g_bf16.buffer_ptrs[r] = nullptr;  // Ensure NULL on failure
+            }
             // Set barrier signal pointer for remote buffer
             char* remote_buf = static_cast<char*>(g_bf16.buffer_ptrs[r]);
-            g_bf16.barrier_signal_ptrs[r] = reinterpret_cast<int*>(remote_buf + barrier_off);
+            g_bf16.barrier_signal_ptrs[r] = remote_buf ? reinterpret_cast<int*>(remote_buf + barrier_off) : nullptr;
         }
     }
     g_ipc_handles_opened = true;
@@ -4536,12 +4541,24 @@ extern "C" void rdep_scatter_dx_dist_bf16(
             return;
         }
 
+        // Validate all buffer pointers before launching kernel
+        for (int r = 0; r < g_bf16.world; r++) {
+            if (g_bf16.buffer_ptrs[r] == nullptr) {
+                fprintf(stderr, "RDEP FATAL: buffer_ptrs[%d] is NULL (rank=%d world=%d). IPC setup failed.\n",
+                        r, g_bf16.rank, g_bf16.world);
+                return;
+            }
+        }
+
         int threads = 256;
         int blocks = std::max(1, (M * 32 + threads - 1) / threads);
 
-        // DEBUG: print parameters before send kernel
-        fprintf(stderr, "DEBUG scatter_dx rank=%d: M=%d T=%d H=%d Ha=%d K=%d blocks=%d tok_y_off=%zu\n",
-                g_bf16.rank, M, T, H, Ha, K, blocks, tok_y_off);
+        // DEBUG: print parameters and buffer pointers before send kernel
+        fprintf(stderr, "DEBUG scatter_dx rank=%d: M=%d T=%d H=%d Ha=%d K=%d blocks=%d tok_y_off=%zu capacity=%zu\n",
+                g_bf16.rank, M, T, H, Ha, K, blocks, tok_y_off, g_bf16.capacity);
+        for (int r = 0; r < g_bf16.world; r++) {
+            fprintf(stderr, "  buffer_ptrs[%d] = %p\n", r, g_bf16.buffer_ptrs[r]);
+        }
 
         k_send_dx_tokslot_bf16<<<blocks, threads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(dXe_sorted),
