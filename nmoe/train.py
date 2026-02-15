@@ -225,6 +225,55 @@ def train(cfg: Config):
       logger.info("[NAN] Model weights sanity check passed: no NaN/Inf detected")
       print("[NAN] Model weights sanity check passed: no NaN/Inf detected", flush=True)
 
+  # === Warmup NCCL communicators ===
+  # Force NCCL ring/tree setup for all process groups BEFORE training.
+  # The DP group spans all 16 nodes and its first collective would otherwise
+  # happen during backward (ECO all_reduce), making hangs hard to debug.
+  if world > 1:
+    import torch.distributed as _dist
+    _warmup_t = torch.ones(1, device='cuda')
+
+    if rank == 0:
+      print("[INIT] warming up NCCL communicators...", flush=True)
+
+    # Global group
+    _dist.all_reduce(_warmup_t, group=None)
+    if rank == 0:
+      print(f"[INIT] global all_reduce OK (world={world})", flush=True)
+
+    # DP group
+    try:
+      from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_data_parallel_group, get_dp_size
+      if is_nmoe_parallel_initialized():
+        dp_group = get_data_parallel_group()
+        dp_size = get_dp_size()
+        _dist.all_reduce(_warmup_t, group=dp_group)
+        if rank == 0:
+          print(f"[INIT] DP group all_reduce OK (dp_size={dp_size})", flush=True)
+    except Exception as e:
+      if rank == 0:
+        print(f"[INIT] DP group warmup FAILED: {e}", flush=True)
+
+    # EP group
+    try:
+      from nmoe.distributed.init_groups import get_ep_group, get_ep_size
+      if is_nmoe_parallel_initialized():
+        ep_group = get_ep_group()
+        ep_size = get_ep_size()
+        _dist.all_reduce(_warmup_t, group=ep_group)
+        if rank == 0:
+          print(f"[INIT] EP group all_reduce OK (ep_size={ep_size})", flush=True)
+    except Exception as e:
+      if rank == 0:
+        print(f"[INIT] EP group warmup FAILED: {e}", flush=True)
+
+    # Barrier to ensure all ranks complete warmup
+    _dist.barrier()
+    if rank == 0:
+      print("[INIT] all NCCL warmup complete, starting training", flush=True)
+
+    del _warmup_t
+
   try:
     with nvtx_ctx('train/run'):
       for step_num in range(start_step, cfg.steps):
