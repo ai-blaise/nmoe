@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import Optional, List, TYPE_CHECKING
 
 import torch
@@ -220,7 +221,7 @@ def init_nmoe_process_groups(
                 tp_groups.append(group_ranks)
 
         for ranks in tp_groups:
-            group = dist.new_group(ranks=ranks, backend=backend)
+            group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
             if rank in ranks:
                 _TP_GROUP = group
                 _TP_RANK = ranks.index(rank)
@@ -249,7 +250,7 @@ def init_nmoe_process_groups(
                 ep_groups.append(group_ranks)
 
         for ranks in ep_groups:
-            group = dist.new_group(ranks=ranks, backend=backend)
+            group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
             if rank in ranks:
                 _EP_GROUP = group
                 _EP_RANK = ranks.index(rank)
@@ -276,7 +277,7 @@ def init_nmoe_process_groups(
             dp_groups.append(group_ranks)
 
         for ranks in dp_groups:
-            group = dist.new_group(ranks=ranks, backend=backend)
+            group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
             if rank in ranks:
                 _DP_GROUP = group
                 _DP_RANK = ranks.index(rank)

@@ -1,5 +1,6 @@
 import logging
 import os
+from datetime import timedelta
 from typing import Dict, Optional
 
 import torch
@@ -70,7 +71,7 @@ def _cpu_pg():
     if world <= 1:
         return None
     if _CPU_PG is None or _CPU_PG_WORLD != world:
-        _CPU_PG = dist.new_group(backend="gloo")
+        _CPU_PG = dist.new_group(backend="gloo", timeout=timedelta(seconds=1800))
         _CPU_PG_WORLD = world
     return _CPU_PG
 
