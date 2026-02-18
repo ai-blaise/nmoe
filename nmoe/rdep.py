@@ -237,9 +237,11 @@ class Rdep:
         Returns:
             1-D int32 CUDA tensor (length = handle_np.nbytes / 4).
         """
-        assert handle_np.dtype in (np.int8, np.uint8), f"expected int8/uint8, got {handle_np.dtype}"
+        if handle_np.dtype not in (np.int8, np.uint8):
+            raise ValueError(f"expected int8/uint8 IPC handle, got {handle_np.dtype}")
         n = handle_np.nbytes
-        assert n % 4 == 0, f"IPC handle byte count ({n}) must be divisible by 4"
+        if n % 4 != 0:
+            raise ValueError(f"IPC handle byte count ({n}) must be divisible by 4")
         # reinterpret bytes as int32 on the numpy side, then move to CUDA
         # Use .view(np.uint8) first to normalise, then reinterpret as int32
         handle_i32_np = handle_np.view(np.uint8).view(np.int32)
@@ -260,7 +262,7 @@ class Rdep:
         for h in handle_tensors:
             # h is int32 on CUDA; view as int8 to get original bytes
             h_cpu = h.cpu()
-            h_bytes = h_cpu.view(torch.int8).numpy()
+            h_bytes = h_cpu.view(torch.uint8).numpy()
             parts.append(h_bytes)
         return np.concatenate(parts)
 

@@ -49,6 +49,7 @@ class NCCLWatchdog:
         # Also print to stderr for visibility in torchrun logs
         import sys
         print(msg, file=sys.stderr, flush=True)
+        os._exit(1)
 
     def watch(self, work: dist.Work | None, op_name: str = "nccl_op") -> None:
         """Start monitoring an async NCCL operation."""
