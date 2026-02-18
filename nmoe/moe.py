@@ -8,6 +8,8 @@ The dispatch/combine infrastructure is in rdep.py.
 The Router and MoE nn.Module classes are in model.py.
 """
 from __future__ import annotations
+import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,6 +20,14 @@ from nmoe.cuda_errors import cuda_error_context
 
 if TYPE_CHECKING:
   from nmoe.rdep import Rdep
+
+
+def _nvtx(tag: str):
+    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
+        return nullcontext()
+    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
 
 
 def dequant_nvfp4_to_bf16_transient(
@@ -121,7 +131,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     M_host.zero_()
     align = 128  # Required for blockscaled SF swizzle
 
-    with cuda_error_context("dispatch_meta_blockscaled"):
+    with _nvtx("moe_bs/fwd_dispatch_meta"), cuda_error_context("dispatch_meta_blockscaled"):
       M_recv = _C.dispatch_meta_blockscaled(
         x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
         int(T), int(K),
@@ -186,18 +196,21 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     sf_k_pad = ((sf_k + 3) // 4) * 4
     Xe_q = torch.empty(int(M_pad), Hp, device=device, dtype=torch.uint16)
     Xe_sf = torch.empty(int(M_pad), sf_k_pad, device=device, dtype=torch.uint8)
-    _C.gather_xe_blockscaled(Xe_q.data_ptr(), Xe_sf.data_ptr(), int(M_recv), int(M_pad), stream)
+    with _nvtx("moe_bs/fwd_dispatch"):
+      _C.gather_xe_blockscaled(Xe_q.data_ptr(), Xe_sf.data_ptr(), int(M_recv), int(M_pad), stream)
 
     # Expert compute (blockscaled)
     from nmoe.blockscaled.grouped import expert_blockscaled
-    Ye_pad = expert_blockscaled(Xe_q, Xe_sf, W_cache, offs_pad, capacity_rows=int(rdep.capacity))
+    with _nvtx("moe_bs/fwd_expert_compute"):
+      Ye_pad = expert_blockscaled(Xe_q, Xe_sf, W_cache, offs_pad, capacity_rows=int(rdep.capacity))
 
-    _C.return_scatter_from_pad_blockscaled(
-      Ye_pad.data_ptr(),
-      out_f32.data_ptr(),
-      int(M_recv), int(T), int(K),
-      stream,
-    )
+    with _nvtx("moe_bs/fwd_combine"):
+      _C.return_scatter_from_pad_blockscaled(
+        Ye_pad.data_ptr(),
+        out_f32.data_ptr(),
+        int(M_recv), int(T), int(K),
+        stream,
+      )
     ctx.rdep = rdep
     ctx.T = int(T)
     ctx.H = int(H)
@@ -251,12 +264,13 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     M_host.zero_()
     align = 128  # Required for blockscaled SF swizzle
 
-    M_recv = _C.dispatch_meta_bf16(
-      x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
-      int(T), int(K), align,
-      offs_pad.data_ptr(), M_host.data_ptr(),
-      stream,
-    )
+    with _nvtx("moe_bs/bwd_dispatch_meta"):
+      M_recv = _C.dispatch_meta_bf16(
+        x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
+        int(T), int(K), align,
+        offs_pad.data_ptr(), M_host.data_ptr(),
+        stream,
+      )
 
     if M_recv <= 0:
       dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
@@ -333,35 +347,36 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
     dGates_tk_f32 = torch.zeros(int(T), int(K), device=device, dtype=torch.float32)
 
-    if is_dist:
-      # Distributed path: gather dYe across ranks with gate scaling (no dGate yet)
-      _C.gather_dy_nogate_dist_bf16(
-        dOut.data_ptr(),
-        eid.data_ptr(),
-        row_id.data_ptr(),
-        gate_sorted.data_ptr(),
-        dYe_sorted.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
-    else:
-      # Single-GPU: gather dY with gate scaling (no dGate yet)
-      _C.gather_dy_nogate_bf16(
-        dOut.data_ptr(),
-        row_id.data_ptr(),
-        gate_sorted.data_ptr(),
-        dYe_sorted.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
+    with _nvtx("moe_bs/bwd_combine"):
+      if is_dist:
+        # Distributed path: gather dYe across ranks with gate scaling (no dGate yet)
+        _C.gather_dy_nogate_dist_bf16(
+          dOut.data_ptr(),
+          eid.data_ptr(),
+          row_id.data_ptr(),
+          gate_sorted.data_ptr(),
+          dYe_sorted.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
+      else:
+        # Single-GPU: gather dY with gate scaling (no dGate yet)
+        _C.gather_dy_nogate_bf16(
+          dOut.data_ptr(),
+          row_id.data_ptr(),
+          gate_sorted.data_ptr(),
+          dYe_sorted.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
 
-    dYe_pad = torch.zeros(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
-    _C.scatter_sorted_to_pad_bf16(
-      dYe_sorted.data_ptr(),
-      dYe_pad.data_ptr(),
-      int(M_recv), int(H),
-      stream,
-    )
+      dYe_pad = torch.zeros(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
+      _C.scatter_sorted_to_pad_bf16(
+        dYe_sorted.data_ptr(),
+        dYe_pad.data_ptr(),
+        int(M_recv), int(H),
+        stream,
+      )
     del dYe_sorted  # Consumed; free [M_recv, H] BF16
 
     # P3.14: Use pre-allocated pinned memory from Rdep for offs
@@ -370,74 +385,75 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     copy_event = torch.cuda.Event()
     copy_event.record(stream)
 
-    # H1/H3 from W1/W3 (activation recompute for SwiGLU backward).
-    # In NVFP4 stagger mode: dequant one weight at a time, compute, free.
-    # Each BF16 weight is ~1.3 GiB; we never hold two simultaneously.
-    if _nvfp4_stagger:
-      gs = getattr(moe_ref, '_nvfp4_group_size', 16)
-      W1 = dequant_nvfp4_to_bf16_transient(
-        moe_ref._W1_packed, moe_ref._W1_scale, moe_ref._W1_gs, gs, transpose=True)
-      H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
-      del W1  # Free ~1.3 GiB
+    with _nvtx("moe_bs/bwd_expert_grad"):
+      # H1/H3 from W1/W3 (activation recompute for SwiGLU backward).
+      # In NVFP4 stagger mode: dequant one weight at a time, compute, free.
+      # Each BF16 weight is ~1.3 GiB; we never hold two simultaneously.
+      if _nvfp4_stagger:
+        gs = getattr(moe_ref, '_nvfp4_group_size', 16)
+        W1 = dequant_nvfp4_to_bf16_transient(
+          moe_ref._W1_packed, moe_ref._W1_scale, moe_ref._W1_gs, gs, transpose=True)
+        H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
+        del W1  # Free ~1.3 GiB
 
-      W3 = dequant_nvfp4_to_bf16_transient(
-        moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
-      H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
-      del W3  # Free ~1.3 GiB
-    else:
-      H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
-      H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+        W3 = dequant_nvfp4_to_bf16_transient(
+          moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
+        H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+        del W3  # Free ~1.3 GiB
+      else:
+        H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
+        H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
 
-    # dA needs W2. Dequant W2 now, compute dA, free W2 immediately.
-    if _nvfp4_stagger:
-      W2 = dequant_nvfp4_to_bf16_transient(
-        moe_ref._W2_packed, moe_ref._W2_scale, moe_ref._W2_gs, gs, transpose=True)
-    Dff = int(W2.size(1))
-    dA = torch._grouped_mm(dYe_pad, W2.transpose(1, 2), offs=offs_pad)
-    if _nvfp4_stagger:
-      del W2  # Free ~1.3 GiB
+      # dA needs W2. Dequant W2 now, compute dA, free W2 immediately.
+      if _nvfp4_stagger:
+        W2 = dequant_nvfp4_to_bf16_transient(
+          moe_ref._W2_packed, moe_ref._W2_scale, moe_ref._W2_gs, gs, transpose=True)
+      Dff = int(W2.size(1))
+      dA = torch._grouped_mm(dYe_pad, W2.transpose(1, 2), offs=offs_pad)
+      if _nvfp4_stagger:
+        del W2  # Free ~1.3 GiB
 
-    A = torch.empty_like(H1)
-    dH1 = torch.empty_like(H1)
-    dH3 = torch.empty_like(H3)
-    _C.swiglu_bwd_bf16(
-      H1.data_ptr(), int(Dff),
-      H3.data_ptr(), int(Dff),
-      dA.data_ptr(), int(Dff),
-      A.data_ptr(), int(Dff),
-      dH1.data_ptr(), int(Dff),
-      dH3.data_ptr(), int(Dff),
-      int(max_pad), int(Dff),
-      stream,
-    )
-
-    # SonicMoE dGate identity: dGate = ⟨A, dA⟩ instead of ⟨dOut, Ye⟩
-    # This avoids recomputing Ye_pad in both single-GPU and distributed modes.
-    _C.dgate_from_adA_bf16(
-      A.data_ptr(),
-      dA.data_ptr(),
-      dGate_sorted.data_ptr(),
-      int(M_recv), int(Dff),
-      stream,
-    )
-    if is_dist:
-      # Distributed: send dGate back to source ranks via IPC
-      _C.send_dgate_dist_bf16(
-        row_id.data_ptr(),
-        dGate_sorted.data_ptr(),
-        dGates_tk_f32.data_ptr(),
-        int(M_recv), int(T), int(K),
+      A = torch.empty_like(H1)
+      dH1 = torch.empty_like(H1)
+      dH3 = torch.empty_like(H3)
+      _C.swiglu_bwd_bf16(
+        H1.data_ptr(), int(Dff),
+        H3.data_ptr(), int(Dff),
+        dA.data_ptr(), int(Dff),
+        A.data_ptr(), int(Dff),
+        dH1.data_ptr(), int(Dff),
+        dH3.data_ptr(), int(Dff),
+        int(max_pad), int(Dff),
         stream,
       )
-    else:
-      # Single-GPU: scatter dGate directly
-      _C.scatter_gate_bf16(
+
+      # SonicMoE dGate identity: dGate = ⟨A, dA⟩ instead of ⟨dOut, Ye⟩
+      # This avoids recomputing Ye_pad in both single-GPU and distributed modes.
+      _C.dgate_from_adA_bf16(
+        A.data_ptr(),
+        dA.data_ptr(),
         dGate_sorted.data_ptr(),
-        row_id.data_ptr(),
-        dGates_tk_f32.data_ptr(),
-        int(M_recv), int(T), int(K),
+        int(M_recv), int(Dff),
         stream,
       )
+      if is_dist:
+        # Distributed: send dGate back to source ranks via IPC
+        _C.send_dgate_dist_bf16(
+          row_id.data_ptr(),
+          dGate_sorted.data_ptr(),
+          dGates_tk_f32.data_ptr(),
+          int(M_recv), int(T), int(K),
+          stream,
+        )
+      else:
+        # Single-GPU: scatter dGate directly
+        _C.scatter_gate_bf16(
+          dGate_sorted.data_ptr(),
+          row_id.data_ptr(),
+          dGates_tk_f32.data_ptr(),
+          int(M_recv), int(T), int(K),
+          stream,
+        )
 
     # P3.13: Use non-blocking query loop instead of blocking synchronize()
     while not copy_event.query():
@@ -445,132 +461,135 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     offs_host = offs_pinned
 
     if fused_eco is not None:
-      # Memory-optimized backward for NVFP4 primary mode.
-      # Key insight: never hold more than one BF16 weight at a time.
-      # W1/W3 were already freed after H1/H3 recompute (stagger mode).
-      # At this point live tensors: H1, H3, dA, A, dH1, dH3,
-      # Xe_pad, dYe_pad. We free H1/H3/dA now (consumed by SwiGLU+dGate).
-      #
-      # Order: dW2 → free → re-dequant W1 → dX_part1 → free W1 →
-      #        dW1 → free → re-dequant W3 → dX_part2 → free W3 → dW3 → free
-      del H1, H3, dA  # Consumed by swiglu_bwd + dgate; free before wgrad
+      with _nvtx("moe_bs/bwd_wgrad_eco"):
+        # Memory-optimized backward for NVFP4 primary mode.
+        # Key insight: never hold more than one BF16 weight at a time.
+        # W1/W3 were already freed after H1/H3 recompute (stagger mode).
+        # At this point live tensors: H1, H3, dA, A, dH1, dH3,
+        # Xe_pad, dYe_pad. We free H1/H3/dA now (consumed by SwiGLU+dGate).
+        #
+        # Order: dW2 → free → re-dequant W1 → dX_part1 → free W1 →
+        #        dW1 → free → re-dequant W3 → dX_part2 → free W3 → dW3 → free
+        del H1, H3, dA  # Consumed by swiglu_bwd + dgate; free before wgrad
 
-      # Phase A: dW2 = wgrad_w2(A, dYe) → fused_update → free dW2, A, dYe
-      dW2 = torch.empty(int(E), int(Dff), int(H), device=device, dtype=torch.bfloat16)
-      _C.bf16_wgrad_w2_cublaslt(
-        A.data_ptr(),
-        dYe_pad.data_ptr(),
-        dW2.data_ptr(),
-        offs_host.data_ptr(),
-        int(E), int(H), int(Dff),
-        stream,
-      )
-      del A, dYe_pad  # Free ~(max_pad*Dff + max_pad*H)*2 bytes
-      fused_eco.fused_update(moe_ref, 'W2', dW2)
-      del dW2  # Free ~448 MiB
+        # Phase A: dW2 = wgrad_w2(A, dYe) → fused_update → free dW2, A, dYe
+        dW2 = torch.empty(int(E), int(Dff), int(H), device=device, dtype=torch.bfloat16)
+        _C.bf16_wgrad_w2_cublaslt(
+          A.data_ptr(),
+          dYe_pad.data_ptr(),
+          dW2.data_ptr(),
+          offs_host.data_ptr(),
+          int(E), int(H), int(Dff),
+          stream,
+        )
+        del A, dYe_pad  # Free ~(max_pad*Dff + max_pad*H)*2 bytes
+        fused_eco.fused_update(moe_ref, 'W2', dW2)
+        del dW2  # Free ~448 MiB
 
-      # Phase B: dX from W1.T — re-dequant W1 (was freed after H1 recompute).
-      # Dequant is fast (~0.5ms), saves 1.3 GiB vs keeping W1 alive.
-      W1 = dequant_nvfp4_to_bf16_transient(
-        moe_ref._W1_packed, moe_ref._W1_scale, moe_ref._W1_gs, gs, transpose=True)
-      dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
-      del W1  # Free ~1.3 GiB
+        # Phase B: dX from W1.T — re-dequant W1 (was freed after H1 recompute).
+        # Dequant is fast (~0.5ms), saves 1.3 GiB vs keeping W1 alive.
+        W1 = dequant_nvfp4_to_bf16_transient(
+          moe_ref._W1_packed, moe_ref._W1_scale, moe_ref._W1_gs, gs, transpose=True)
+        dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
+        del W1  # Free ~1.3 GiB
 
-      # Phase C: dW1 = wgrad_w13(Xe, dH1) → fused_update → free
-      dW1 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
-      _C.bf16_wgrad_w13_cublaslt(
-        Xe_pad.data_ptr(),
-        dH1.data_ptr(),
-        dW1.data_ptr(),
-        offs_host.data_ptr(),
-        int(E), int(H), int(Dff),
-        stream,
-      )
-      del dH1
-      fused_eco.fused_update(moe_ref, 'W1', dW1)
-      del dW1
+        # Phase C: dW1 = wgrad_w13(Xe, dH1) → fused_update → free
+        dW1 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
+        _C.bf16_wgrad_w13_cublaslt(
+          Xe_pad.data_ptr(),
+          dH1.data_ptr(),
+          dW1.data_ptr(),
+          offs_host.data_ptr(),
+          int(E), int(H), int(Dff),
+          stream,
+        )
+        del dH1
+        fused_eco.fused_update(moe_ref, 'W1', dW1)
+        del dW1
 
-      # Phase D: dW3 = wgrad_w13(Xe, dH3) → fused_update → free Xe_pad (~1.2 GiB)
-      # Done BEFORE dX+=W3.T so Xe_pad is freed, making room for grouped_mm temp.
-      dW3 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
-      _C.bf16_wgrad_w13_cublaslt(
-        Xe_pad.data_ptr(),
-        dH3.data_ptr(),
-        dW3.data_ptr(),
-        offs_host.data_ptr(),
-        int(E), int(H), int(Dff),
-        stream,
-      )
-      del Xe_pad  # Free ~1.2 GiB before grouped_mm allocation
+        # Phase D: dW3 = wgrad_w13(Xe, dH3) → fused_update → free Xe_pad (~1.2 GiB)
+        # Done BEFORE dX+=W3.T so Xe_pad is freed, making room for grouped_mm temp.
+        dW3 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
+        _C.bf16_wgrad_w13_cublaslt(
+          Xe_pad.data_ptr(),
+          dH3.data_ptr(),
+          dW3.data_ptr(),
+          offs_host.data_ptr(),
+          int(E), int(H), int(Dff),
+          stream,
+        )
+        del Xe_pad  # Free ~1.2 GiB before grouped_mm allocation
 
-      # Phase E: dX += W3.T contribution — re-dequant W3 BEFORE fused_update
-      # modifies the NVFP4 buffers in-place, so dX uses the ORIGINAL W3.
-      # Xe_pad freed above; now we have room for grouped_mm temp (~1.23 GiB).
-      W3 = dequant_nvfp4_to_bf16_transient(
-        moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
-      dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
-      del W3, dH3  # Free ~1.3 GiB + dH3
+        # Phase E: dX += W3.T contribution — re-dequant W3 BEFORE fused_update
+        # modifies the NVFP4 buffers in-place, so dX uses the ORIGINAL W3.
+        # Xe_pad freed above; now we have room for grouped_mm temp (~1.23 GiB).
+        W3 = dequant_nvfp4_to_bf16_transient(
+          moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
+        dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+        del W3, dH3  # Free ~1.3 GiB + dH3
 
-      # Phase F: fused_update for W3 — AFTER dX has been computed from original W3.
-      fused_eco.fused_update(moe_ref, 'W3', dW3)
-      del dW3
-      fused_eco.refresh_layer_cache(moe_ref)
+        # Phase F: fused_update for W3 — AFTER dX has been computed from original W3.
+        fused_eco.fused_update(moe_ref, 'W3', dW3)
+        del dW3
+        fused_eco.refresh_layer_cache(moe_ref)
 
     else:
-      # Standard backward (no fused ECO): compute wgrad, dX, return gradients
-      dW2 = torch.empty(int(E), int(Dff), int(H), device=device, dtype=torch.bfloat16)
-      _C.bf16_wgrad_w2_cublaslt(
-        A.data_ptr(),
-        dYe_pad.data_ptr(),
-        dW2.data_ptr(),
-        offs_host.data_ptr(),
-        int(E), int(H), int(Dff),
-        stream,
-      )
+      with _nvtx("moe_bs/bwd_wgrad"):
+        # Standard backward (no fused ECO): compute wgrad, dX, return gradients
+        dW2 = torch.empty(int(E), int(Dff), int(H), device=device, dtype=torch.bfloat16)
+        _C.bf16_wgrad_w2_cublaslt(
+          A.data_ptr(),
+          dYe_pad.data_ptr(),
+          dW2.data_ptr(),
+          offs_host.data_ptr(),
+          int(E), int(H), int(Dff),
+          stream,
+        )
 
-      dW1 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
-      _C.bf16_wgrad_w13_cublaslt(
-        Xe_pad.data_ptr(),
-        dH1.data_ptr(),
-        dW1.data_ptr(),
-        offs_host.data_ptr(),
-        int(E), int(H), int(Dff),
-        stream,
-      )
+        dW1 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
+        _C.bf16_wgrad_w13_cublaslt(
+          Xe_pad.data_ptr(),
+          dH1.data_ptr(),
+          dW1.data_ptr(),
+          offs_host.data_ptr(),
+          int(E), int(H), int(Dff),
+          stream,
+        )
 
-      dW3 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
-      _C.bf16_wgrad_w13_cublaslt(
-        Xe_pad.data_ptr(),
-        dH3.data_ptr(),
-        dW3.data_ptr(),
-        offs_host.data_ptr(),
-        int(E), int(H), int(Dff),
-        stream,
-      )
+        dW3 = torch.empty(int(E), int(H), int(Dff), device=device, dtype=torch.bfloat16)
+        _C.bf16_wgrad_w13_cublaslt(
+          Xe_pad.data_ptr(),
+          dH3.data_ptr(),
+          dW3.data_ptr(),
+          offs_host.data_ptr(),
+          int(E), int(H), int(Dff),
+          stream,
+        )
 
-      dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
-      dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
-      del W1, W3, A, dH1, dH3, Xe_pad, dYe_pad
+        dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
+        dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+        del W1, W3, A, dH1, dH3, Xe_pad, dYe_pad
 
-    dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-      dX_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
-      _C.gather_from_pad_bf16(dX_pad.data_ptr(), dX_sorted.data_ptr(), int(M_recv), int(H), stream)
-      _C.scatter_dx_dist_bf16(
-        dX_sorted.data_ptr(),
-        row_id.data_ptr(),
-        dX.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
-    else:
-      _C.scatter_dx_bf16_internal(
-        dX_pad.data_ptr(),
-        row_id.data_ptr(),
-        dX.data_ptr(),
-        int(M_recv), int(T), int(H), int(K),
-        stream,
-      )
+    with _nvtx("moe_bs/bwd_input_grad"):
+      dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
+      if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dX_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
+        _C.gather_from_pad_bf16(dX_pad.data_ptr(), dX_sorted.data_ptr(), int(M_recv), int(H), stream)
+        _C.scatter_dx_dist_bf16(
+          dX_sorted.data_ptr(),
+          row_id.data_ptr(),
+          dX.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
+      else:
+        _C.scatter_dx_bf16_internal(
+          dX_pad.data_ptr(),
+          row_id.data_ptr(),
+          dX.data_ptr(),
+          int(M_recv), int(T), int(H), int(K),
+          stream,
+        )
 
     dGates = dGates_tk_f32.to(dtype=torch.bfloat16)
 

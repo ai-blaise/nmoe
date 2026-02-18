@@ -32,10 +32,21 @@ Fused Bias Update (Performance Optimization):
 
 import os
 import ctypes
+from contextlib import contextmanager
 import torch
 import triton
 import triton.language as tl
 from typing import Optional, Tuple
+
+
+@contextmanager
+def _nvtx(name: str):
+    """Emit an NVTX range visible in Nsight Systems / nvprof."""
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 # ---------------------------------------------------------------------------
@@ -234,42 +245,43 @@ def fused_update_bias_from_expert_ids(
         - bias must be float32 and contiguous
         - expert_ids must be int32 and contiguous
     """
-    assert expert_ids.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
-    assert bias.dtype == torch.float32, "Bias must be float32"
-    assert expert_ids.dtype == torch.int32, "expert_ids must be int32"
+    with _nvtx("fused_router/update_bias_from_expert_ids"):
+        assert expert_ids.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
+        assert bias.dtype == torch.float32, "Bias must be float32"
+        assert expert_ids.dtype == torch.int32, "expert_ids must be int32"
 
-    expert_ids = expert_ids.contiguous()
-    bias = bias.contiguous()
+        expert_ids = expert_ids.contiguous()
+        bias = bias.contiguous()
 
-    E = bias.shape[0]
-    TK = expert_ids.numel()
+        E = bias.shape[0]
+        TK = expert_ids.numel()
 
-    # Allocate temporary counts buffer (zeroed)
-    counts = torch.zeros(E, dtype=torch.float32, device=bias.device)
+        # Allocate temporary counts buffer (zeroed)
+        counts = torch.zeros(E, dtype=torch.float32, device=bias.device)
 
-    # Kernel 1: Parallel bincount
-    BLOCK = 1024
-    grid = ((TK + BLOCK - 1) // BLOCK,)
-    _bincount_kernel[grid](
-        expert_ids.view(-1),
-        counts,
-        TK,
-        BLOCK=BLOCK,
-    )
+        # Kernel 1: Parallel bincount
+        BLOCK = 1024
+        grid = ((TK + BLOCK - 1) // BLOCK,)
+        _bincount_kernel[grid](
+            expert_ids.view(-1),
+            counts,
+            TK,
+            BLOCK=BLOCK,
+        )
 
-    # Kernel 2: Fused bias update (single block)
-    BLOCK_E = triton.next_power_of_2(E)
-    BLOCK_E = max(BLOCK_E, 32)
-    BLOCK_E = min(BLOCK_E, 1024)
+        # Kernel 2: Fused bias update (single block)
+        BLOCK_E = triton.next_power_of_2(E)
+        BLOCK_E = max(BLOCK_E, 32)
+        BLOCK_E = min(BLOCK_E, 1024)
 
-    _update_bias_fused_kernel[(1,)](
-        counts,
-        bias,
-        float(TK),
-        E,
-        gamma,
-        BLOCK_E=BLOCK_E,
-    )
+        _update_bias_fused_kernel[(1,)](
+            counts,
+            bias,
+            float(TK),
+            E,
+            gamma,
+            BLOCK_E=BLOCK_E,
+        )
 
 
 def fused_update_bias_from_counts(
@@ -297,43 +309,44 @@ def fused_update_bias_from_counts(
         pre-normalized (sums to 1.0), which is the case after
         Transformer.forward() normalizes loads across EP ranks.
     """
-    assert expert_counts.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
-    assert bias.dtype == torch.float32, "Bias must be float32"
+    with _nvtx("fused_router/update_bias_from_counts"):
+        assert expert_counts.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
+        assert bias.dtype == torch.float32, "Bias must be float32"
 
-    expert_counts = expert_counts.contiguous()
-    bias = bias.contiguous()
+        expert_counts = expert_counts.contiguous()
+        bias = bias.contiguous()
 
-    E = bias.shape[0]
+        E = bias.shape[0]
 
-    # Convert counts to float32 if needed
-    if expert_counts.dtype != torch.float32:
-        counts = expert_counts.float()
-    else:
-        counts = expert_counts
+        # Convert counts to float32 if needed
+        if expert_counts.dtype != torch.float32:
+            counts = expert_counts.float()
+        else:
+            counts = expert_counts
 
-    BLOCK_E = triton.next_power_of_2(E)
-    BLOCK_E = max(BLOCK_E, 32)
-    BLOCK_E = min(BLOCK_E, 1024)
+        BLOCK_E = triton.next_power_of_2(E)
+        BLOCK_E = max(BLOCK_E, 32)
+        BLOCK_E = min(BLOCK_E, 1024)
 
-    if total is not None:
-        # Unnormalized counts with known total - use standard kernel
-        _update_bias_fused_kernel[(1,)](
-            counts,
-            bias,
-            float(total),
-            E,
-            gamma,
-            BLOCK_E=BLOCK_E,
-        )
-    else:
-        # Pre-normalized loads (sum to 1.0) - use normalized kernel
-        _update_bias_normalized_kernel[(1,)](
-            counts,
-            bias,
-            E,
-            gamma,
-            BLOCK_E=BLOCK_E,
-        )
+        if total is not None:
+            # Unnormalized counts with known total - use standard kernel
+            _update_bias_fused_kernel[(1,)](
+                counts,
+                bias,
+                float(total),
+                E,
+                gamma,
+                BLOCK_E=BLOCK_E,
+            )
+        else:
+            # Pre-normalized loads (sum to 1.0) - use normalized kernel
+            _update_bias_normalized_kernel[(1,)](
+                counts,
+                bias,
+                E,
+                gamma,
+                BLOCK_E=BLOCK_E,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +411,21 @@ def _call_fused_router_backward(
     route_scale: float,
 ) -> torch.Tensor:
     """Call the fused CUDA backward kernel; returns grad_router_weight [D, E] BF16."""
+    with _nvtx("fused_router/call_fused_router_backward"):
+        return _call_fused_router_backward_impl(
+            hidden, router_weight, expert_ids, gates_f32, grad_gates_f32, route_scale
+        )
+
+
+def _call_fused_router_backward_impl(
+    hidden: torch.Tensor,
+    router_weight: torch.Tensor,
+    expert_ids: torch.Tensor,
+    gates_f32: torch.Tensor,
+    grad_gates_f32: torch.Tensor,
+    route_scale: float,
+) -> torch.Tensor:
+    """Inner implementation of fused CUDA backward kernel call."""
     lib = _load_router_bwd()
 
     T, D = hidden.shape
@@ -579,51 +607,52 @@ class _FusedRouterFunction(torch.autograd.Function):
         dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass using fused Triton kernel."""
-        T, D = hidden.shape
-        E = router_weight.shape[1]
-        K = topk
+        with _nvtx("fused_router/forward"):
+            T, D = hidden.shape
+            E = router_weight.shape[1]
+            K = topk
 
-        # Ensure inputs are contiguous
-        hidden = hidden.contiguous()
+            # Ensure inputs are contiguous
+            hidden = hidden.contiguous()
 
-        # Allocate outputs
-        expert_ids = torch.empty(T, K, dtype=torch.int32, device=hidden.device)
-        gates = torch.empty(T, K, dtype=torch.float16, device=hidden.device)
-        dispatch_indices = torch.empty(T, K, dtype=torch.int32, device=hidden.device)
-        expert_counts = torch.zeros(E, dtype=torch.int32, device=hidden.device)
+            # Allocate outputs
+            expert_ids = torch.empty(T, K, dtype=torch.int32, device=hidden.device)
+            gates = torch.empty(T, K, dtype=torch.float16, device=hidden.device)
+            dispatch_indices = torch.empty(T, K, dtype=torch.int32, device=hidden.device)
+            expert_counts = torch.zeros(E, dtype=torch.int32, device=hidden.device)
 
-        # Choose block sizes
-        BLOCK_E = triton.next_power_of_2(E)
-        BLOCK_E = max(BLOCK_E, 32)
-        BLOCK_E = min(BLOCK_E, 256)
+            # Choose block sizes
+            BLOCK_E = triton.next_power_of_2(E)
+            BLOCK_E = max(BLOCK_E, 32)
+            BLOCK_E = min(BLOCK_E, 256)
 
-        # Launch fused kernel
-        grid = (T,)
-        _fused_router_kernel[grid](
-            hidden,
-            router_weight,
-            bias,
-            expert_ids,
-            gates,
-            dispatch_indices,
-            expert_counts,
-            T=T,
-            D=D,
-            E=E,
-            K=K,
-            stride_h_t=hidden.stride(0),
-            stride_h_d=hidden.stride(1),
-            stride_w_d=router_weight.stride(0),
-            stride_w_e=router_weight.stride(1),
-            route_scale=route_scale,
-            BLOCK_E=BLOCK_E,
-        )
+            # Launch fused kernel
+            grid = (T,)
+            _fused_router_kernel[grid](
+                hidden,
+                router_weight,
+                bias,
+                expert_ids,
+                gates,
+                dispatch_indices,
+                expert_counts,
+                T=T,
+                D=D,
+                E=E,
+                K=K,
+                stride_h_t=hidden.stride(0),
+                stride_h_d=hidden.stride(1),
+                stride_w_d=router_weight.stride(0),
+                stride_w_e=router_weight.stride(1),
+                route_scale=route_scale,
+                BLOCK_E=BLOCK_E,
+            )
 
-        # Save for backward
-        ctx.save_for_backward(hidden, router_weight, expert_ids, gates)
-        ctx.route_scale = route_scale
+            # Save for backward
+            ctx.save_for_backward(hidden, router_weight, expert_ids, gates)
+            ctx.route_scale = route_scale
 
-        return expert_ids, gates.to(dtype), dispatch_indices, expert_counts
+            return expert_ids, gates.to(dtype), dispatch_indices, expert_counts
 
     @staticmethod
     def backward(ctx, grad_expert_ids, grad_gates, grad_dispatch_indices, grad_expert_counts):
@@ -635,26 +664,27 @@ class _FusedRouterFunction(torch.autograd.Function):
         Uses a fused CUDA kernel (router_bwd.cu) that exploits the TopK
         sparsity to avoid materializing the dense [T, E] intermediates.
         """
-        hidden, router_weight, expert_ids, gates = ctx.saved_tensors
-        route_scale = ctx.route_scale
+        with _nvtx("fused_router/backward"):
+            hidden, router_weight, expert_ids, gates = ctx.saved_tensors
+            route_scale = ctx.route_scale
 
-        grad_router_weight = None
+            grad_router_weight = None
 
-        if router_weight.requires_grad and grad_gates is not None:
-            gates_f32 = gates.float()
-            grad_gates_f32 = grad_gates.float()
+            if router_weight.requires_grad and grad_gates is not None:
+                gates_f32 = gates.float()
+                grad_gates_f32 = grad_gates.float()
 
-            grad_router_weight = _call_fused_router_backward(
-                hidden.contiguous(),
-                router_weight.contiguous(),
-                expert_ids.contiguous(),
-                gates_f32.contiguous(),
-                grad_gates_f32.contiguous(),
-                route_scale,
-            )
+                grad_router_weight = _call_fused_router_backward(
+                    hidden.contiguous(),
+                    router_weight.contiguous(),
+                    expert_ids.contiguous(),
+                    gates_f32.contiguous(),
+                    grad_gates_f32.contiguous(),
+                    route_scale,
+                )
 
-        # Return gradients for all inputs (None for non-differentiable ones)
-        return None, grad_router_weight, None, None, None, None
+            # Return gradients for all inputs (None for non-differentiable ones)
+            return None, grad_router_weight, None, None, None, None
 
 
 class FusedRouterTopKDispatch(torch.nn.Module):
@@ -727,24 +757,25 @@ class FusedRouterTopKDispatch(torch.nn.Module):
             dispatch_indices: [T, K] per-expert offsets (int32)
             expert_counts: [E] number of tokens per expert (int32)
         """
-        # Flatten to [T, D]
-        original_shape = hidden.shape
-        if hidden.dim() == 3:
-            hidden = hidden.view(-1, hidden.size(-1))
+        with _nvtx("fused_router/module_forward"):
+            # Flatten to [T, D]
+            original_shape = hidden.shape
+            if hidden.dim() == 3:
+                hidden = hidden.view(-1, hidden.size(-1))
 
-        T, D = hidden.shape
+            T, D = hidden.shape
 
-        assert D == self.hidden_dim, f"Hidden dim mismatch: got {D}, expected {self.hidden_dim}"
+            assert D == self.hidden_dim, f"Hidden dim mismatch: got {D}, expected {self.hidden_dim}"
 
-        # Use custom autograd function for backward support
-        return _FusedRouterFunction.apply(
-            hidden,
-            self.router_weight,
-            self.bias,
-            self.topk,
-            self.route_scale,
-            self.dtype,
-        )
+            # Use custom autograd function for backward support
+            return _FusedRouterFunction.apply(
+                hidden,
+                self.router_weight,
+                self.bias,
+                self.topk,
+                self.route_scale,
+                self.dtype,
+            )
 
     @torch.no_grad()
     def update_bias(
@@ -772,12 +803,13 @@ class FusedRouterTopKDispatch(torch.nn.Module):
             - When expert_ids is provided: uses fused bincount + update (2 kernels)
             - When expert_loads is provided: uses fused update only (1 kernel)
         """
-        if expert_ids is not None:
-            # Most efficient path: fused bincount + bias update
-            # 2 Triton kernel launches, no CPU sync
-            fused_update_bias_from_expert_ids(expert_ids, self.bias, gamma)
-        else:
-            # Fallback: expert counts already computed, just do fused update
-            # 1 Triton kernel launch, no CPU sync
-            fused_update_bias_from_counts(expert_loads, self.bias, gamma)
+        with _nvtx("fused_router/update_bias"):
+            if expert_ids is not None:
+                # Most efficient path: fused bincount + bias update
+                # 2 Triton kernel launches, no CPU sync
+                fused_update_bias_from_expert_ids(expert_ids, self.bias, gamma)
+            else:
+                # Fallback: expert counts already computed, just do fused update
+                # 1 Triton kernel launch, no CPU sync
+                fused_update_bias_from_counts(expert_loads, self.bias, gamma)
 

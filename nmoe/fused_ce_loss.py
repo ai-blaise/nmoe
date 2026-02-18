@@ -35,9 +35,20 @@ This module provides:
 Both pretraining (EOS masking) and SFT (explicit loss_mask) modes are supported.
 """
 
+from contextlib import contextmanager
 from typing import Optional
 import torch
 import torch.nn.functional as F
+
+
+@contextmanager
+def _nvtx(name: str):
+    """Emit an NVTX range visible in Nsight Systems / nvprof."""
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 class FusedMaskedCELossFunction(torch.autograd.Function):
@@ -73,57 +84,58 @@ class FusedMaskedCELossFunction(torch.autograd.Function):
         Returns:
             Scalar loss tensor (float32)
         """
-        # Reshape to 2D for cross_entropy
-        # Using .reshape() instead of .view() for non-contiguous tensors
-        N = targets.numel()
-        logits_2d = logits.reshape(N, vocab_size)
-        targets_1d = targets.reshape(N)
-        mask_1d = mask.reshape(N)
+        with _nvtx("fused_ce/forward"):
+            # Reshape to 2D for cross_entropy
+            # Using .reshape() instead of .view() for non-contiguous tensors
+            N = targets.numel()
+            logits_2d = logits.reshape(N, vocab_size)
+            targets_1d = targets.reshape(N)
+            mask_1d = mask.reshape(N)
 
-        # Cast to FP32 for numerical stability
-        # BF16 softmax over vocab_size=129K causes catastrophic precision loss
-        logits_fp32 = logits_2d.float()
+            # Cast to FP32 for numerical stability
+            # BF16 softmax over vocab_size=129K causes catastrophic precision loss
+            logits_fp32 = logits_2d.float()
 
-        # Compute unreduced cross-entropy
-        # PyTorch's F.cross_entropy is highly optimized (uses cuDNN internally)
-        with torch.no_grad():
-            # Compute log_softmax for both forward and backward
-            # We compute this once and reuse it
-            log_probs = F.log_softmax(logits_fp32, dim=-1)
+            # Compute unreduced cross-entropy
+            # PyTorch's F.cross_entropy is highly optimized (uses cuDNN internally)
+            with torch.no_grad():
+                # Compute log_softmax for both forward and backward
+                # We compute this once and reuse it
+                log_probs = F.log_softmax(logits_fp32, dim=-1)
 
-        # NLL at target positions
-        # This is equivalent to F.cross_entropy with reduction='none'
-        # but we have log_probs already computed
-        nll = F.nll_loss(log_probs, targets_1d, reduction='none')
+            # NLL at target positions
+            # This is equivalent to F.cross_entropy with reduction='none'
+            # but we have log_probs already computed
+            nll = F.nll_loss(log_probs, targets_1d, reduction='none')
 
-        # Apply label smoothing if requested
-        if label_smoothing > 0.0:
-            smooth_loss = -log_probs.mean(dim=-1)
-            nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth_loss
+            # Apply label smoothing if requested
+            if label_smoothing > 0.0:
+                smooth_loss = -log_probs.mean(dim=-1)
+                nll = (1.0 - label_smoothing) * nll + label_smoothing * smooth_loss
 
-        # Fused masked reduction using torch.dot
-        # This replaces: (nll * mask).sum() with a single BLAS call
-        # torch.dot requires 1D tensors of same dtype
-        mask_fp32 = mask_1d.float() if mask_1d.dtype != torch.float32 else mask_1d
+            # Fused masked reduction using torch.dot
+            # This replaces: (nll * mask).sum() with a single BLAS call
+            # torch.dot requires 1D tensors of same dtype
+            mask_fp32 = mask_1d.float() if mask_1d.dtype != torch.float32 else mask_1d
 
-        # Use torch.dot for fused mul+sum (1 kernel instead of 2)
-        masked_sum = torch.dot(nll, mask_fp32)
+            # Use torch.dot for fused mul+sum (1 kernel instead of 2)
+            masked_sum = torch.dot(nll, mask_fp32)
 
-        # Compute mask sum with clamp to avoid division by zero
-        mask_sum = mask_fp32.sum().clamp(min=1.0)
+            # Compute mask sum with clamp to avoid division by zero
+            mask_sum = mask_fp32.sum().clamp(min=1.0)
 
-        # Final division
-        loss = masked_sum / mask_sum
+            # Final division
+            loss = masked_sum / mask_sum
 
-        # Save for backward
-        # Store log_probs compressed as BF16 to save memory (accuracy loss is acceptable for gradients)
-        ctx.save_for_backward(log_probs.to(logits.dtype), targets_1d, mask_fp32)
-        ctx.mask_sum = mask_sum
-        ctx.vocab_size = vocab_size
-        ctx.original_shape = logits.shape
-        ctx.label_smoothing = label_smoothing
+            # Save for backward
+            # Store log_probs compressed as BF16 to save memory (accuracy loss is acceptable for gradients)
+            ctx.save_for_backward(log_probs.to(logits.dtype), targets_1d, mask_fp32)
+            ctx.mask_sum = mask_sum
+            ctx.vocab_size = vocab_size
+            ctx.original_shape = logits.shape
+            ctx.label_smoothing = label_smoothing
 
-        return loss
+            return loss
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -135,53 +147,54 @@ class FusedMaskedCELossFunction(torch.autograd.Function):
         For masked loss:
             d(loss)/d(logits[i]) = (softmax[i] - one_hot[i]) * mask[i] / mask_sum
         """
-        log_probs, targets_1d, mask_fp32 = ctx.saved_tensors
-        mask_sum = ctx.mask_sum
-        vocab_size = ctx.vocab_size
-        label_smoothing = ctx.label_smoothing
+        with _nvtx("fused_ce/backward"):
+            log_probs, targets_1d, mask_fp32 = ctx.saved_tensors
+            mask_sum = ctx.mask_sum
+            vocab_size = ctx.vocab_size
+            label_smoothing = ctx.label_smoothing
 
-        # Convert log_probs back to FP32 for gradient computation
-        log_probs_fp32 = log_probs.float()
+            # Convert log_probs back to FP32 for gradient computation
+            log_probs_fp32 = log_probs.float()
 
-        # Compute softmax from log_softmax
-        probs = log_probs_fp32.exp()
+            # Compute softmax from log_softmax
+            probs = log_probs_fp32.exp()
 
-        # Gradient of cross-entropy: softmax - one_hot
-        N = targets_1d.numel()
-        grad_logits = probs.clone()
+            # Gradient of cross-entropy: softmax - one_hot
+            N = targets_1d.numel()
+            grad_logits = probs.clone()
 
-        # Subtract 1 at target positions (one_hot subtraction)
-        # This is done in-place for efficiency
-        grad_logits.scatter_add_(
-            dim=1,
-            index=targets_1d.unsqueeze(1),
-            src=torch.full((N, 1), -1.0, device=grad_logits.device, dtype=grad_logits.dtype)
-        )
+            # Subtract 1 at target positions (one_hot subtraction)
+            # This is done in-place for efficiency
+            grad_logits.scatter_add_(
+                dim=1,
+                index=targets_1d.unsqueeze(1),
+                src=torch.full((N, 1), -1.0, device=grad_logits.device, dtype=grad_logits.dtype)
+            )
 
-        # Apply label smoothing gradient adjustment
-        if label_smoothing > 0.0:
-            # For smoothed loss: (1-eps)*CE + eps*uniform_loss
-            # Gradient adjustment: (1-eps)*grad_CE + eps*grad_uniform
-            # grad_uniform = probs - 1/V (but since we want -log_probs.mean() derivative)
-            # This simplifies to scaling the gradient
-            grad_logits = (1.0 - label_smoothing) * grad_logits + label_smoothing * probs
-            # Subtract the uniform part
-            grad_logits = grad_logits - label_smoothing / vocab_size
+            # Apply label smoothing gradient adjustment
+            if label_smoothing > 0.0:
+                # For smoothed loss: (1-eps)*CE + eps*uniform_loss
+                # Gradient adjustment: (1-eps)*grad_CE + eps*grad_uniform
+                # grad_uniform = probs - 1/V (but since we want -log_probs.mean() derivative)
+                # This simplifies to scaling the gradient
+                grad_logits = (1.0 - label_smoothing) * grad_logits + label_smoothing * probs
+                # Subtract the uniform part
+                grad_logits = grad_logits - label_smoothing / vocab_size
 
-        # Apply mask: scale each row by mask value
-        # Shape: [N, V] * [N, 1] -> [N, V]
-        mask_scaled = (mask_fp32 / mask_sum).unsqueeze(1)
-        grad_logits = grad_logits * mask_scaled
+            # Apply mask: scale each row by mask value
+            # Shape: [N, V] * [N, 1] -> [N, V]
+            mask_scaled = (mask_fp32 / mask_sum).unsqueeze(1)
+            grad_logits = grad_logits * mask_scaled
 
-        # Scale by incoming gradient
-        grad_logits = grad_logits * grad_output
+            # Scale by incoming gradient
+            grad_logits = grad_logits * grad_output
 
-        # Reshape to original shape
-        grad_logits = grad_logits.reshape(ctx.original_shape)
+            # Reshape to original shape
+            grad_logits = grad_logits.reshape(ctx.original_shape)
 
-        # Return gradients for: logits, targets, mask, vocab_size, label_smoothing
-        # Only logits has gradients
-        return grad_logits, None, None, None, None
+            # Return gradients for: logits, targets, mask, vocab_size, label_smoothing
+            # Only logits has gradients
+            return grad_logits, None, None, None, None
 
 
 def fused_masked_ce_loss(
@@ -216,21 +229,22 @@ def fused_masked_ce_loss(
     Example (SFT mode with explicit mask):
         >>> loss = fused_masked_ce_loss(logits, targets, mask=loss_mask)
     """
-    # Infer vocab_size if not provided
-    if vocab_size is None:
-        vocab_size = logits.shape[-1]
+    with _nvtx("fused_ce/masked_ce_loss"):
+        # Infer vocab_size if not provided
+        if vocab_size is None:
+            vocab_size = logits.shape[-1]
 
-    # Generate mask if not provided
-    if mask is None:
-        if eos_token_id is None:
-            raise ValueError("Either mask or eos_token_id must be provided")
-        # Fused comparison + cast: (targets != eos_id).float()
-        # This is 1 kernel on modern PyTorch (fused compare-cast)
-        mask = (targets != eos_token_id).float()
+        # Generate mask if not provided
+        if mask is None:
+            if eos_token_id is None:
+                raise ValueError("Either mask or eos_token_id must be provided")
+            # Fused comparison + cast: (targets != eos_id).float()
+            # This is 1 kernel on modern PyTorch (fused compare-cast)
+            mask = (targets != eos_token_id).float()
 
-    return FusedMaskedCELossFunction.apply(
-        logits, targets, mask, vocab_size, label_smoothing
-    )
+        return FusedMaskedCELossFunction.apply(
+            logits, targets, mask, vocab_size, label_smoothing
+        )
 
 
 class FusedMaskedCELoss(torch.nn.Module):
@@ -276,14 +290,15 @@ class FusedMaskedCELoss(torch.nn.Module):
         Returns:
             Scalar loss tensor
         """
-        return fused_masked_ce_loss(
-            logits=logits,
-            targets=targets,
-            mask=mask,
-            vocab_size=self.vocab_size,
-            eos_token_id=self.eos_token_id,
-            label_smoothing=self.label_smoothing,
-        )
+        with _nvtx("fused_ce/module_forward"):
+            return fused_masked_ce_loss(
+                logits=logits,
+                targets=targets,
+                mask=mask,
+                vocab_size=self.vocab_size,
+                eos_token_id=self.eos_token_id,
+                label_smoothing=self.label_smoothing,
+            )
 
 
 # ============================================================================
@@ -322,39 +337,40 @@ def simple_fused_masked_ce_loss(
     Returns:
         Scalar loss tensor
     """
-    if vocab_size is None:
-        vocab_size = logits.shape[-1]
+    with _nvtx("fused_ce/simple_masked_ce_loss"):
+        if vocab_size is None:
+            vocab_size = logits.shape[-1]
 
-    N = targets.numel()
+        N = targets.numel()
 
-    # Reshape inputs
-    logits_2d = logits.reshape(N, vocab_size)
-    targets_1d = targets.reshape(N)
+        # Reshape inputs
+        logits_2d = logits.reshape(N, vocab_size)
+        targets_1d = targets.reshape(N)
 
-    # Cast to FP32 for numerical stability
-    logits_fp32 = logits_2d.float()
+        # Cast to FP32 for numerical stability
+        logits_fp32 = logits_2d.float()
 
-    # Compute unreduced cross-entropy (PyTorch's optimized implementation)
-    loss_unreduced = F.cross_entropy(logits_fp32, targets_1d, reduction='none')
+        # Compute unreduced cross-entropy (PyTorch's optimized implementation)
+        loss_unreduced = F.cross_entropy(logits_fp32, targets_1d, reduction='none')
 
-    # Generate or reshape mask
-    if mask is None:
-        if eos_token_id is None:
-            raise ValueError("Either mask or eos_token_id must be provided")
-        mask_1d = (targets_1d != eos_token_id).float()
-    else:
-        mask_1d = mask.reshape(N)
-        if mask_1d.dtype != torch.float32:
-            mask_1d = mask_1d.float()
+        # Generate or reshape mask
+        if mask is None:
+            if eos_token_id is None:
+                raise ValueError("Either mask or eos_token_id must be provided")
+            mask_1d = (targets_1d != eos_token_id).float()
+        else:
+            mask_1d = mask.reshape(N)
+            if mask_1d.dtype != torch.float32:
+                mask_1d = mask_1d.float()
 
-    # Fused masked sum using torch.dot (1 kernel instead of 2 for mul+sum)
-    masked_sum = torch.dot(loss_unreduced, mask_1d)
+        # Fused masked sum using torch.dot (1 kernel instead of 2 for mul+sum)
+        masked_sum = torch.dot(loss_unreduced, mask_1d)
 
-    # Normalize by mask sum
-    mask_sum = mask_1d.sum().clamp(min=1.0)
-    loss = masked_sum / mask_sum
+        # Normalize by mask sum
+        mask_sum = mask_1d.sum().clamp(min=1.0)
+        loss = masked_sum / mask_sum
 
-    return loss
+        return loss
 
 
 # ============================================================================

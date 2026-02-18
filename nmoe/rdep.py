@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import Dict, Optional
 
@@ -20,6 +21,14 @@ from .cuda_errors import (
     cuda_error_context,
 )
 from .nccl_watchdog import get_watchdog
+
+
+def _nvtx(tag: str):
+    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
+        return nullcontext()
+    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
 
 
 def _get_local_world_size() -> int:
@@ -142,22 +151,26 @@ class Rdep:
 
         try:
             if self._mode == 'hybrid':
-                self._setup_hybrid()
+                with _nvtx("rdep/init_hybrid"):
+                    self._setup_hybrid()
             elif self._mode == 'ipc':
-                if profile != 'bf16':
-                    with cuda_error_context("rdep.alloc_blockscaled"):
-                        _C.alloc_blockscaled(capacity, dim, n_local, self.PROFILES[profile])
-                with cuda_error_context("rdep.alloc_bf16"):
-                    _C.alloc_bf16(capacity, dim, n_local)
-                self._setup_ipc()
+                with _nvtx("rdep/init_buffers"):
+                    if profile != 'bf16':
+                        with cuda_error_context("rdep.alloc_blockscaled"):
+                            _C.alloc_blockscaled(capacity, dim, n_local, self.PROFILES[profile])
+                    with cuda_error_context("rdep.alloc_bf16"):
+                        _C.alloc_bf16(capacity, dim, n_local)
+                with _nvtx("rdep/init_ipc"):
+                    self._setup_ipc()
             elif self._mode == 'single':
-                with cuda_error_context("rdep.alloc_bf16"):
-                    _C.alloc_bf16(capacity, dim, n_local)
-                    _C.sync_buffer_ptrs_bf16()
-                if profile != 'bf16':
-                    with cuda_error_context("rdep.alloc_blockscaled"):
-                        _C.alloc_blockscaled(capacity, dim, n_local, self.PROFILES[profile])
-                        _C.sync_buffer_ptrs_blockscaled()
+                with _nvtx("rdep/init_buffers"):
+                    with cuda_error_context("rdep.alloc_bf16"):
+                        _C.alloc_bf16(capacity, dim, n_local)
+                        _C.sync_buffer_ptrs_bf16()
+                    if profile != 'bf16':
+                        with cuda_error_context("rdep.alloc_blockscaled"):
+                            _C.alloc_blockscaled(capacity, dim, n_local, self.PROFILES[profile])
+                            _C.sync_buffer_ptrs_blockscaled()
         except CudaError as e:
             raise RdepError(
                 f"[RDEP] Failed to allocate buffers (mode={self._mode}, capacity={capacity}, dim={dim}): {e}",
@@ -172,47 +185,50 @@ class Rdep:
 
         try:
             uid_size = _C.nvshmem_get_uid_size()
-            if self.rank == 0:
-                _rdep_logger.info("rank=%d: Getting UID (size=%d)...", self.rank, uid_size)
-                with cuda_error_context("nvshmem_get_uid"):
-                    uid = _C.nvshmem_get_uid()
-                _rdep_logger.info("rank=%d: Got UID", self.rank)
-            else:
-                uid = None
+            with _nvtx("rdep/hybrid_bootstrap"):
+                if self.rank == 0:
+                    _rdep_logger.info("rank=%d: Getting UID (size=%d)...", self.rank, uid_size)
+                    with cuda_error_context("nvshmem_get_uid"):
+                        uid = _C.nvshmem_get_uid()
+                    _rdep_logger.info("rank=%d: Got UID", self.rank)
+                else:
+                    uid = None
 
-            if self.rank == 0:
-                _rdep_logger.info("rank=%d: Broadcasting UID via CPU...", self.rank)
-            uid_list = [uid]
-            dist.broadcast_object_list(uid_list, src=0, group=cpu_pg)
-            uid = uid_list[0]
-            if self.rank == 0:
-                _rdep_logger.info("rank=%d: UID broadcast complete", self.rank)
-            if self.rank == 0:
-                _rdep_logger.info("rank=%d: Initializing NVSHMEM...", self.rank)
+                if self.rank == 0:
+                    _rdep_logger.info("rank=%d: Broadcasting UID via CPU...", self.rank)
+                uid_list = [uid]
+                dist.broadcast_object_list(uid_list, src=0, group=cpu_pg)
+                uid = uid_list[0]
+                if self.rank == 0:
+                    _rdep_logger.info("rank=%d: UID broadcast complete", self.rank)
+                if self.rank == 0:
+                    _rdep_logger.info("rank=%d: Initializing NVSHMEM...", self.rank)
 
-            with cuda_error_context("nvshmem_init"):
-                _C.nvshmem_init(uid, self.rank, self.world, self.local_world)
-            if self.rank == 0:
-                _rdep_logger.info("rank=%d: NVSHMEM initialized!", self.rank)
+                with cuda_error_context("nvshmem_init"):
+                    _C.nvshmem_init(uid, self.rank, self.world, self.local_world)
+                if self.rank == 0:
+                    _rdep_logger.info("rank=%d: NVSHMEM initialized!", self.rank)
 
-            with cuda_error_context("nvshmem_alloc_bf16"):
-                _C.nvshmem_alloc_bf16(self.capacity, self.dim, self.n_local)
+                with cuda_error_context("nvshmem_alloc_bf16"):
+                    _C.nvshmem_alloc_bf16(self.capacity, self.dim, self.n_local)
 
             node_id = self.rank // self.local_world
             with cuda_error_context("nvshmem_get_ipc_handle_bf16"):
                 local_handle_bf16 = _C.nvshmem_get_ipc_handle_bf16()
 
-            all_handles_bf16 = [None] * self.world
-            dist.all_gather_object(all_handles_bf16, local_handle_bf16, group=cpu_pg)
-            local_handles_bf16 = []
-            for r in range(self.world):
-                if r // self.local_world == node_id:
-                    local_handles_bf16.append(all_handles_bf16[r])
-            local_handles_bf16_np = np.concatenate(local_handles_bf16)
+            with _nvtx("rdep/hybrid_allgather"):
+                all_handles_bf16 = [None] * self.world
+                dist.all_gather_object(all_handles_bf16, local_handle_bf16, group=cpu_pg)
+                local_handles_bf16 = []
+                for r in range(self.world):
+                    if r // self.local_world == node_id:
+                        local_handles_bf16.append(all_handles_bf16[r])
+                local_handles_bf16_np = np.concatenate(local_handles_bf16)
 
-            with cuda_error_context("nvshmem_open_ipc_handles_bf16"):
-                _C.nvshmem_open_ipc_handles_bf16(local_handles_bf16_np, self.local_world)
-                _C.nvshmem_sync_ipc_buffer_ptrs_bf16()
+            with _nvtx("rdep/hybrid_open"):
+                with cuda_error_context("nvshmem_open_ipc_handles_bf16"):
+                    _C.nvshmem_open_ipc_handles_bf16(local_handles_bf16_np, self.local_world)
+                    _C.nvshmem_sync_ipc_buffer_ptrs_bf16()
 
             dist.barrier(group=cpu_pg)
 
@@ -285,33 +301,40 @@ class Rdep:
         ipc_group = self.ep_group
         try:
             # --- bf16 handles ---
-            with cuda_error_context("get_ipc_handle_bf16"):
-                local_handle_bf16 = _C.get_ipc_handle_bf16()
-            handle_tensor_bf16 = self._ipc_handle_to_int32(local_handle_bf16)
+            with _nvtx("rdep/ipc_get_handle_bf16"):
+                with cuda_error_context("get_ipc_handle_bf16"):
+                    local_handle_bf16 = _C.get_ipc_handle_bf16()
+            with _nvtx("rdep/ipc_to_int32_bf16"):
+                handle_tensor_bf16 = self._ipc_handle_to_int32(local_handle_bf16)
 
-            all_handles_bf16 = [torch.zeros_like(handle_tensor_bf16) for _ in range(self.world)]
-            with wd.guard("all_gather IPC handles bf16"):
-                dist.all_gather(all_handles_bf16, handle_tensor_bf16, group=ipc_group)
+            with _nvtx("rdep/ipc_allgather_bf16"):
+                all_handles_bf16 = [torch.zeros_like(handle_tensor_bf16) for _ in range(self.world)]
+                with wd.guard("all_gather IPC handles bf16"):
+                    dist.all_gather(all_handles_bf16, handle_tensor_bf16, group=ipc_group)
 
             all_handles_bf16_np = self._int32_handles_to_numpy(all_handles_bf16)
-            with cuda_error_context("open_ipc_handles_bf16"):
-                _C.open_ipc_handles_bf16(all_handles_bf16_np, self.world)
-                _C.sync_buffer_ptrs_bf16()
+            with _nvtx("rdep/ipc_open_bf16"):
+                with cuda_error_context("open_ipc_handles_bf16"):
+                    _C.open_ipc_handles_bf16(all_handles_bf16_np, self.world)
+                    _C.sync_buffer_ptrs_bf16()
 
             # --- blockscaled handles (fp8 / nvfp4) ---
             if self.profile != 'bf16':
-                with cuda_error_context("get_ipc_handle_blockscaled"):
-                    local_handle_block = _C.get_ipc_handle_blockscaled()
+                with _nvtx("rdep/ipc_get_handle_block"):
+                    with cuda_error_context("get_ipc_handle_blockscaled"):
+                        local_handle_block = _C.get_ipc_handle_blockscaled()
                 handle_tensor_block = self._ipc_handle_to_int32(local_handle_block)
 
-                all_handles_block = [torch.zeros_like(handle_tensor_block) for _ in range(self.world)]
-                with wd.guard("all_gather IPC handles blockscaled"):
-                    dist.all_gather(all_handles_block, handle_tensor_block, group=ipc_group)
+                with _nvtx("rdep/ipc_allgather_block"):
+                    all_handles_block = [torch.zeros_like(handle_tensor_block) for _ in range(self.world)]
+                    with wd.guard("all_gather IPC handles blockscaled"):
+                        dist.all_gather(all_handles_block, handle_tensor_block, group=ipc_group)
 
                 all_handles_block_np = self._int32_handles_to_numpy(all_handles_block)
-                with cuda_error_context("open_ipc_handles_blockscaled"):
-                    _C.open_ipc_handles_blockscaled(all_handles_block_np, self.world)
-                    _C.sync_buffer_ptrs_blockscaled()
+                with _nvtx("rdep/ipc_open_block"):
+                    with cuda_error_context("open_ipc_handles_blockscaled"):
+                        _C.open_ipc_handles_blockscaled(all_handles_block_np, self.world)
+                        _C.sync_buffer_ptrs_blockscaled()
 
         except CudaError as e:
             raise RdepError(
@@ -321,18 +344,20 @@ class Rdep:
 
     def moe_bf16(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                 W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor) -> torch.Tensor:
-        raise RuntimeError(
-            "BF16 MoE path removed — use blockscaled (dtype=nvfp4). "
-            "The _MoEBf16Fused autograd Function has been deleted; "
-            "set profile='fp8' or profile='nvfp4' and call moe_blockscaled()."
-        )
+        with _nvtx("rdep/moe_bf16"):
+            raise RuntimeError(
+                "BF16 MoE path removed — use blockscaled (dtype=nvfp4). "
+                "The _MoEBf16Fused autograd Function has been deleted; "
+                "set profile='fp8' or profile='nvfp4' and call moe_blockscaled()."
+            )
 
     def moe_blockscaled(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                         W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor,
                         W_cache, fused_eco=None, moe_ref=None) -> torch.Tensor:
-        if self.profile == 'bf16':
-            raise RuntimeError("moe_blockscaled() requires profile in {'fp8','nvfp4'}")
-        return _MoEBlockscaledFused.apply(self, x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
+        with _nvtx("rdep/moe_blockscaled"):
+            if self.profile == 'bf16':
+                raise RuntimeError("moe_blockscaled() requires profile in {'fp8','nvfp4'}")
+            return _MoEBlockscaledFused.apply(self, x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
 
     def dispatch(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                  W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor,
@@ -370,14 +395,15 @@ class Rdep:
                 f"Increase capacity via compute_rdep_capacity() or reduce batch size."
             )
 
-        if self.profile == 'bf16':
-            return self.moe_bf16(x, eid, gates, W1, W3, W2)
-        else:
-            if W_cache is None:
-                raise ValueError(
-                    f"Blockscaled profile '{self.profile}' requires W_cache argument"
-                )
-            return self.moe_blockscaled(x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
+        with _nvtx("rdep/dispatch"):
+            if self.profile == 'bf16':
+                return self.moe_bf16(x, eid, gates, W1, W3, W2)
+            else:
+                if W_cache is None:
+                    raise ValueError(
+                        f"Blockscaled profile '{self.profile}' requires W_cache argument"
+                    )
+                return self.moe_blockscaled(x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
 
 
 class CudaGraphDispatch:

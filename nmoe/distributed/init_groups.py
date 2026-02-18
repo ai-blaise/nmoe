@@ -26,6 +26,8 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import Optional, List, TYPE_CHECKING
 
@@ -36,6 +38,13 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
+
+
+def _nvtx(tag: str):
+    """Return an NVTX range context manager when NMOE_NVTX=1, else a no-op."""
+    if os.getenv("NMOE_NVTX", "0") in ("1", "true", "True") and hasattr(torch.cuda, "nvtx") and hasattr(torch.cuda.nvtx, "range"):
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
 
 # Global process group state
 _EP_GROUP: Optional[ProcessGroup] = None
@@ -209,82 +218,86 @@ def init_nmoe_process_groups(
     _TP_SIZE = tp_size
     _DP_SIZE = dp_size
 
-    # -------------------------------------------------------------------------
-    # Create TP groups (consecutive ranks within each EP rank)
-    # For world=8, tp=2: groups are [0,1], [2,3], [4,5], [6,7]
-    # -------------------------------------------------------------------------
-    if tp_size > 1:
-        tp_groups: List[List[int]] = []
-        for base in range(0, world_size, tp_size):
-            group_ranks = list(range(base, min(base + tp_size, world_size)))
-            if len(group_ranks) == tp_size:
-                tp_groups.append(group_ranks)
+    with _nvtx("dist/init_process_group"):
+        # -------------------------------------------------------------------------
+        # Create TP groups (consecutive ranks within each EP rank)
+        # For world=8, tp=2: groups are [0,1], [2,3], [4,5], [6,7]
+        # -------------------------------------------------------------------------
+        with _nvtx("dist/create_tp_group"):
+            if tp_size > 1:
+                tp_groups: List[List[int]] = []
+                for base in range(0, world_size, tp_size):
+                    group_ranks = list(range(base, min(base + tp_size, world_size)))
+                    if len(group_ranks) == tp_size:
+                        tp_groups.append(group_ranks)
 
-        for ranks in tp_groups:
-            group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
-            if rank in ranks:
-                _TP_GROUP = group
-                _TP_RANK = ranks.index(rank)
-                logger.debug(f"Rank {rank} joined TP group {ranks}, tp_rank={_TP_RANK}")
-    else:
-        _TP_GROUP = None
-        _TP_RANK = 0
+                for ranks in tp_groups:
+                    group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
+                    if rank in ranks:
+                        _TP_GROUP = group
+                        _TP_RANK = ranks.index(rank)
+                        logger.debug(f"Rank {rank} joined TP group {ranks}, tp_rank={_TP_RANK}")
+            else:
+                _TP_GROUP = None
+                _TP_RANK = 0
 
-    # -------------------------------------------------------------------------
-    # Create EP groups (consecutive EP ranks, strided by TP)
-    #
-    # With TP=1 (common SFT case): EP groups are simply consecutive.
-    #   world=128, EP=8: [0..7], [8..15], ..., [120..127]
-    #
-    # With TP>1: EP ranks are interleaved with TP.
-    #   world=8, EP=4, TP=2: [0,2,4,6], [1,3,5,7]
-    # -------------------------------------------------------------------------
-    if ep_size > 1:
-        ep_groups: List[List[int]] = []
-        # Each DP replica (dp_rank) has ep_size*tp_size consecutive global ranks.
-        # Within each DP replica, EP groups are strided by tp_size.
-        for dp_idx in range(dp_size):
-            base = dp_idx * ep_size * tp_size
-            for tp_idx in range(tp_size):
-                group_ranks = [base + e * tp_size + tp_idx for e in range(ep_size)]
-                ep_groups.append(group_ranks)
+        # -------------------------------------------------------------------------
+        # Create EP groups (consecutive EP ranks, strided by TP)
+        #
+        # With TP=1 (common SFT case): EP groups are simply consecutive.
+        #   world=128, EP=8: [0..7], [8..15], ..., [120..127]
+        #
+        # With TP>1: EP ranks are interleaved with TP.
+        #   world=8, EP=4, TP=2: [0,2,4,6], [1,3,5,7]
+        # -------------------------------------------------------------------------
+        with _nvtx("dist/create_ep_group"):
+            if ep_size > 1:
+                ep_groups: List[List[int]] = []
+                # Each DP replica (dp_rank) has ep_size*tp_size consecutive global ranks.
+                # Within each DP replica, EP groups are strided by tp_size.
+                for dp_idx in range(dp_size):
+                    base = dp_idx * ep_size * tp_size
+                    for tp_idx in range(tp_size):
+                        group_ranks = [base + e * tp_size + tp_idx for e in range(ep_size)]
+                        ep_groups.append(group_ranks)
 
-        for ranks in ep_groups:
-            group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
-            if rank in ranks:
-                _EP_GROUP = group
-                _EP_RANK = ranks.index(rank)
-                logger.debug(f"Rank {rank} joined EP group {ranks}, ep_rank={_EP_RANK}")
-    else:
-        _EP_GROUP = None
-        _EP_RANK = 0
+                for ranks in ep_groups:
+                    group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
+                    if rank in ranks:
+                        _EP_GROUP = group
+                        _EP_RANK = ranks.index(rank)
+                        logger.debug(f"Rank {rank} joined EP group {ranks}, ep_rank={_EP_RANK}")
+            else:
+                _EP_GROUP = None
+                _EP_RANK = 0
 
-    # -------------------------------------------------------------------------
-    # Create DP groups (strided by ep_size * tp_size)
-    #
-    # DP ranks are the "same position" across EP replicas.
-    #   world=128, EP=8, TP=1: DP groups are [0,8,16,...,120], [1,9,17,...,121], etc.
-    #   Each DP group has dp_size=16 ranks.
-    #
-    # With TP>1: stride = ep_size * tp_size.
-    #   world=16, EP=4, TP=2: stride=8, dp_size=2. DP groups: [0,8],[1,9],...,[7,15]
-    # -------------------------------------------------------------------------
-    if dp_size > 1:
-        stride = ep_size * tp_size
-        dp_groups: List[List[int]] = []
-        for local_idx in range(stride):
-            group_ranks = [local_idx + d * stride for d in range(dp_size)]
-            dp_groups.append(group_ranks)
+        # -------------------------------------------------------------------------
+        # Create DP groups (strided by ep_size * tp_size)
+        #
+        # DP ranks are the "same position" across EP replicas.
+        #   world=128, EP=8, TP=1: DP groups are [0,8,16,...,120], [1,9,17,...,121], etc.
+        #   Each DP group has dp_size=16 ranks.
+        #
+        # With TP>1: stride = ep_size * tp_size.
+        #   world=16, EP=4, TP=2: stride=8, dp_size=2. DP groups: [0,8],[1,9],...,[7,15]
+        # -------------------------------------------------------------------------
+        with _nvtx("dist/create_dp_group"):
+            if dp_size > 1:
+                stride = ep_size * tp_size
+                dp_groups: List[List[int]] = []
+                for local_idx in range(stride):
+                    group_ranks = [local_idx + d * stride for d in range(dp_size)]
+                    dp_groups.append(group_ranks)
 
-        for ranks in dp_groups:
-            group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
-            if rank in ranks:
-                _DP_GROUP = group
-                _DP_RANK = ranks.index(rank)
-                logger.debug(f"Rank {rank} joined DP group {ranks}, dp_rank={_DP_RANK}")
-    else:
-        _DP_GROUP = None
-        _DP_RANK = 0
+                for ranks in dp_groups:
+                    group = dist.new_group(ranks=ranks, backend=backend, timeout=timedelta(seconds=1800))
+                    if rank in ranks:
+                        _DP_GROUP = group
+                        _DP_RANK = ranks.index(rank)
+                        logger.debug(f"Rank {rank} joined DP group {ranks}, dp_rank={_DP_RANK}")
+            else:
+                _DP_GROUP = None
+                _DP_RANK = 0
 
     _INITIALIZED = True
 

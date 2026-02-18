@@ -6,12 +6,23 @@ Seamlessly supports single GPU, single-node multi-GPU, and multi-node training.
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 import torch
 import torch.distributed as dist
 
 _log = logging.getLogger(__name__)
+
+
+@contextmanager
+def _nvtx(name: str):
+    """Emit an NVTX range visible in Nsight Systems / nvprof."""
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def _require_b200():
@@ -56,14 +67,16 @@ def init(seed: int = 42, ep_size: int = 1, tp_size: int = 1) -> tuple[int, int]:
   - Single-node multi-GPU: torchrun sets LOCAL_RANK, init NCCL
   - Multi-node: same as single-node, world > local_world
   """
-  _require_b200()
+  with _nvtx("runtime/require_b200"):
+    _require_b200()
   _ensure_third_party_imports()
 
   # Seeds and TF32
-  torch.backends.cuda.matmul.allow_tf32 = True
-  torch.backends.cudnn.allow_tf32 = True
-  torch.manual_seed(seed)
-  torch.cuda.manual_seed_all(seed)
+  with _nvtx("runtime/seeds_and_tf32"):
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
   # Device assignment (torchrun sets LOCAL_RANK; single-process defaults to 0)
   local_rank = int(os.environ.get('LOCAL_RANK', '0'))
@@ -72,7 +85,8 @@ def init(seed: int = 42, ep_size: int = 1, tp_size: int = 1) -> tuple[int, int]:
   # Distributed init (only when launched under torchrun)
   world_env = int(os.environ.get('WORLD_SIZE', '1'))
   if world_env > 1 and not dist.is_initialized():
-    dist.init_process_group("nccl", timeout=timedelta(seconds=1800))
+    with _nvtx("runtime/init_process_group"):
+      dist.init_process_group("nccl", timeout=timedelta(seconds=1800))
 
   # Get rank and world (or default to single GPU)
   rank = dist.get_rank() if dist.is_initialized() else 0
@@ -83,7 +97,8 @@ def init(seed: int = 42, ep_size: int = 1, tp_size: int = 1) -> tuple[int, int]:
   if (ep_size > 1 or tp_size > 1) and world > 1:
     from nmoe.distributed.init_groups import init_nmoe_process_groups, is_nmoe_parallel_initialized
     if not is_nmoe_parallel_initialized():
-      init_nmoe_process_groups(ep_size=ep_size, tp_size=tp_size)
+      with _nvtx("runtime/init_nmoe_groups"):
+        init_nmoe_process_groups(ep_size=ep_size, tp_size=tp_size)
       if rank == 0:
         import logging as _rt_logging
         dp_size = world // (ep_size * tp_size)
@@ -96,13 +111,14 @@ def init(seed: int = 42, ep_size: int = 1, tp_size: int = 1) -> tuple[int, int]:
 
 def finalize():
   """Cleanup distributed state (process groups and EP/DP groups)."""
-  # Clean up nmoe process groups first (they are sub-groups of WORLD)
-  try:
-    from nmoe.distributed.init_groups import cleanup_process_groups, is_nmoe_parallel_initialized
-    if is_nmoe_parallel_initialized():
-      cleanup_process_groups()
-  except Exception:
-    _log.warning("Failed to clean up nmoe process groups during finalize", exc_info=True)
+  with _nvtx("runtime/finalize"):
+    # Clean up nmoe process groups first (they are sub-groups of WORLD)
+    try:
+      from nmoe.distributed.init_groups import cleanup_process_groups, is_nmoe_parallel_initialized
+      if is_nmoe_parallel_initialized():
+        cleanup_process_groups()
+    except Exception:
+      _log.warning("Failed to clean up nmoe process groups during finalize", exc_info=True)
 
-  if dist.is_initialized():
-    dist.destroy_process_group()
+    if dist.is_initialized():
+      dist.destroy_process_group()

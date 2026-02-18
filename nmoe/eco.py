@@ -25,14 +25,25 @@ Memory savings vs BF16 master:
 
 from __future__ import annotations
 
+import os
 import math
 import logging
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+
+def _nvtx(tag: str):
+    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
+        return nullcontext()
+    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
+
 
 # Fail fast if PyTorch lacks FP8 support — silent BF16 fallback is a 10x perf trap.
 if not hasattr(torch, 'float8_e5m2') or not hasattr(torch, 'float8_e4m3fn'):
@@ -231,88 +242,91 @@ class FusedBackwardECO:
 
         Raises RuntimeError if CUDA kernel requirements are not met.
         """
-        _rdep = getattr(self, '_rdep', None)
-        if _rdep is None:
-            raise RuntimeError("CUDA kernel required but _rdep not initialized")
+        with _nvtx("eco/cuda_mv_accumulate"):
+            _rdep = getattr(self, '_rdep', None)
+            if _rdep is None:
+                raise RuntimeError("CUDA kernel required but _rdep not initialized")
 
-        packed = getattr(moe, f'_{param_name}_packed')
-        E = packed.shape[0]
-        out_dim = packed.shape[1]
-        in_dim = packed.shape[2] * 2
+            packed = getattr(moe, f'_{param_name}_packed')
+            E = packed.shape[0]
+            out_dim = packed.shape[1]
+            in_dim = packed.shape[2] * 2
 
-        def _fail(msg):
-            raise RuntimeError(f"eco_mv_accumulate CUDA kernel: {msg}")
+            def _fail(msg):
+                raise RuntimeError(f"eco_mv_accumulate CUDA kernel: {msg}")
 
-        # Alignment check
-        if (out_dim & 31) != 0 or (in_dim & 31) != 0:
-            return _fail(f"dims not 32-aligned: out_dim={out_dim}, in_dim={in_dim}")
+            # Alignment check
+            if (out_dim & 31) != 0 or (in_dim & 31) != 0:
+                return _fail(f"dims not 32-aligned: out_dim={out_dim}, in_dim={in_dim}")
 
-        expected = (E, in_dim, out_dim)
-        if grad.shape != expected:
-            return _fail(f"grad shape {grad.shape} != expected {expected}")
-        if not grad.is_contiguous():
-            grad = grad.contiguous()
+            expected = (E, in_dim, out_dim)
+            if grad.shape != expected:
+                return _fail(f"grad shape {grad.shape} != expected {expected}")
+            if not grad.is_contiguous():
+                grad = grad.contiguous()
 
-        m_data = st["exp_avg"]
-        m_sc = st["exp_avg_scale"]
-        if m_data.dtype not in (torch.uint8, torch.float8_e5m2):
-            return _fail(f"m dtype {m_data.dtype} not FP8 E5M2")
-        if m_data.shape != expected:
-            return _fail(f"m shape {m_data.shape} != expected {expected}")
-        if not m_data.is_contiguous():
-            return _fail("m not contiguous")
+            m_data = st["exp_avg"]
+            m_sc = st["exp_avg_scale"]
+            if m_data.dtype not in (torch.uint8, torch.float8_e5m2):
+                return _fail(f"m dtype {m_data.dtype} not FP8 E5M2")
+            if m_data.shape != expected:
+                return _fail(f"m shape {m_data.shape} != expected {expected}")
+            if not m_data.is_contiguous():
+                return _fail("m not contiguous")
 
-        m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
-        m_sc_flat = m_sc.reshape(-1).contiguous()
-        stream = torch.cuda.current_stream(packed.device)
+            m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
+            m_sc_flat = m_sc.reshape(-1).contiguous()
+            stream = torch.cuda.current_stream(packed.device)
 
-        if self._factored_v:
-            v_row = st["v_row"]
-            v_col = st["v_col"]
-            if v_row.shape != (E, in_dim) or v_col.shape != (E, out_dim):
-                return _fail(f"v_row/v_col shape mismatch")
-            if not v_row.is_contiguous() or not v_col.is_contiguous():
-                return _fail("v_row/v_col not contiguous")
-            if "v_rms" not in st:
-                st["v_rms"] = torch.zeros(E, device=packed.device, dtype=torch.float32)
-            v_rms = st["v_rms"]
+            if self._factored_v:
+                v_row = st["v_row"]
+                v_col = st["v_col"]
+                if v_row.shape != (E, in_dim) or v_col.shape != (E, out_dim):
+                    return _fail(f"v_row/v_col shape mismatch")
+                if not v_row.is_contiguous() or not v_col.is_contiguous():
+                    return _fail("v_row/v_col not contiguous")
+                if "v_rms" not in st:
+                    st["v_rms"] = torch.zeros(E, device=packed.device, dtype=torch.float32)
+                v_rms = st["v_rms"]
 
-            _rdep.eco_mv_accumulate_fv(
-                m_u8.data_ptr(),
-                m_sc_flat.data_ptr(),
-                v_row.data_ptr(),
-                v_col.data_ptr(),
-                v_rms.data_ptr(),
-                grad.data_ptr(),
-                E, in_dim, out_dim,
-                beta1_frac, beta2_frac,
-                stream,
-            )
-            st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
-        else:
-            v_data = st["exp_avg_sq"]
-            v_sc = st["exp_avg_sq_scale"]
-            if v_data.dtype not in (torch.uint8, torch.float8_e4m3fn):
-                return _fail(f"v dtype {v_data.dtype} not FP8 E4M3")
-            if v_data.shape != expected:
-                return _fail(f"v shape {v_data.shape} != expected {expected}")
-            if not v_data.is_contiguous():
-                return _fail("v not contiguous")
-            v_u8 = v_data.view(torch.uint8) if v_data.dtype != torch.uint8 else v_data
-            v_sc_flat = v_sc.reshape(-1).contiguous()
+                with _nvtx("eco/mv_accumulate_fv_kernel"):
+                    _rdep.eco_mv_accumulate_fv(
+                        m_u8.data_ptr(),
+                        m_sc_flat.data_ptr(),
+                        v_row.data_ptr(),
+                        v_col.data_ptr(),
+                        v_rms.data_ptr(),
+                        grad.data_ptr(),
+                        E, in_dim, out_dim,
+                        beta1_frac, beta2_frac,
+                        stream,
+                    )
+                st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
+            else:
+                v_data = st["exp_avg_sq"]
+                v_sc = st["exp_avg_sq_scale"]
+                if v_data.dtype not in (torch.uint8, torch.float8_e4m3fn):
+                    return _fail(f"v dtype {v_data.dtype} not FP8 E4M3")
+                if v_data.shape != expected:
+                    return _fail(f"v shape {v_data.shape} != expected {expected}")
+                if not v_data.is_contiguous():
+                    return _fail("v not contiguous")
+                v_u8 = v_data.view(torch.uint8) if v_data.dtype != torch.uint8 else v_data
+                v_sc_flat = v_sc.reshape(-1).contiguous()
 
-            _rdep.eco_mv_accumulate(
-                m_u8.data_ptr(),
-                m_sc_flat.data_ptr(),
-                v_u8.data_ptr(),
-                v_sc_flat.data_ptr(),
-                grad.data_ptr(),
-                E, in_dim, out_dim,
-                beta1_frac, beta2_frac,
-                stream,
-            )
-            st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
-            st["exp_avg_sq_scale"] = v_sc_flat.reshape(v_sc.shape)
+                with _nvtx("eco/mv_accumulate_kernel"):
+                    _rdep.eco_mv_accumulate(
+                        m_u8.data_ptr(),
+                        m_sc_flat.data_ptr(),
+                        v_u8.data_ptr(),
+                        v_sc_flat.data_ptr(),
+                        grad.data_ptr(),
+                        E, in_dim, out_dim,
+                        beta1_frac, beta2_frac,
+                        stream,
+                    )
+                st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
+                st["exp_avg_sq_scale"] = v_sc_flat.reshape(v_sc.shape)
 
     def attach(self, model: nn.Module):
         """Attach to model: disable gradients on expert params, free BF16 storage.
@@ -426,54 +440,57 @@ class FusedBackwardECO:
         Args:
             step: Current training step number (0-indexed).
         """
-        self._current_step = step
-        self._step_count = step + 1  # 1-indexed for Adam bias correction
+        with _nvtx("eco/pre_backward"):
+            self._current_step = step
+            self._step_count = step + 1  # 1-indexed for Adam bias correction
 
-        # Bias corrections
-        bc1 = 1.0 - (self.beta1 ** self._step_count)
-        bc2 = 1.0 - (self.beta2 ** self._step_count)
-        self._bias_correction1 = bc1
-        self._bias_correction2 = bc2
-        self._step_size = self.lr / bc1
-        self._inv_bc2_sqrt = 1.0 / math.sqrt(bc2)
+            # Bias corrections
+            bc1 = 1.0 - (self.beta1 ** self._step_count)
+            bc2 = 1.0 - (self.beta2 ** self._step_count)
+            self._bias_correction1 = bc1
+            self._bias_correction2 = bc2
+            self._step_size = self.lr / bc1
+            self._inv_bc2_sqrt = 1.0 / math.sqrt(bc2)
 
-        # ECO injection strength
-        if self._error_feedback and self._step_size != 0:
-            self._eco_alpha = (self.beta1 - 1.0) / (self.beta1 * self._step_size)
-        else:
-            self._eco_alpha = 0.0
+            # ECO injection strength
+            if self._error_feedback and self._step_size != 0:
+                self._eco_alpha = (self.beta1 - 1.0) / (self.beta1 * self._step_size)
+            else:
+                self._eco_alpha = 0.0
 
-        # PRNG for stochastic rounding
-        device = next((getattr(moe, '_W1_packed').device for moe in self._moes
-                       if getattr(moe, '_W1_packed', None) is not None), torch.device('cpu'))
-        gen_device = device if device.type == 'cuda' else torch.device('cpu')
-        self._generator = torch.Generator(device=gen_device)
-        self._generator.manual_seed(self._step_count * 1000003 + 42)
+            # PRNG for stochastic rounding
+            device = next((getattr(moe, '_W1_packed').device for moe in self._moes
+                           if getattr(moe, '_W1_packed', None) is not None), torch.device('cpu'))
+            gen_device = device if device.type == 'cuda' else torch.device('cpu')
+            self._generator = torch.Generator(device=gen_device)
+            self._generator.manual_seed(self._step_count * 1000003 + 42)
 
-        # Reset GPU gradient norm accumulator
-        if self._norm_sq_gpu is not None:
-            self._norm_sq_gpu.zero_()
+            # Reset GPU gradient norm accumulator
+            if self._norm_sq_gpu is not None:
+                self._norm_sq_gpu.zero_()
 
     def post_backward(self):
         """Finalize after backward pass. Call after loss.backward()."""
-        # Drain all pending async all-reduce ops before finalizing the step.
-        # This ensures every deferred optimizer step completes before we
-        # compute the global gradient norm for next step's clipping.
-        self._drain_all()
+        with _nvtx("eco/post_backward"):
+            # Drain all pending async all-reduce ops before finalizing the step.
+            # This ensures every deferred optimizer step completes before we
+            # compute the global gradient norm for next step's clipping.
+            self._drain_all()
 
-        # Update global norm estimate for next step's clipping.
-        # Single .item() call here replaces 174 per-weight GPU-CPU syncs.
-        if self._norm_sq_gpu is not None:
-            # Synchronize gradient norm across DP ranks for accurate global norm.
-            # Without this, each rank only sees its local contribution to the norm,
-            # causing under-clipping or over-clipping on multi-node (DP > 1).
-            if self._dp_size > 1 and self._dp_group is not None:
-                import torch.distributed as dist
-                dist.all_reduce(self._norm_sq_gpu, op=dist.ReduceOp.SUM, group=self._dp_group)
-            norm_sq = self._norm_sq_gpu.item()
-        else:
-            norm_sq = 0.0
-        self._prev_global_norm = math.sqrt(max(norm_sq, 1e-30))
+            # Update global norm estimate for next step's clipping.
+            # Single .item() call here replaces 174 per-weight GPU-CPU syncs.
+            if self._norm_sq_gpu is not None:
+                # Synchronize gradient norm across DP ranks for accurate global norm.
+                # Without this, each rank only sees its local contribution to the norm,
+                # causing under-clipping or over-clipping on multi-node (DP > 1).
+                with _nvtx("eco/post_backward_norm_allreduce"):
+                    if self._dp_size > 1 and self._dp_group is not None:
+                        import torch.distributed as dist
+                        dist.all_reduce(self._norm_sq_gpu, op=dist.ReduceOp.SUM, group=self._dp_group)
+                norm_sq = self._norm_sq_gpu.item()
+            else:
+                norm_sq = 0.0
+            self._prev_global_norm = math.sqrt(max(norm_sq, 1e-30))
 
     def _cuda_fused_update(
         self, moe: nn.Module, param_name: str, grad: torch.Tensor, st: dict,
@@ -488,128 +505,131 @@ class FusedBackwardECO:
         Raises RuntimeError if requirements are not met.
         Returns False if the kernel cannot handle the given shapes.
         """
-        b1 = beta1_eff if beta1_eff is not None else self.beta1
-        b2 = beta2_eff if beta2_eff is not None else self.beta2
+        with _nvtx("eco/cuda_fused_update"):
+            b1 = beta1_eff if beta1_eff is not None else self.beta1
+            b2 = beta2_eff if beta2_eff is not None else self.beta2
 
-        _rdep = getattr(self, '_rdep', None)
-        if _rdep is None:
-            if self._require_cuda:
-                raise RuntimeError("CUDA kernel required but _rdep not initialized")
-            return False
+            _rdep = getattr(self, '_rdep', None)
+            if _rdep is None:
+                if self._require_cuda:
+                    raise RuntimeError("CUDA kernel required but _rdep not initialized")
+                return False
 
-        def _fail(msg):
-            if self._require_cuda:
-                raise RuntimeError(f"eco_adam_nvfp4_update CUDA kernel: {msg}")
-            return False
+            def _fail(msg):
+                if self._require_cuda:
+                    raise RuntimeError(f"eco_adam_nvfp4_update CUDA kernel: {msg}")
+                return False
 
-        packed = getattr(moe, f'_{param_name}_packed')
-        scale_buf = getattr(moe, f'_{param_name}_scale')
-        gs_buf = getattr(moe, f'_{param_name}_gs')
-        group_size = getattr(moe, '_nvfp4_group_size', 16)
+            packed = getattr(moe, f'_{param_name}_packed')
+            scale_buf = getattr(moe, f'_{param_name}_scale')
+            gs_buf = getattr(moe, f'_{param_name}_gs')
+            group_size = getattr(moe, '_nvfp4_group_size', 16)
 
-        E = packed.shape[0]
-        out_dim = packed.shape[1]
-        in_dim = packed.shape[2] * 2
+            E = packed.shape[0]
+            out_dim = packed.shape[1]
+            in_dim = packed.shape[2] * 2
 
-        if (out_dim & 31) != 0 or (in_dim & 31) != 0:
-            return _fail(f"dims not 32-aligned: out_dim={out_dim}, in_dim={in_dim}")
-        if in_dim % group_size != 0:
-            return _fail(f"in_dim={in_dim} not divisible by group_size={group_size}")
+            if (out_dim & 31) != 0 or (in_dim & 31) != 0:
+                return _fail(f"dims not 32-aligned: out_dim={out_dim}, in_dim={in_dim}")
+            if in_dim % group_size != 0:
+                return _fail(f"in_dim={in_dim} not divisible by group_size={group_size}")
 
-        m_data = st["exp_avg"]
-        m_sc = st["exp_avg_scale"]
-        if m_data.dtype not in (torch.uint8, torch.float8_e5m2):
-            return _fail(f"m dtype {m_data.dtype} not FP8 E5M2")
+            m_data = st["exp_avg"]
+            m_sc = st["exp_avg_scale"]
+            if m_data.dtype not in (torch.uint8, torch.float8_e5m2):
+                return _fail(f"m dtype {m_data.dtype} not FP8 E5M2")
 
-        expected = (E, in_dim, out_dim)
-        if grad.shape != expected:
-            return _fail(f"grad shape {grad.shape} != expected {expected}")
-        if not grad.is_contiguous():
-            grad = grad.contiguous()
-        if m_data.shape != expected:
-            return _fail(f"m shape {m_data.shape} != expected {expected}")
-        if not m_data.is_contiguous():
-            return _fail("m not contiguous")
+            expected = (E, in_dim, out_dim)
+            if grad.shape != expected:
+                return _fail(f"grad shape {grad.shape} != expected {expected}")
+            if not grad.is_contiguous():
+                grad = grad.contiguous()
+            if m_data.shape != expected:
+                return _fail(f"m shape {m_data.shape} != expected {expected}")
+            if not m_data.is_contiguous():
+                return _fail("m not contiguous")
 
-        m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
-        m_sc_flat = m_sc.reshape(-1).contiguous()
+            m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
+            m_sc_flat = m_sc.reshape(-1).contiguous()
 
-        _param_offset = {'W1': 0, 'W2': 1, 'W3': 2}[param_name]
-        idx = self._moe_to_idx[id(moe)]
-        prng_seed0 = (self._step_count * 1000003 + idx * 7 + _param_offset) & 0xFFFFFFFF
-        prng_seed1 = (self._step_count * 7919 + idx * 31 + _param_offset * 127) & 0xFFFFFFFF
+            _param_offset = {'W1': 0, 'W2': 1, 'W3': 2}[param_name]
+            idx = self._moe_to_idx[id(moe)]
+            prng_seed0 = (self._step_count * 1000003 + idx * 7 + _param_offset) & 0xFFFFFFFF
+            prng_seed1 = (self._step_count * 7919 + idx * 31 + _param_offset * 127) & 0xFFFFFFFF
 
-        scale_u8 = scale_buf.view(torch.uint8)
-        stream = torch.cuda.current_stream(packed.device)
+            scale_u8 = scale_buf.view(torch.uint8)
+            stream = torch.cuda.current_stream(packed.device)
 
-        if self._factored_v:
-            v_row = st["v_row"]
-            v_col = st["v_col"]
-            if v_row.shape != (E, in_dim) or v_col.shape != (E, out_dim):
-                return _fail(f"v_row/v_col shape mismatch")
-            if not v_row.is_contiguous() or not v_col.is_contiguous():
-                return _fail("v_row/v_col not contiguous")
-            if "v_rms" not in st:
-                st["v_rms"] = torch.zeros(E, device=packed.device, dtype=torch.float32)
-            v_rms = st["v_rms"]
+            if self._factored_v:
+                v_row = st["v_row"]
+                v_col = st["v_col"]
+                if v_row.shape != (E, in_dim) or v_col.shape != (E, out_dim):
+                    return _fail(f"v_row/v_col shape mismatch")
+                if not v_row.is_contiguous() or not v_col.is_contiguous():
+                    return _fail("v_row/v_col not contiguous")
+                if "v_rms" not in st:
+                    st["v_rms"] = torch.zeros(E, device=packed.device, dtype=torch.float32)
+                v_rms = st["v_rms"]
 
-            _rdep.eco_adam_nvfp4_fv_update(
-                packed.data_ptr(),
-                scale_u8.data_ptr(),
-                gs_buf.data_ptr(),
-                m_u8.data_ptr(),
-                m_sc_flat.data_ptr(),
-                v_row.data_ptr(),
-                v_col.data_ptr(),
-                v_rms.data_ptr(),
-                grad.data_ptr(),
-                E, out_dim, in_dim, group_size,
-                self.lr, b1, b2,
-                self.weight_decay, self.eps,
-                self._step_size, self._inv_bc2_sqrt,
-                self._eco_alpha,
-                1 if self._stochastic_rounding else 0,
-                1 if self._error_feedback else 0,
-                prng_seed0, prng_seed1,
-                stream,
-            )
-            st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
+                with _nvtx("eco/adam_nvfp4_fv_kernel"):
+                    _rdep.eco_adam_nvfp4_fv_update(
+                        packed.data_ptr(),
+                        scale_u8.data_ptr(),
+                        gs_buf.data_ptr(),
+                        m_u8.data_ptr(),
+                        m_sc_flat.data_ptr(),
+                        v_row.data_ptr(),
+                        v_col.data_ptr(),
+                        v_rms.data_ptr(),
+                        grad.data_ptr(),
+                        E, out_dim, in_dim, group_size,
+                        self.lr, b1, b2,
+                        self.weight_decay, self.eps,
+                        self._step_size, self._inv_bc2_sqrt,
+                        self._eco_alpha,
+                        1 if self._stochastic_rounding else 0,
+                        1 if self._error_feedback else 0,
+                        prng_seed0, prng_seed1,
+                        stream,
+                    )
+                st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
 
-        else:
-            v_data = st["exp_avg_sq"]
-            v_sc = st["exp_avg_sq_scale"]
-            if v_data.dtype not in (torch.uint8, torch.float8_e4m3fn):
-                return _fail(f"v dtype {v_data.dtype} not FP8 E4M3")
-            if v_data.shape != expected:
-                return _fail(f"v shape {v_data.shape} != expected {expected}")
-            if not v_data.is_contiguous():
-                return _fail("v not contiguous")
-            v_u8 = v_data.view(torch.uint8) if v_data.dtype != torch.uint8 else v_data
-            v_sc_flat = v_sc.reshape(-1).contiguous()
+            else:
+                v_data = st["exp_avg_sq"]
+                v_sc = st["exp_avg_sq_scale"]
+                if v_data.dtype not in (torch.uint8, torch.float8_e4m3fn):
+                    return _fail(f"v dtype {v_data.dtype} not FP8 E4M3")
+                if v_data.shape != expected:
+                    return _fail(f"v shape {v_data.shape} != expected {expected}")
+                if not v_data.is_contiguous():
+                    return _fail("v not contiguous")
+                v_u8 = v_data.view(torch.uint8) if v_data.dtype != torch.uint8 else v_data
+                v_sc_flat = v_sc.reshape(-1).contiguous()
 
-            _rdep.eco_adam_nvfp4_update(
-                packed.data_ptr(),
-                scale_u8.data_ptr(),
-                gs_buf.data_ptr(),
-                m_u8.data_ptr(),
-                m_sc_flat.data_ptr(),
-                v_u8.data_ptr(),
-                v_sc_flat.data_ptr(),
-                grad.data_ptr(),
-                E, out_dim, in_dim, group_size,
-                self.lr, b1, b2,
-                self.weight_decay, self.eps,
-                self._step_size, self._inv_bc2_sqrt,
-                self._eco_alpha,
-                1 if self._stochastic_rounding else 0,
-                1 if self._error_feedback else 0,
-                prng_seed0, prng_seed1,
-                stream,
-            )
-            st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
-            st["exp_avg_sq_scale"] = v_sc_flat.reshape(v_sc.shape)
+                with _nvtx("eco/adam_nvfp4_kernel"):
+                    _rdep.eco_adam_nvfp4_update(
+                        packed.data_ptr(),
+                        scale_u8.data_ptr(),
+                        gs_buf.data_ptr(),
+                        m_u8.data_ptr(),
+                        m_sc_flat.data_ptr(),
+                        v_u8.data_ptr(),
+                        v_sc_flat.data_ptr(),
+                        grad.data_ptr(),
+                        E, out_dim, in_dim, group_size,
+                        self.lr, b1, b2,
+                        self.weight_decay, self.eps,
+                        self._step_size, self._inv_bc2_sqrt,
+                        self._eco_alpha,
+                        1 if self._stochastic_rounding else 0,
+                        1 if self._error_feedback else 0,
+                        prng_seed0, prng_seed1,
+                        stream,
+                    )
+                st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
+                st["exp_avg_sq_scale"] = v_sc_flat.reshape(v_sc.shape)
 
-        return True
+            return True
 
     def _drain_one(self) -> None:
         """Wait for the oldest pending async all-reduce and run its optimizer step.
@@ -621,49 +641,53 @@ class FusedBackwardECO:
         if not self._pending_queue:
             return
 
-        pending = self._pending_queue.popleft()
-        pending.work.wait()
+        with _nvtx("eco/drain_one"):
+            pending = self._pending_queue.popleft()
+            with _nvtx("eco/drain_one_wait_allreduce"):
+                pending.work.wait()
 
-        grad = pending.grad
+            grad = pending.grad
 
-        # Gradient clipping using previous step's global norm estimate.
-        if self.grad_clip > 0 and not pending.is_accumulating:
-            grad_flat = grad.reshape(-1)
-            grad_norm_sq = torch.dot(grad_flat, grad_flat)
-            if self._norm_sq_gpu is None:
-                self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
-            self._norm_sq_gpu += grad_norm_sq
-            if self._prev_global_norm > 0:
-                clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
-                if clip_coeff < 1.0:
-                    grad.mul_(clip_coeff)
+            # Gradient clipping using previous step's global norm estimate.
+            if self.grad_clip > 0 and not pending.is_accumulating:
+                with _nvtx("eco/drain_one_grad_clip"):
+                    grad_flat = grad.reshape(-1)
+                    grad_norm_sq = torch.dot(grad_flat, grad_flat)
+                    if self._norm_sq_gpu is None:
+                        self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
+                    self._norm_sq_gpu += grad_norm_sq
+                    if self._prev_global_norm > 0:
+                        clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
+                        if clip_coeff < 1.0:
+                            grad.mul_(clip_coeff)
 
-        if pending.is_accumulating:
-            self._cuda_mv_accumulate(
-                pending.moe, pending.param_name, grad, pending.state,
-                pending.beta1_eff, pending.beta2_eff,
-            )
-        else:
-            pending.state["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
-            self._cuda_fused_update(
-                pending.moe, pending.param_name, grad, pending.state,
-                beta1_eff=pending.beta1_eff, beta2_eff=pending.beta2_eff,
-            )
-            # Recompute per-group E4M3 scales at correct group_size granularity.
-            # The CUDA kernel writes scales at 32-element (TILE_IN) granularity;
-            # this tightens them to the true group_size (typically 16).
-            moe = pending.moe
-            pname = pending.param_name
-            group_size = getattr(moe, '_nvfp4_group_size', 16)
-            self._recompute_nvfp4_group_scales(
-                getattr(moe, f'_{pname}_packed'),
-                getattr(moe, f'_{pname}_scale'),
-                group_size=group_size,
-                _rdep=self._rdep if self._require_cuda else None,
-                gs_buf=getattr(moe, f'_{pname}_gs', None),
-            )
+            if pending.is_accumulating:
+                self._cuda_mv_accumulate(
+                    pending.moe, pending.param_name, grad, pending.state,
+                    pending.beta1_eff, pending.beta2_eff,
+                )
+            else:
+                pending.state["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
+                self._cuda_fused_update(
+                    pending.moe, pending.param_name, grad, pending.state,
+                    beta1_eff=pending.beta1_eff, beta2_eff=pending.beta2_eff,
+                )
+                # Recompute per-group E4M3 scales at correct group_size granularity.
+                # The CUDA kernel writes scales at 32-element (TILE_IN) granularity;
+                # this tightens them to the true group_size (typically 16).
+                moe = pending.moe
+                pname = pending.param_name
+                group_size = getattr(moe, '_nvfp4_group_size', 16)
+                with _nvtx("eco/drain_one_recompute_scales"):
+                    self._recompute_nvfp4_group_scales(
+                        getattr(moe, f'_{pname}_packed'),
+                        getattr(moe, f'_{pname}_scale'),
+                        group_size=group_size,
+                        _rdep=self._rdep if self._require_cuda else None,
+                        gs_buf=getattr(moe, f'_{pname}_gs', None),
+                    )
 
-        del pending.grad  # Free FP32 buffer
+            del pending.grad  # Free FP32 buffer
 
     def _drain_completed(self) -> None:
         """Non-blockingly drain all entries whose NCCL ops have already completed.
@@ -684,8 +708,9 @@ class FusedBackwardECO:
         Called from post_backward() to ensure all deferred optimizer steps
         complete before the training step ends.
         """
-        while self._pending_queue:
-            self._drain_one()
+        with _nvtx("eco/drain_all"):
+            while self._pending_queue:
+                self._drain_one()
 
     @torch.no_grad()
     def fused_update(self, moe: nn.Module, param_name: str, grad_bf16: torch.Tensor):
@@ -720,92 +745,97 @@ class FusedBackwardECO:
             param_name: 'W1', 'W3', or 'W2'.
             grad_bf16: [E, dim1, dim2] BF16 gradient (nmoe layout).
         """
-        import torch.distributed as dist
+        with _nvtx("eco/fused_update"):
+            import torch.distributed as dist
 
-        assert id(moe) in self._moe_to_idx, (
-            f"fused_update called with unknown MoE module (id={id(moe)}). "
-            f"Known ids: {list(self._moe_to_idx.keys())}"
-        )
-        assert param_name in ('W1', 'W2', 'W3'), f"Invalid param_name: {param_name}"
-
-        # Cast to FP32 for precision during AllReduce averaging.
-        grad = grad_bf16.float()
-        del grad_bf16
-
-        # AdamA fractional betas: beta^(1/K) for K micro-steps.
-        # When K=1 (no accumulation), beta^(1/1) = beta — standard Adam.
-        K = self._accum_steps
-        beta1_frac = self.beta1 ** (1.0 / K)
-        beta2_frac = self.beta2 ** (1.0 / K)
-
-        # Get or init optimizer state (needed for both accumulate and full step)
-        st = self._get_or_init_state(moe, param_name)
-
-        if self._dp_size > 1 and self._dp_group is not None:
-            # --- Async path: enqueue all_reduce, defer optimizer step ---
-            # Opportunistic drain: process any completed ops without blocking.
-            self._drain_completed()
-            # Back-pressure: if queue is still full, block on oldest.
-            if len(self._pending_queue) >= self._max_pending:
-                self._drain_one()
-
-            work = dist.all_reduce(grad, op=dist.ReduceOp.AVG,
-                                   group=self._dp_group, async_op=True)
-            self._pending_queue.append(PendingAllReduce(
-                work=work,
-                grad=grad,
-                moe=moe,
-                param_name=param_name,
-                state=st,
-                beta1_eff=beta1_frac,
-                beta2_eff=beta2_frac,
-                is_accumulating=self.is_accumulating,
-            ))
-            return  # Optimizer step deferred to _drain_one/_drain_all
-
-        # --- Synchronous path (single node, no DP): run optimizer step inline ---
-        if self.is_accumulating:
-            self._cuda_mv_accumulate(moe, param_name, grad, st,
-                                     beta1_frac, beta2_frac)
-            del grad
-            return
-
-        # Final micro-step (or no accumulation): full ECO Adam step.
-        st["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
-
-        # Gradient clipping using previous step's global norm estimate.
-        if self.grad_clip > 0:
-            grad_flat = grad.reshape(-1)
-            grad_norm_sq = torch.dot(grad_flat, grad_flat)
-            if self._norm_sq_gpu is None:
-                self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
-            self._norm_sq_gpu += grad_norm_sq
-            if self._prev_global_norm > 0:
-                clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
-                if clip_coeff < 1.0:
-                    grad.mul_(clip_coeff)
-
-        # CUDA fused kernel with fractional betas (zero FP32 materialization)
-        if self._cuda_fused_update(moe, param_name, grad, st,
-                                    beta1_eff=beta1_frac, beta2_eff=beta2_frac):
-            del grad
-            # Recompute per-group E4M3 scales at correct group_size granularity.
-            # The CUDA kernel writes scales at 32-element (TILE_IN) granularity;
-            # this tightens them to the true group_size (typically 16).
-            group_size = getattr(moe, '_nvfp4_group_size', 16)
-            self._recompute_nvfp4_group_scales(
-                getattr(moe, f'_{param_name}_packed'),
-                getattr(moe, f'_{param_name}_scale'),
-                group_size=group_size,
-                _rdep=self._rdep if self._require_cuda else None,
-                gs_buf=getattr(moe, f'_{param_name}_gs', None),
+            assert id(moe) in self._moe_to_idx, (
+                f"fused_update called with unknown MoE module (id={id(moe)}). "
+                f"Known ids: {list(self._moe_to_idx.keys())}"
             )
-            return
+            assert param_name in ('W1', 'W2', 'W3'), f"Invalid param_name: {param_name}"
 
-        raise RuntimeError(
-            "BUG: _cuda_fused_update returned False. "
-            "CUDA kernel is required for production (eco_require_cuda=True)."
-        )
+            # Cast to FP32 for precision during AllReduce averaging.
+            with _nvtx("eco/fused_update_cast_fp32"):
+                grad = grad_bf16.float()
+            del grad_bf16
+
+            # AdamA fractional betas: beta^(1/K) for K micro-steps.
+            # When K=1 (no accumulation), beta^(1/1) = beta — standard Adam.
+            K = self._accum_steps
+            beta1_frac = self.beta1 ** (1.0 / K)
+            beta2_frac = self.beta2 ** (1.0 / K)
+
+            # Get or init optimizer state (needed for both accumulate and full step)
+            st = self._get_or_init_state(moe, param_name)
+
+            if self._dp_size > 1 and self._dp_group is not None:
+                # --- Async path: enqueue all_reduce, defer optimizer step ---
+                # Opportunistic drain: process any completed ops without blocking.
+                self._drain_completed()
+                # Back-pressure: if queue is still full, block on oldest.
+                if len(self._pending_queue) >= self._max_pending:
+                    self._drain_one()
+
+                with _nvtx("eco/fused_update_async_allreduce"):
+                    work = dist.all_reduce(grad, op=dist.ReduceOp.AVG,
+                                           group=self._dp_group, async_op=True)
+                self._pending_queue.append(PendingAllReduce(
+                    work=work,
+                    grad=grad,
+                    moe=moe,
+                    param_name=param_name,
+                    state=st,
+                    beta1_eff=beta1_frac,
+                    beta2_eff=beta2_frac,
+                    is_accumulating=self.is_accumulating,
+                ))
+                return  # Optimizer step deferred to _drain_one/_drain_all
+
+            # --- Synchronous path (single node, no DP): run optimizer step inline ---
+            if self.is_accumulating:
+                self._cuda_mv_accumulate(moe, param_name, grad, st,
+                                         beta1_frac, beta2_frac)
+                del grad
+                return
+
+            # Final micro-step (or no accumulation): full ECO Adam step.
+            st["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
+
+            # Gradient clipping using previous step's global norm estimate.
+            if self.grad_clip > 0:
+                with _nvtx("eco/fused_update_grad_clip"):
+                    grad_flat = grad.reshape(-1)
+                    grad_norm_sq = torch.dot(grad_flat, grad_flat)
+                    if self._norm_sq_gpu is None:
+                        self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
+                    self._norm_sq_gpu += grad_norm_sq
+                    if self._prev_global_norm > 0:
+                        clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
+                        if clip_coeff < 1.0:
+                            grad.mul_(clip_coeff)
+
+            # CUDA fused kernel with fractional betas (zero FP32 materialization)
+            if self._cuda_fused_update(moe, param_name, grad, st,
+                                        beta1_eff=beta1_frac, beta2_eff=beta2_frac):
+                del grad
+                # Recompute per-group E4M3 scales at correct group_size granularity.
+                # The CUDA kernel writes scales at 32-element (TILE_IN) granularity;
+                # this tightens them to the true group_size (typically 16).
+                group_size = getattr(moe, '_nvfp4_group_size', 16)
+                with _nvtx("eco/fused_update_recompute_scales"):
+                    self._recompute_nvfp4_group_scales(
+                        getattr(moe, f'_{param_name}_packed'),
+                        getattr(moe, f'_{param_name}_scale'),
+                        group_size=group_size,
+                        _rdep=self._rdep if self._require_cuda else None,
+                        gs_buf=getattr(moe, f'_{param_name}_gs', None),
+                    )
+                return
+
+            raise RuntimeError(
+                "BUG: _cuda_fused_update returned False. "
+                "CUDA kernel is required for production (eco_require_cuda=True)."
+            )
 
     @staticmethod
     @torch.no_grad()
@@ -828,25 +858,26 @@ class FusedBackwardECO:
             _rdep: CUDA extension module (required).
             gs_buf: [E] float32 — per-expert global scale factors (required).
         """
-        E = packed.shape[0]
-        out_dim = packed.shape[1]
-        in_dim = packed.shape[2] * 2  # 2 nibbles per packed byte
+        with _nvtx("eco/recompute_nvfp4_group_scales"):
+            E = packed.shape[0]
+            out_dim = packed.shape[1]
+            in_dim = packed.shape[2] * 2  # 2 nibbles per packed byte
 
-        if in_dim % group_size != 0:
-            raise ValueError(
-                f"in_dim={in_dim} not divisible by group_size={group_size}"
+            if in_dim % group_size != 0:
+                raise ValueError(
+                    f"in_dim={in_dim} not divisible by group_size={group_size}"
+                )
+
+            if _rdep is None:
+                from nmoe.csrc import rdep as _rdep
+
+            _rdep.nvfp4_recompute_group_scales(
+                packed.data_ptr(),
+                scale_buf.view(torch.uint8).data_ptr(),
+                gs_buf.data_ptr(),
+                E, out_dim, in_dim, group_size,
+                torch.cuda.current_stream().cuda_stream,
             )
-
-        if _rdep is None:
-            from nmoe.csrc import rdep as _rdep
-
-        _rdep.nvfp4_recompute_group_scales(
-            packed.data_ptr(),
-            scale_buf.view(torch.uint8).data_ptr(),
-            gs_buf.data_ptr(),
-            E, out_dim, in_dim, group_size,
-            torch.cuda.current_stream().cuda_stream,
-        )
 
     def refresh_layer_cache(self, moe: nn.Module):
         """Invalidate blockscaled _W_cache after fused update.
@@ -859,9 +890,10 @@ class FusedBackwardECO:
         via model.py's `if self._W_cache is None: self.refresh_weight_cache()`,
         when all backward activation memory has already been freed.
         """
-        if hasattr(moe, '_W_cache') and moe._W_cache is not None:
-            del moe._W_cache
-            moe._W_cache = None
+        with _nvtx("eco/refresh_layer_cache"):
+            if hasattr(moe, '_W_cache') and moe._W_cache is not None:
+                del moe._W_cache
+                moe._W_cache = None
 
     def state_dict(self) -> dict:
         """Serialize optimizer state for checkpointing."""

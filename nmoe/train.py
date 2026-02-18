@@ -149,9 +149,10 @@ def train(cfg: Config):
 
     cfg.steps = resolved_steps
 
-  model = Transformer(cfg).cuda()
-  model.init_weights()
-  model.train()
+  with nvtx_ctx('train/model_init'):
+    model = Transformer(cfg).cuda()
+    model.init_weights()
+    model.train()
 
   # Enable gradient checkpointing if configured (required for NVFP4 primary weights:
   # only 1 layer's BF16 scratch activations in GPU memory at a time)
@@ -174,7 +175,8 @@ def train(cfg: Config):
       logger.debug("W&B config upload failed", exc_info=True)
 
   zero2_state = {}
-  start_step, tokens_seen, zero2_state = load_checkpoint(checkpointer, model, optimizer, loader, plan, cfg, rank, print)
+  with nvtx_ctx('train/load_checkpoint'):
+    start_step, tokens_seen, zero2_state = load_checkpoint(checkpointer, model, optimizer, loader, plan, cfg, rank, print)
 
   # Eagerly allocate ZeRO-2 flat buffers and re-point dense params into them.
   # This must happen BEFORE the first forward pass: at this point only model weights
@@ -252,49 +254,50 @@ def train(cfg: Config):
   # The DP group spans all 16 nodes and its first collective would otherwise
   # happen during backward (ECO all_reduce), making hangs hard to debug.
   if world > 1:
-    import torch.distributed as _dist
-    _warmup_t = torch.ones(1, device='cuda')
+    with nvtx_ctx('train/dist_init'):
+      import torch.distributed as _dist
+      _warmup_t = torch.ones(1, device='cuda')
 
-    if rank == 0:
-      print("[INIT] warming up NCCL communicators...", flush=True)
-
-    # Global group
-    _dist.all_reduce(_warmup_t, group=None)
-    if rank == 0:
-      print(f"[INIT] global all_reduce OK (world={world})", flush=True)
-
-    # DP group
-    try:
-      from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_data_parallel_group, get_dp_size
-      if is_nmoe_parallel_initialized():
-        dp_group = get_data_parallel_group()
-        dp_size = get_dp_size()
-        _dist.all_reduce(_warmup_t, group=dp_group)
-        if rank == 0:
-          print(f"[INIT] DP group all_reduce OK (dp_size={dp_size})", flush=True)
-    except Exception as e:
       if rank == 0:
-        print(f"[INIT] DP group warmup FAILED: {e}", flush=True)
+        print("[INIT] warming up NCCL communicators...", flush=True)
 
-    # EP group
-    try:
-      from nmoe.distributed.init_groups import get_ep_group, get_ep_size
-      if is_nmoe_parallel_initialized():
-        ep_group = get_ep_group()
-        ep_size = get_ep_size()
-        _dist.all_reduce(_warmup_t, group=ep_group)
-        if rank == 0:
-          print(f"[INIT] EP group all_reduce OK (ep_size={ep_size})", flush=True)
-    except Exception as e:
+      # Global group
+      _dist.all_reduce(_warmup_t, group=None)
       if rank == 0:
-        print(f"[INIT] EP group warmup FAILED: {e}", flush=True)
+        print(f"[INIT] global all_reduce OK (world={world})", flush=True)
 
-    # Barrier to ensure all ranks complete warmup
-    _dist.barrier()
-    if rank == 0:
-      print("[INIT] all NCCL warmup complete, starting training", flush=True)
+      # DP group
+      try:
+        from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_data_parallel_group, get_dp_size
+        if is_nmoe_parallel_initialized():
+          dp_group = get_data_parallel_group()
+          dp_size = get_dp_size()
+          _dist.all_reduce(_warmup_t, group=dp_group)
+          if rank == 0:
+            print(f"[INIT] DP group all_reduce OK (dp_size={dp_size})", flush=True)
+      except Exception as e:
+        if rank == 0:
+          print(f"[INIT] DP group warmup FAILED: {e}", flush=True)
 
-    del _warmup_t
+      # EP group
+      try:
+        from nmoe.distributed.init_groups import get_ep_group, get_ep_size
+        if is_nmoe_parallel_initialized():
+          ep_group = get_ep_group()
+          ep_size = get_ep_size()
+          _dist.all_reduce(_warmup_t, group=ep_group)
+          if rank == 0:
+            print(f"[INIT] EP group all_reduce OK (ep_size={ep_size})", flush=True)
+      except Exception as e:
+        if rank == 0:
+          print(f"[INIT] EP group warmup FAILED: {e}", flush=True)
+
+      # Barrier to ensure all ranks complete warmup
+      _dist.barrier()
+      if rank == 0:
+        print("[INIT] all NCCL warmup complete, starting training", flush=True)
+
+      del _warmup_t
 
   try:
     with nvtx_ctx('train/run'):
@@ -307,18 +310,20 @@ def train(cfg: Config):
         t0 = time.perf_counter()
 
         for micro_step in range(accum_steps):
-          cu_seqlens = None
-          if sft_mode:
-            loader_result = loader.next()
-            if len(loader_result) == 4:
-              # Packed mode: (inputs, targets, loss_mask, cu_seqlens)
-              inputs, targets, loss_mask, cu_seqlens = loader_result
+         with nvtx_ctx(f'train/micro_{micro_step}'):
+          with nvtx_ctx('train/data_load'):
+            cu_seqlens = None
+            if sft_mode:
+              loader_result = loader.next()
+              if len(loader_result) == 4:
+                # Packed mode: (inputs, targets, loss_mask, cu_seqlens)
+                inputs, targets, loss_mask, cu_seqlens = loader_result
+              else:
+                # Unpacked mode: (inputs, targets, loss_mask)
+                inputs, targets, loss_mask = loader_result
             else:
-              # Unpacked mode: (inputs, targets, loss_mask)
-              inputs, targets, loss_mask = loader_result
-          else:
-            inputs, targets = loader.next()
-            loss_mask = None
+              inputs, targets = loader.next()
+              loss_mask = None
 
           with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
             logits = model(inputs, cu_seqlens=cu_seqlens)
@@ -402,13 +407,14 @@ def train(cfg: Config):
             # See nmoe/fused_grad_clip.py for implementation details
             grad_clip = getattr(cfg, 'grad_clip', 0.0)
             if grad_clip > 0:
-              if fused_eco is not None:
-                # Only clip dense parameters (expert grads already consumed in backward)
-                dense_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
-                if dense_params:
-                  fused_clip_grad_norm_(dense_params, grad_clip)
-              else:
-                fused_clip_grad_norm_(model.parameters(), grad_clip)
+              with nvtx_ctx('train/grad_clip'):
+                if fused_eco is not None:
+                  # Only clip dense parameters (expert grads already consumed in backward)
+                  dense_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+                  if dense_params:
+                    fused_clip_grad_norm_(dense_params, grad_clip)
+                else:
+                  fused_clip_grad_norm_(model.parameters(), grad_clip)
 
             with nvtx_ctx('train/opt_step'), time_ctx('time_ms/opt_step'):
               step(model, optimizer, dense_groups, zero2_state, cfg, world)

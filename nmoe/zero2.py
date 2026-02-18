@@ -17,6 +17,15 @@ from nmoe.nccl_watchdog import get_watchdog
 
 _log = logging.getLogger(__name__)
 
+
+def _nvtx(tag: str):
+    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
+        return nullcontext()
+    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
+
+
 # Check for multi-tensor copy op (available in PyTorch 2.0+).
 # This allows batching ~100 copy kernels into a single launch.
 _HAS_FOREACH_COPY = hasattr(torch, '_foreach_copy_')
@@ -166,20 +175,21 @@ def eager_init(
 
   Re-entrancy safe: if buffers are already initialized, this is a no-op.
   """
-  world = dist.get_world_size(pg) if (dist.is_available() and dist.is_initialized()) else 1
-  rank = dist.get_rank(pg) if (dist.is_available() and dist.is_initialized()) else 0
+  with _nvtx("zero2/eager_init"):
+    world = dist.get_world_size(pg) if (dist.is_available() and dist.is_initialized()) else 1
+    rank = dist.get_rank(pg) if (dist.is_available() and dist.is_initialized()) else 0
 
-  for group in param_groups:
-    params = list(group['params'])
-    if not params:
-      continue
-    by_dtype: dict[torch.dtype, list[torch.nn.Parameter]] = {}
-    for p in params:
-      if p.dtype not in by_dtype:
-        by_dtype[p.dtype] = []
-      by_dtype[p.dtype].append(p)
-    for dtype, group_params in by_dtype.items():
-      _get_or_init_flat_group(group, params=group_params, rank=rank, world=world, dtype=dtype)
+    for group in param_groups:
+      params = list(group['params'])
+      if not params:
+        continue
+      by_dtype: dict[torch.dtype, list[torch.nn.Parameter]] = {}
+      for p in params:
+        if p.dtype not in by_dtype:
+          by_dtype[p.dtype] = []
+        by_dtype[p.dtype].append(p)
+      for dtype, group_params in by_dtype.items():
+        _get_or_init_flat_group(group, params=group_params, rank=rank, world=world, dtype=dtype)
 
 
 @torch.no_grad()
@@ -236,11 +246,12 @@ def step_dense_adamw(
 
       # Wait for previous step's async all-gather to complete before
       # reading gradients (which depend on the current parameters).
-      prev_ag = flat.get('_pending_ag')
-      if prev_ag is not None:
-        prev_ag.wait()
-        nccl_wd.clear()
-        flat['_pending_ag'] = None
+      with _nvtx("zero2/ag_wait_prev"):
+        prev_ag = flat.get('_pending_ag')
+        if prev_ag is not None:
+          prev_ag.wait()
+          nccl_wd.clear()
+          flat['_pending_ag'] = None
 
       flat_param = flat['flat_param']
       param_shard = flat['param_shard']
@@ -290,25 +301,27 @@ def step_dense_adamw(
       _fused_fn = _fused_adamw_fns[dtype]
 
       def _adamw_chunk(rs_out_buf: torch.Tensor, clen: int, soff: int) -> None:
-        _fused_fn(
-            param_shard.data_ptr() + soff * param_shard.element_size(),
-            rs_out_buf.data_ptr(),
-            exp_avg.data_ptr() + soff * exp_avg.element_size(),
-            exp_avg_sq.data_ptr() + soff * exp_avg_sq.element_size(),
-            clen,
-            beta1, beta2,
-            lr, wd, eps,
-            step_size, inv_bc2_sqrt,
-            torch.cuda.current_stream(),
-        )
+        with _nvtx("zero2/adamw_kernel"):
+          _fused_fn(
+              param_shard.data_ptr() + soff * param_shard.element_size(),
+              rs_out_buf.data_ptr(),
+              exp_avg.data_ptr() + soff * exp_avg.element_size(),
+              exp_avg_sq.data_ptr() + soff * exp_avg_sq.element_size(),
+              clen,
+              beta1, beta2,
+              lr, wd, eps,
+              step_size, inv_bc2_sqrt,
+              torch.cuda.current_stream(),
+          )
 
       # Precompute flat views of grads (avoid repeated reshape work).
-      grad_views: list[torch.Tensor | None] = []
-      for p in group_params:
-        if p.grad is None:
-          grad_views.append(None)
-        else:
-          grad_views.append(p.grad.detach().reshape(-1))
+      with _nvtx("zero2/grad_pack"):
+        grad_views: list[torch.Tensor | None] = []
+        for p in group_params:
+          if p.grad is None:
+            grad_views.append(None)
+          else:
+            grad_views.append(p.grad.detach().reshape(-1))
 
       # Double-buffered reduce-scatter with pipelined packing.
       # Treat conceptual flat_grad as [world, shard_size] laid out row-major.
@@ -342,40 +355,41 @@ def step_dense_adamw(
           # Optimization: collect all (dst, src) slice pairs and execute with
           # a single torch._foreach_copy_ call instead of ~100 individual
           # .copy_() calls. This reduces kernel launch overhead significantly.
-          cur_rs_in2d.zero_()
-          dst_slices: list[torch.Tensor] = []
-          src_slices: list[torch.Tensor] = []
-          for src_rank in range(world):
-            g0 = src_rank * shard_size + shard_off
-            if g0 >= total:
-              continue
-            g1 = min(g0 + chunk_len, total)
-            row = cur_rs_in2d[src_rank]
+          with _nvtx("zero2/grad_pack_chunk"):
+            cur_rs_in2d.zero_()
+            dst_slices: list[torch.Tensor] = []
+            src_slices: list[torch.Tensor] = []
+            for src_rank in range(world):
+              g0 = src_rank * shard_size + shard_off
+              if g0 >= total:
+                continue
+              g1 = min(g0 + chunk_len, total)
+              row = cur_rs_in2d[src_rank]
 
-            i = cursors[src_rank]
-            while i < len(offsets) and offsets[i][1] <= g0:
-              i += 1
-            cursors[src_rank] = i
+              i = cursors[src_rank]
+              while i < len(offsets) and offsets[i][1] <= g0:
+                i += 1
+              cursors[src_rank] = i
 
-            while i < len(offsets) and offsets[i][0] < g1:
-              a, b = offsets[i]
-              o0 = g0 if g0 > a else a
-              o1 = g1 if g1 < b else b
-              if o1 > o0:
-                gv = grad_views[i]
-                if gv is not None:
-                  dst_slices.append(row[(o0 - g0):(o1 - g0)])
-                  src_slices.append(gv[(o0 - a):(o1 - a)])
-              i += 1
+              while i < len(offsets) and offsets[i][0] < g1:
+                a, b = offsets[i]
+                o0 = g0 if g0 > a else a
+                o1 = g1 if g1 < b else b
+                if o1 > o0:
+                  gv = grad_views[i]
+                  if gv is not None:
+                    dst_slices.append(row[(o0 - g0):(o1 - g0)])
+                    src_slices.append(gv[(o0 - a):(o1 - a)])
+                i += 1
 
-          # Execute all gradient copies in a single batched kernel.
-          if dst_slices:
-            if _HAS_FOREACH_COPY:
-              torch._foreach_copy_(dst_slices, src_slices)
-            else:
-              # Fallback for older PyTorch versions (sequential copies).
-              for dst, src in zip(dst_slices, src_slices):
-                dst.copy_(src)
+            # Execute all gradient copies in a single batched kernel.
+            if dst_slices:
+              if _HAS_FOREACH_COPY:
+                torch._foreach_copy_(dst_slices, src_slices)
+              else:
+                # Fallback for older PyTorch versions (sequential copies).
+                for dst, src in zip(dst_slices, src_slices):
+                  dst.copy_(src)
 
           # Wait for the PREVIOUS chunk's RS to finish, then apply AdamW.
           if pending_work is not None:
@@ -385,34 +399,37 @@ def step_dense_adamw(
             _adamw_chunk(pending_rs_out, pending_chunk_len, pending_shard_off)
 
           # Launch async reduce-scatter for the current chunk.
-          if world == 1:
-            cur_rs_out[:chunk_len].copy_(cur_rs_in2d[0, :chunk_len])
-            pending_work = None
-          else:
-            pending_work = dist.reduce_scatter_tensor(
-              cur_rs_out, cur_rs_in, op=dist.ReduceOp.AVG, group=pg, async_op=True
-            )
-            nccl_wd.watch(pending_work, f"reduce_scatter chunk {ci}")
-          pending_rs_out = cur_rs_out
-          pending_chunk_len = chunk_len
-          pending_shard_off = shard_off
+          with _nvtx("zero2/reduce_scatter"):
+            if world == 1:
+              cur_rs_out[:chunk_len].copy_(cur_rs_in2d[0, :chunk_len])
+              pending_work = None
+            else:
+              pending_work = dist.reduce_scatter_tensor(
+                cur_rs_out, cur_rs_in, op=dist.ReduceOp.AVG, group=pg, async_op=True
+              )
+              nccl_wd.watch(pending_work, f"reduce_scatter chunk {ci}")
+            pending_rs_out = cur_rs_out
+            pending_chunk_len = chunk_len
+            pending_shard_off = shard_off
 
       # Drain the last pending chunk (outside the timer context).
-      if pending_work is not None:
-        pending_work.wait()
-        nccl_wd.clear()
-      if pending_rs_out is not None:
-        _adamw_chunk(pending_rs_out, pending_chunk_len, pending_shard_off)
+      with _nvtx("zero2/rs_drain"):
+        if pending_work is not None:
+          pending_work.wait()
+          nccl_wd.clear()
+        if pending_rs_out is not None:
+          _adamw_chunk(pending_rs_out, pending_chunk_len, pending_shard_off)
 
       # Async all-gather updated params to all ranks (no-op when world==1).
       # The work handle is stored in the flat dict so the next step waits
       # before reading gradients, allowing the current AG to overlap with
       # the next forward pass.
-      if world > 1:
-        with time_ctx('time_ms/zero2_all_gather'):
-          ag_work = dist.all_gather_into_tensor(flat_param, param_shard, group=pg, async_op=True)
-          nccl_wd.watch(ag_work, f"all_gather params dtype={dtype}")
-        flat['_pending_ag'] = ag_work
-      elif total < padded_total:
-        # Keep padding clean for determinism.
-        flat_param[total:padded_total].zero_()
+      with _nvtx("zero2/all_gather"):
+        if world > 1:
+          with time_ctx('time_ms/zero2_all_gather'):
+            ag_work = dist.all_gather_into_tensor(flat_param, param_shard, group=pg, async_op=True)
+            nccl_wd.watch(ag_work, f"all_gather params dtype={dtype}")
+          flat['_pending_ag'] = ag_work
+        elif total < padded_total:
+          # Keep padding clean for determinism.
+          flat_param[total:padded_total].zero_()

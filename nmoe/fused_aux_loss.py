@@ -20,9 +20,20 @@ Performance:
 
 import os
 import ctypes
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
+
+
+@contextmanager
+def _nvtx(name: str):
+    """Emit an NVTX range visible in Nsight Systems / nvprof."""
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 # ---------------------------------------------------------------------------
 # Load the fused aux loss CUDA extension.
@@ -123,106 +134,107 @@ def fused_aux_loss(
         This function requires the fused CUDA kernel to be compiled and
         available. There is no PyTorch fallback.
     """
-    if alpha == 0.0:
-        return gates.new_zeros((), dtype=torch.float32)
+    with _nvtx("fused_aux_loss/compute"):
+        if alpha == 0.0:
+            return gates.new_zeros((), dtype=torch.float32)
 
-    lib = _load_aux_loss_lib()
+        lib = _load_aux_loss_lib()
 
-    device = expert_ids.device
-    TK = expert_ids.numel()
+        device = expert_ids.device
+        TK = expert_ids.numel()
 
-    # Get cached buffers and zero them
-    buffers = _get_buffers(device, E)
-    f_accum = buffers["f_accum"]
-    P_accum = buffers["P_accum"]
-    loss_out = buffers["loss_out"]
-    block_done = buffers["block_done"]
+        # Get cached buffers and zero them
+        buffers = _get_buffers(device, E)
+        f_accum = buffers["f_accum"]
+        P_accum = buffers["P_accum"]
+        loss_out = buffers["loss_out"]
+        block_done = buffers["block_done"]
 
-    # Zero the accumulators
-    f_accum.zero_()
-    P_accum.zero_()
-    block_done.zero_()
+        # Zero the accumulators
+        f_accum.zero_()
+        P_accum.zero_()
+        block_done.zero_()
 
-    # Flatten inputs
-    expert_ids_flat = expert_ids.reshape(-1).contiguous()
-    gates_flat = gates.reshape(-1).contiguous()
+        # Flatten inputs
+        expert_ids_flat = expert_ids.reshape(-1).contiguous()
+        gates_flat = gates.reshape(-1).contiguous()
 
-    # Get CUDA stream
-    stream = torch.cuda.current_stream(device).cuda_stream
+        # Get CUDA stream
+        stream = torch.cuda.current_stream(device).cuda_stream
 
-    # Determine which kernel to use based on gates dtype
-    # We use the single-kernel variant for better performance when E is small
-    if gates.dtype == torch.float32:
-        lib.fused_aux_loss_single_f32.restype = ctypes.c_int
-        lib.fused_aux_loss_single_f32.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_float,
-            ctypes.c_void_p,
-        ]
-        err = lib.fused_aux_loss_single_f32(
-            ctypes.c_void_p(expert_ids_flat.data_ptr()),
-            ctypes.c_void_p(gates_flat.data_ptr()),
-            ctypes.c_void_p(f_accum.data_ptr()),
-            ctypes.c_void_p(P_accum.data_ptr()),
-            ctypes.c_void_p(loss_out.data_ptr()),
-            ctypes.c_void_p(block_done.data_ptr()),
-            ctypes.c_int(E),
-            ctypes.c_int(TK),
-            ctypes.c_float(alpha),
-            ctypes.c_void_p(stream),
-        )
-    elif gates.dtype == torch.bfloat16:
-        lib.fused_aux_loss_single_bf16.restype = ctypes.c_int
-        lib.fused_aux_loss_single_bf16.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_float,
-            ctypes.c_void_p,
-        ]
-        err = lib.fused_aux_loss_single_bf16(
-            ctypes.c_void_p(expert_ids_flat.data_ptr()),
-            ctypes.c_void_p(gates_flat.data_ptr()),
-            ctypes.c_void_p(f_accum.data_ptr()),
-            ctypes.c_void_p(P_accum.data_ptr()),
-            ctypes.c_void_p(loss_out.data_ptr()),
-            ctypes.c_void_p(block_done.data_ptr()),
-            ctypes.c_int(E),
-            ctypes.c_int(TK),
-            ctypes.c_float(alpha),
-            ctypes.c_void_p(stream),
-        )
-    elif gates.dtype == torch.float16:
-        lib.fused_aux_loss_single_f16.restype = ctypes.c_int
-        lib.fused_aux_loss_single_f16.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_float,
-            ctypes.c_void_p,
-        ]
-        err = lib.fused_aux_loss_single_f16(
-            ctypes.c_void_p(expert_ids_flat.data_ptr()),
-            ctypes.c_void_p(gates_flat.data_ptr()),
-            ctypes.c_void_p(f_accum.data_ptr()),
-            ctypes.c_void_p(P_accum.data_ptr()),
-            ctypes.c_void_p(loss_out.data_ptr()),
-            ctypes.c_void_p(block_done.data_ptr()),
-            ctypes.c_int(E),
-            ctypes.c_int(TK),
-            ctypes.c_float(alpha),
-            ctypes.c_void_p(stream),
-        )
-    else:
-        raise ValueError(f"Unsupported gates dtype: {gates.dtype}")
+        # Determine which kernel to use based on gates dtype
+        # We use the single-kernel variant for better performance when E is small
+        if gates.dtype == torch.float32:
+            lib.fused_aux_loss_single_f32.restype = ctypes.c_int
+            lib.fused_aux_loss_single_f32.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                ctypes.c_void_p,
+            ]
+            err = lib.fused_aux_loss_single_f32(
+                ctypes.c_void_p(expert_ids_flat.data_ptr()),
+                ctypes.c_void_p(gates_flat.data_ptr()),
+                ctypes.c_void_p(f_accum.data_ptr()),
+                ctypes.c_void_p(P_accum.data_ptr()),
+                ctypes.c_void_p(loss_out.data_ptr()),
+                ctypes.c_void_p(block_done.data_ptr()),
+                ctypes.c_int(E),
+                ctypes.c_int(TK),
+                ctypes.c_float(alpha),
+                ctypes.c_void_p(stream),
+            )
+        elif gates.dtype == torch.bfloat16:
+            lib.fused_aux_loss_single_bf16.restype = ctypes.c_int
+            lib.fused_aux_loss_single_bf16.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                ctypes.c_void_p,
+            ]
+            err = lib.fused_aux_loss_single_bf16(
+                ctypes.c_void_p(expert_ids_flat.data_ptr()),
+                ctypes.c_void_p(gates_flat.data_ptr()),
+                ctypes.c_void_p(f_accum.data_ptr()),
+                ctypes.c_void_p(P_accum.data_ptr()),
+                ctypes.c_void_p(loss_out.data_ptr()),
+                ctypes.c_void_p(block_done.data_ptr()),
+                ctypes.c_int(E),
+                ctypes.c_int(TK),
+                ctypes.c_float(alpha),
+                ctypes.c_void_p(stream),
+            )
+        elif gates.dtype == torch.float16:
+            lib.fused_aux_loss_single_f16.restype = ctypes.c_int
+            lib.fused_aux_loss_single_f16.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                ctypes.c_void_p,
+            ]
+            err = lib.fused_aux_loss_single_f16(
+                ctypes.c_void_p(expert_ids_flat.data_ptr()),
+                ctypes.c_void_p(gates_flat.data_ptr()),
+                ctypes.c_void_p(f_accum.data_ptr()),
+                ctypes.c_void_p(P_accum.data_ptr()),
+                ctypes.c_void_p(loss_out.data_ptr()),
+                ctypes.c_void_p(block_done.data_ptr()),
+                ctypes.c_int(E),
+                ctypes.c_int(TK),
+                ctypes.c_float(alpha),
+                ctypes.c_void_p(stream),
+            )
+        else:
+            raise ValueError(f"Unsupported gates dtype: {gates.dtype}")
 
-    if err != 0:
-        raise RuntimeError(f"fused_aux_loss CUDA kernel returned error {err}")
+        if err != 0:
+            raise RuntimeError(f"fused_aux_loss CUDA kernel returned error {err}")
 
-    # Return a scalar tensor (clone to avoid returning a view into the buffer)
-    return loss_out[0].clone()
+        # Return a scalar tensor (clone to avoid returning a view into the buffer)
+        return loss_out[0].clone()
 
 
 class FusedAuxLoss(torch.autograd.Function):
@@ -245,10 +257,11 @@ class FusedAuxLoss(torch.autograd.Function):
         alpha: float,
     ) -> torch.Tensor:
         """Forward pass computing the auxiliary loss."""
-        # The aux loss is a regularization term that typically does not
-        # backprop through gates (the gradient would encourage imbalanced routing).
-        # If backprop is needed, implement it in backward().
-        return fused_aux_loss(expert_ids, gates, E, alpha)
+        with _nvtx("fused_aux_loss/autograd_forward"):
+            # The aux loss is a regularization term that typically does not
+            # backprop through gates (the gradient would encourage imbalanced routing).
+            # If backprop is needed, implement it in backward().
+            return fused_aux_loss(expert_ids, gates, E, alpha)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -268,4 +281,5 @@ def fused_aux_loss_autograd(
     This version can be used in training when the loss needs to be part of
     a computation graph, though gradients do not flow through it.
     """
-    return FusedAuxLoss.apply(expert_ids, gates, E, alpha)
+    with _nvtx("fused_aux_loss/autograd_wrapper"):
+        return FusedAuxLoss.apply(expert_ids, gates, E, alpha)

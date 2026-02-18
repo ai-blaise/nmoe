@@ -1,5 +1,7 @@
 from __future__ import annotations
+import os
 from typing import Optional, Tuple
+from contextlib import nullcontext
 from importlib import import_module
 
 import torch
@@ -18,6 +20,14 @@ from nmoe.fused_router import (
     fused_update_bias_from_counts,
 )
 from nmoe.fused_aux_loss import fused_aux_loss
+
+
+def _nvtx(tag: str):
+    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
+        return nullcontext()
+    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
 
 
 # =============================================================================
@@ -133,35 +143,36 @@ def _create_rdep(config, ep_size: int) -> Rdep:
   Uses ep_size (not world_size) to determine local expert count. With EP=8 and
   128 routed experts: n_local = 128 // 8 = 16 experts per GPU.
   """
-  import sys
-  dp = dist.get_world_size() // max(1, ep_size) if dist.is_initialized() else 1
-  n_local = config.n_routed_experts // max(1, ep_size)
-  # Capacity = max token-expert slots per GPU in one micro-batch.
-  micro_batch = max(1, config.batch_size // (dp * config.gradient_accumulation_steps))
-  # Auto-compute: T * K * ep_size (worst-case dispatch)
-  auto_capacity = int(micro_batch * config.seq_len * config.n_activated_experts * max(1, ep_size))
-  if hasattr(config, "rdep_capacity") and config.rdep_capacity > 0:
-    capacity = int(config.rdep_capacity)
-  else:
-    capacity = auto_capacity
-  # --- Enhanced RDEP logging ---
-  rank = int(dist.get_rank()) if dist.is_initialized() else 0
-  if rank == 0:
-    mem_est_gb = capacity * config.dim * 2 * n_local / (1024**3)  # bf16 estimate
-    print(f"[RDEP] capacity={capacity:,} (auto={auto_capacity:,})", flush=True)
-    print(f"[RDEP] micro_batch={micro_batch} seq_len={config.seq_len} K={config.n_activated_experts} ep={ep_size} dp={dp}", flush=True)
-    print(f"[RDEP] n_local={n_local} dim={config.dim} dtype={config.dtype}", flush=True)
-    print(f"[RDEP] estimated_buffer_mem={mem_est_gb:.2f} GiB (bf16, {n_local} experts)", flush=True)
-    sys.stdout.flush()
-  ep_group = _get_ep_group()
-  return Rdep(
-    config.dim,
-    n_local,
-    config.n_routed_experts,
-    profile=config.dtype,
-    capacity=capacity,
-    ep_group=ep_group,
-  )
+  with _nvtx("model/create_rdep"):
+    import sys
+    dp = dist.get_world_size() // max(1, ep_size) if dist.is_initialized() else 1
+    n_local = config.n_routed_experts // max(1, ep_size)
+    # Capacity = max token-expert slots per GPU in one micro-batch.
+    micro_batch = max(1, config.batch_size // (dp * config.gradient_accumulation_steps))
+    # Auto-compute: T * K * ep_size (worst-case dispatch)
+    auto_capacity = int(micro_batch * config.seq_len * config.n_activated_experts * max(1, ep_size))
+    if hasattr(config, "rdep_capacity") and config.rdep_capacity > 0:
+      capacity = int(config.rdep_capacity)
+    else:
+      capacity = auto_capacity
+    # --- Enhanced RDEP logging ---
+    rank = int(dist.get_rank()) if dist.is_initialized() else 0
+    if rank == 0:
+      mem_est_gb = capacity * config.dim * 2 * n_local / (1024**3)  # bf16 estimate
+      print(f"[RDEP] capacity={capacity:,} (auto={auto_capacity:,})", flush=True)
+      print(f"[RDEP] micro_batch={micro_batch} seq_len={config.seq_len} K={config.n_activated_experts} ep={ep_size} dp={dp}", flush=True)
+      print(f"[RDEP] n_local={n_local} dim={config.dim} dtype={config.dtype}", flush=True)
+      print(f"[RDEP] estimated_buffer_mem={mem_est_gb:.2f} GiB (bf16, {n_local} experts)", flush=True)
+      sys.stdout.flush()
+    ep_group = _get_ep_group()
+    return Rdep(
+      config.dim,
+      n_local,
+      config.n_routed_experts,
+      profile=config.dtype,
+      capacity=capacity,
+      ep_group=ep_group,
+    )
 
 
 def get_attention(name: str):
@@ -201,14 +212,16 @@ class Router(nn.Module):
 
   @record_function("router")
   def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    logits = self.gate(x).float()
-    if self.route_scale != 1.0:
-      logits = logits * self.route_scale
-    scores = torch.sigmoid(logits)
-    scores_for_selection = scores + self.bias
-    _, indices = torch.topk(scores_for_selection, k=self.topk, dim=-1)
-    weights = torch.gather(scores, 1, indices)
-    weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    with _nvtx("router/gate"):
+      logits = self.gate(x).float()
+      if self.route_scale != 1.0:
+        logits = logits * self.route_scale
+      scores = torch.sigmoid(logits)
+    with _nvtx("router/topk"):
+      scores_for_selection = scores + self.bias
+      _, indices = torch.topk(scores_for_selection, k=self.topk, dim=-1)
+      weights = torch.gather(scores, 1, indices)
+      weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-12)
     return weights.to(x.dtype), indices
 
   @torch.no_grad()
@@ -409,23 +422,26 @@ class MoE(nn.Module):
     X = x.view(-1, x.size(-1))
     T = X.size(0)
 
-    if self._use_fused_router:
-      # Fused router returns: expert_ids, gates, dispatch_indices, expert_counts
-      # dispatch_indices and expert_counts are computed by the fused kernel
-      # but the actual dispatch is still handled by rdep
-      eid, g, dispatch_indices, expert_counts = self.router(X)
+    with _nvtx("moe/router"):
+      if self._use_fused_router:
+        # Fused router returns: expert_ids, gates, dispatch_indices, expert_counts
+        # dispatch_indices and expert_counts are computed by the fused kernel
+        # but the actual dispatch is still handled by rdep
+        eid, g, dispatch_indices, expert_counts = self.router(X)
+      else:
+        g, eid = self.router(X)
+
+    with _nvtx("moe/aux_loss"):
       # Compute auxiliary loss for load balancing
       self.last_aux_loss = self._compute_aux_loss(g, eid, T)
-      with torch.no_grad():
-        # Use expert_counts directly instead of bincount
-        self.last_loads = expert_counts.float()
-    else:
-      g, eid = self.router(X)
-      # Compute auxiliary loss for load balancing
-      self.last_aux_loss = self._compute_aux_loss(g, eid, T)
-      with torch.no_grad():
-        loads = torch.bincount(eid.reshape(-1), minlength=self.router.n_experts).to(torch.float32)
-        self.last_loads = loads
+      if self._use_fused_router:
+        with torch.no_grad():
+          # Use expert_counts directly instead of bincount
+          self.last_loads = expert_counts.float()
+      else:
+        with torch.no_grad():
+          loads = torch.bincount(eid.reshape(-1), minlength=self.router.n_experts).to(torch.float32)
+          self.last_loads = loads
 
     # Track load imbalance for monitoring (coefficient of variation)
     with torch.no_grad():
@@ -437,33 +453,35 @@ class MoE(nn.Module):
       else:
         self._last_load_cv = 0.0
 
-    if self._use_blockscaled:
-      if self._W_cache is None:
-        self.refresh_weight_cache()
+    with _nvtx("moe/blockscaled_dispatch"):
+      if self._use_blockscaled:
+        if self._W_cache is None:
+          self.refresh_weight_cache()
 
-      # NVFP4 primary mode: transiently populate W1/W3/W2 data from NVFP4 buffers
-      # for backward pass (STE: forward uses blockscaled cache, backward uses BF16).
-      # When fused_eco is active, skip this — backward will dequant per-layer on-the-fly
-      # from moe_ref's NVFP4 buffers, avoiding 76 GiB of simultaneous BF16 allocations.
-      if self._nvfp4_primary and self._W1_packed is not None and self._fused_eco is None:
-        from nmoe.moe import dequant_nvfp4_to_bf16_transient
-        gs = self._nvfp4_group_size
-        # W1/W3: HF [E, moe_inter_dim, dim//2] → nmoe [E, dim, moe_inter_dim]
-        self.W1.data = dequant_nvfp4_to_bf16_transient(
-          self._W1_packed, self._W1_scale, self._W1_gs, gs, transpose=True)
-        self.W3.data = dequant_nvfp4_to_bf16_transient(
-          self._W3_packed, self._W3_scale, self._W3_gs, gs, transpose=True)
-        # W2: HF [E, dim, moe_inter_dim//2] → nmoe [E, moe_inter_dim, dim]
-        self.W2.data = dequant_nvfp4_to_bf16_transient(
-          self._W2_packed, self._W2_scale, self._W2_gs, gs, transpose=True)
+        # NVFP4 primary mode: transiently populate W1/W3/W2 data from NVFP4 buffers
+        # for backward pass (STE: forward uses blockscaled cache, backward uses BF16).
+        # When fused_eco is active, skip this — backward will dequant per-layer on-the-fly
+        # from moe_ref's NVFP4 buffers, avoiding 76 GiB of simultaneous BF16 allocations.
+        if self._nvfp4_primary and self._W1_packed is not None and self._fused_eco is None:
+          from nmoe.moe import dequant_nvfp4_to_bf16_transient
+          gs = self._nvfp4_group_size
+          # W1/W3: HF [E, moe_inter_dim, dim//2] → nmoe [E, dim, moe_inter_dim]
+          self.W1.data = dequant_nvfp4_to_bf16_transient(
+            self._W1_packed, self._W1_scale, self._W1_gs, gs, transpose=True)
+          self.W3.data = dequant_nvfp4_to_bf16_transient(
+            self._W3_packed, self._W3_scale, self._W3_gs, gs, transpose=True)
+          # W2: HF [E, dim, moe_inter_dim//2] → nmoe [E, moe_inter_dim, dim]
+          self.W2.data = dequant_nvfp4_to_bf16_transient(
+            self._W2_packed, self._W2_scale, self._W2_gs, gs, transpose=True)
 
-      out = self._rdep.moe_blockscaled(X.bfloat16(), eid, g, self.W1, self.W3, self.W2, self._W_cache,
-                                        fused_eco=self._fused_eco, moe_ref=self)
-    else:
-      out = self._rdep.moe_bf16(X.bfloat16(), eid, g, self.W1, self.W3, self.W2)
+        out = self._rdep.moe_blockscaled(X.bfloat16(), eid, g, self.W1, self.W3, self.W2, self._W_cache,
+                                          fused_eco=self._fused_eco, moe_ref=self)
+      else:
+        out = self._rdep.moe_bf16(X.bfloat16(), eid, g, self.W1, self.W3, self.W2)
 
     if self._shared:
-      out = out + self._shared(X)
+      with _nvtx("moe/shared_expert"):
+        out = out + self._shared(X)
     return out.view_as(x)
 
 
@@ -545,17 +563,19 @@ class TransformerBlock(nn.Module):
       # 2. torch.compile works best outside checkpoint boundaries
       # The checkpoint itself provides memory savings, and the recomputation
       # naturally fuses operations during the backward pass.
-      if pass_cu:
+      with _nvtx("block/attn"):
+        if pass_cu:
+          x = x + torch.utils.checkpoint.checkpoint(
+            self.attn, self.attn_norm(x), cos, sin, cu_seqlens, **self._gradient_checkpointing_kwargs
+          )
+        else:
+          x = x + torch.utils.checkpoint.checkpoint(
+            self.attn, self.attn_norm(x), cos, sin, **self._gradient_checkpointing_kwargs
+          )
+      with _nvtx("block/ffn"):
         x = x + torch.utils.checkpoint.checkpoint(
-          self.attn, self.attn_norm(x), cos, sin, cu_seqlens, **self._gradient_checkpointing_kwargs
+          self.ffn, self.ffn_norm(x), **self._gradient_checkpointing_kwargs
         )
-      else:
-        x = x + torch.utils.checkpoint.checkpoint(
-          self.attn, self.attn_norm(x), cos, sin, **self._gradient_checkpointing_kwargs
-        )
-      x = x + torch.utils.checkpoint.checkpoint(
-        self.ffn, self.ffn_norm(x), **self._gradient_checkpointing_kwargs
-      )
     else:
       # No checkpointing - use fused residual add helpers
       # torch.compile fuses: RMSNorm output consumed immediately + layer + residual add
@@ -565,14 +585,16 @@ class TransformerBlock(nn.Module):
       # x_normed = RMSNorm(x)  -> consumed by attn/ffn
       # out = layer(x_normed) -> fused with residual
       # x = x + out           -> single fused kernel
-      if pass_cu:
-        normed_x = self.attn_norm(x)
-        x = _get_fused_residual_attn_cu()(x, normed_x, self.attn, cos, sin, cu_seqlens)
-      else:
-        normed_x = self.attn_norm(x)
-        x = _get_fused_residual_attn()(x, normed_x, self.attn, cos, sin)
-      normed_x = self.ffn_norm(x)
-      x = _get_fused_residual_ffn()(x, normed_x, self.ffn)
+      with _nvtx("block/attn"):
+        if pass_cu:
+          normed_x = self.attn_norm(x)
+          x = _get_fused_residual_attn_cu()(x, normed_x, self.attn, cos, sin, cu_seqlens)
+        else:
+          normed_x = self.attn_norm(x)
+          x = _get_fused_residual_attn()(x, normed_x, self.attn, cos, sin)
+      with _nvtx("block/ffn"):
+        normed_x = self.ffn_norm(x)
+        x = _get_fused_residual_ffn()(x, normed_x, self.ffn)
     return x
 
 
@@ -707,41 +729,43 @@ class Transformer(nn.Module):
                   When provided, attention layers use document-isolated causal masking
                   so tokens from different packed documents cannot attend to each other.
     """
-    with record_function("embedding"):
+    with record_function("embedding"), _nvtx("model/embed"):
       x = self.embedding(tokens) * self.mup_scale_factor
     seqlen = tokens.size(1)
-    if cu_seqlens is not None:
-      # Packed sequences: build per-document position IDs that reset to 0
-      # at each document boundary so RoPE encodes intra-document positions.
-      # Without this, documents packed at position 500+ would get RoPE
-      # frequencies as if they were at absolute positions 500+, which is wrong.
-      #
-      # Algorithm: seq_positions = [0,1,2,...,S-1] per row, then subtract the
-      # cumulative start of each document. E.g. cu_seqlens=[0,300,700,4096]:
-      #   positions 0-299   -> 0-299   (doc 0, subtract 0)
-      #   positions 300-699 -> 0-399   (doc 1, subtract 300)
-      #   positions 700+    -> 0-3395  (doc 2, subtract 700)
-      bsz = tokens.size(0)
-      position_ids = torch.arange(seqlen, device=tokens.device).unsqueeze(0).expand(bsz, -1)
-      # Build doc_starts: for each position, the cu_seqlen boundary that starts its document.
-      # Use searchsorted to find which document each position belongs to, then look up its start.
-      doc_starts = torch.zeros(bsz, seqlen, dtype=torch.long, device=tokens.device)
-      for b in range(bsz):
-        cu = cu_seqlens[b].to(dtype=torch.long, device=tokens.device)
-        # searchsorted(cu, positions, right=True) - 1 gives the document index for each position
-        doc_idx = torch.searchsorted(cu, position_ids[b], right=True) - 1
-        doc_idx = doc_idx.clamp(min=0, max=cu.shape[0] - 2)
-        doc_starts[b] = cu[doc_idx]
-      position_ids = position_ids - doc_starts
-      # Index into precomputed RoPE table: [B, S] -> [B, S, head_dim//2]
-      cos = self.rope.cos[position_ids]
-      sin = self.rope.sin[position_ids]
-    else:
-      # Standard sequential positions
-      cos = self.rope.cos[:seqlen]
-      sin = self.rope.sin[:seqlen]
-    for block in self.blocks:
-      x = block(x, cos, sin, cu_seqlens=cu_seqlens)
+    with _nvtx("model/rope"):
+      if cu_seqlens is not None:
+        # Packed sequences: build per-document position IDs that reset to 0
+        # at each document boundary so RoPE encodes intra-document positions.
+        # Without this, documents packed at position 500+ would get RoPE
+        # frequencies as if they were at absolute positions 500+, which is wrong.
+        #
+        # Algorithm: seq_positions = [0,1,2,...,S-1] per row, then subtract the
+        # cumulative start of each document. E.g. cu_seqlens=[0,300,700,4096]:
+        #   positions 0-299   -> 0-299   (doc 0, subtract 0)
+        #   positions 300-699 -> 0-399   (doc 1, subtract 300)
+        #   positions 700+    -> 0-3395  (doc 2, subtract 700)
+        bsz = tokens.size(0)
+        position_ids = torch.arange(seqlen, device=tokens.device).unsqueeze(0).expand(bsz, -1)
+        # Build doc_starts: for each position, the cu_seqlen boundary that starts its document.
+        # Use searchsorted to find which document each position belongs to, then look up its start.
+        doc_starts = torch.zeros(bsz, seqlen, dtype=torch.long, device=tokens.device)
+        for b in range(bsz):
+          cu = cu_seqlens[b].to(dtype=torch.long, device=tokens.device)
+          # searchsorted(cu, positions, right=True) - 1 gives the document index for each position
+          doc_idx = torch.searchsorted(cu, position_ids[b], right=True) - 1
+          doc_idx = doc_idx.clamp(min=0, max=cu.shape[0] - 2)
+          doc_starts[b] = cu[doc_idx]
+        position_ids = position_ids - doc_starts
+        # Index into precomputed RoPE table: [B, S] -> [B, S, head_dim//2]
+        cos = self.rope.cos[position_ids]
+        sin = self.rope.sin[position_ids]
+      else:
+        # Standard sequential positions
+        cos = self.rope.cos[:seqlen]
+        sin = self.rope.sin[:seqlen]
+    with _nvtx("model/layers"):
+      for block in self.blocks:
+        x = block(x, cos, sin, cu_seqlens=cu_seqlens)
     with torch.no_grad():
       moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
       if moe_layers:
@@ -755,10 +779,10 @@ class Transformer(nn.Module):
         loads = loads / loads.sum(dim=-1, keepdim=True).clamp_min(1.0)
         for m, l in zip(moe_layers, loads):
           m.last_loads = l
-    with record_function("norm_f"):
+    with record_function("norm_f"), _nvtx("model/norm_f"):
       x = self.norm(x)
     # Dynamic amax scaling handles range - no clamp needed (TorchTitan/Megatron pattern)
-    with record_function("lm_head"):
+    with record_function("lm_head"), _nvtx("model/lm_head"):
       logits = self.lm_head(x) * self.logits_scale_factor
 
     return logits

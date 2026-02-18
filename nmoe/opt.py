@@ -11,10 +11,22 @@ import math
 import torch
 import torch.distributed as dist
 
+from contextlib import contextmanager
+
 from nmoe.config import Config
 from nmoe import zero2
 
 _log = logging.getLogger(__name__)
+
+
+@contextmanager
+def _nvtx(tag: str):
+  """Emit an NVTX range for Nsight profiling.  No-op cost when no profiler is attached."""
+  torch.cuda.nvtx.range_push(tag)
+  try:
+    yield
+  finally:
+    torch.cuda.nvtx.range_pop()
 
 
 class _NullExpertOptimizer(torch.optim.Optimizer):
@@ -251,34 +263,37 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups:
   # ZeRO-2 AdamW step for dense params.
   # When EP+DP is active, ZeRO-2 uses the DP group (not WORLD).
   # Dense params are replicated across DP ranks; ZeRO-2 shards within DP group.
-  if world > 1:
-    pg = dp_group if dp_group is not None else dist.group.WORLD
-    zero2.step_dense_adamw(
-      dense_groups,
-      state=zero2_state,
-      pg=pg,
-      betas=(cfg.adam_beta1, cfg.adam_beta2),
-      eps=cfg.adam_eps,
-    )
-  else:
-    zero2.step_dense_adamw(dense_groups, state=zero2_state)
+  with _nvtx("opt/zero2_step"):
+    if world > 1:
+      pg = dp_group if dp_group is not None else dist.group.WORLD
+      zero2.step_dense_adamw(
+        dense_groups,
+        state=zero2_state,
+        pg=pg,
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        eps=cfg.adam_eps,
+      )
+    else:
+      zero2.step_dense_adamw(dense_groups, state=zero2_state)
 
   # Expert gradient AllReduce over DP group.
   # With EP+DP, each expert is replicated across dp_size ranks.
   # Their gradients must be averaged before the optimizer step.
   # Skip when fused backward-optimizer is active (AllReduce done inside backward).
   is_fused_eco = isinstance(optimizer, _NullExpertOptimizer)
-  if not is_fused_eco and dp_size > 1 and dp_group is not None:
-    for p in optimizer.param_groups[0]['params']:
-      if p.grad is not None:
-        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=dp_group)
+  with _nvtx("opt/expert_allreduce"):
+    if not is_fused_eco and dp_size > 1 and dp_group is not None:
+      for p in optimizer.param_groups[0]['params']:
+        if p.grad is not None:
+          dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=dp_group)
 
   # Expert optimizer step (params already sharded via RDEP across EP group).
   # _NullExpertOptimizer.step() is a no-op (fused backward-optimizer already ran).
-  optimizer.step()
+  with _nvtx("opt/expert_step"):
+    optimizer.step()
 
   # Post-step hooks (quantization rebuild, router bias update)
-  with torch.no_grad():
+  with _nvtx("opt/post_hooks"), torch.no_grad():
     for blk in model.blocks:
       ffn = getattr(blk, 'ffn', None)
       if ffn is None:
