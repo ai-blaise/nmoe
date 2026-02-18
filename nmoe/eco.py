@@ -464,6 +464,12 @@ class FusedBackwardECO:
         # Update global norm estimate for next step's clipping.
         # Single .item() call here replaces 174 per-weight GPU-CPU syncs.
         if self._norm_sq_gpu is not None:
+            # Synchronize gradient norm across DP ranks for accurate global norm.
+            # Without this, each rank only sees its local contribution to the norm,
+            # causing under-clipping or over-clipping on multi-node (DP > 1).
+            if self._dp_size > 1 and self._dp_group is not None:
+                import torch.distributed as dist
+                dist.all_reduce(self._norm_sq_gpu, op=dist.ReduceOp.SUM, group=self._dp_group)
             norm_sq = self._norm_sq_gpu.item()
         else:
             norm_sq = 0.0
@@ -627,7 +633,7 @@ class FusedBackwardECO:
             if self._norm_sq_gpu is None:
                 self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
             self._norm_sq_gpu += grad_norm_sq
-            if self._step_count > 1:
+            if self._prev_global_norm > 0:
                 clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
                 if clip_coeff < 1.0:
                     grad.mul_(clip_coeff)
@@ -642,6 +648,19 @@ class FusedBackwardECO:
             self._cuda_fused_update(
                 pending.moe, pending.param_name, grad, pending.state,
                 beta1_eff=pending.beta1_eff, beta2_eff=pending.beta2_eff,
+            )
+            # Recompute per-group E4M3 scales at correct group_size granularity.
+            # The CUDA kernel writes scales at 32-element (TILE_IN) granularity;
+            # this tightens them to the true group_size (typically 16).
+            moe = pending.moe
+            pname = pending.param_name
+            group_size = getattr(moe, '_nvfp4_group_size', 16)
+            self._recompute_nvfp4_group_scales(
+                getattr(moe, f'_{pname}_packed'),
+                getattr(moe, f'_{pname}_scale'),
+                group_size=group_size,
+                _rdep=self._rdep if self._require_cuda else None,
+                gs_buf=getattr(moe, f'_{pname}_gs', None),
             )
 
         del pending.grad  # Free FP32 buffer
@@ -761,7 +780,7 @@ class FusedBackwardECO:
             if self._norm_sq_gpu is None:
                 self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
             self._norm_sq_gpu += grad_norm_sq
-            if self._step_count > 1:
+            if self._prev_global_norm > 0:
                 clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
                 if clip_coeff < 1.0:
                     grad.mul_(clip_coeff)
@@ -770,11 +789,63 @@ class FusedBackwardECO:
         if self._cuda_fused_update(moe, param_name, grad, st,
                                     beta1_eff=beta1_frac, beta2_eff=beta2_frac):
             del grad
+            # Recompute per-group E4M3 scales at correct group_size granularity.
+            # The CUDA kernel writes scales at 32-element (TILE_IN) granularity;
+            # this tightens them to the true group_size (typically 16).
+            group_size = getattr(moe, '_nvfp4_group_size', 16)
+            self._recompute_nvfp4_group_scales(
+                getattr(moe, f'_{param_name}_packed'),
+                getattr(moe, f'_{param_name}_scale'),
+                group_size=group_size,
+                _rdep=self._rdep if self._require_cuda else None,
+                gs_buf=getattr(moe, f'_{param_name}_gs', None),
+            )
             return
 
         raise RuntimeError(
             "BUG: _cuda_fused_update returned False. "
             "CUDA kernel is required for production (eco_require_cuda=True)."
+        )
+
+    @staticmethod
+    @torch.no_grad()
+    def _recompute_nvfp4_group_scales(
+        packed: torch.Tensor,
+        scale_buf: torch.Tensor,
+        group_size: int = 16,
+        _rdep=None,
+        gs_buf: torch.Tensor | None = None,
+    ) -> None:
+        """Recompute E4M3 per-group scale factors at correct group_size granularity.
+
+        Uses a single fused CUDA kernel launch instead of ~33 PyTorch ops.
+
+        Args:
+            packed: [E, out_dim, in_dim//2] uint8 — two E2M1 nibbles per byte.
+            scale_buf: [E, out_dim, in_dim//group_size] float8_e4m3fn (or uint8
+                       view) — per-group E4M3 scales.
+            group_size: Elements per scale group (must divide in_dim; default 16).
+            _rdep: CUDA extension module (required).
+            gs_buf: [E] float32 — per-expert global scale factors (required).
+        """
+        E = packed.shape[0]
+        out_dim = packed.shape[1]
+        in_dim = packed.shape[2] * 2  # 2 nibbles per packed byte
+
+        if in_dim % group_size != 0:
+            raise ValueError(
+                f"in_dim={in_dim} not divisible by group_size={group_size}"
+            )
+
+        if _rdep is None:
+            from nmoe.csrc import rdep as _rdep
+
+        _rdep.nvfp4_recompute_group_scales(
+            packed.data_ptr(),
+            scale_buf.view(torch.uint8).data_ptr(),
+            gs_buf.data_ptr(),
+            E, out_dim, in_dim, group_size,
+            torch.cuda.current_stream().cuda_stream,
         )
 
     def refresh_layer_cache(self, moe: nn.Module):

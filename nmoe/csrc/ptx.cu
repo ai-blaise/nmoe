@@ -381,7 +381,7 @@ __device__ __forceinline__ uint8_t e2m1_round_nearest(float ax, uint8_t sign_bit
 
     float dist_floor = ax - floor_v;
     float dist_ceil = ceil_v - ax;
-    int idx = (dist_ceil < dist_floor) ? ceil_i : floor_i;
+    int idx = (dist_ceil <= dist_floor) ? ceil_i : floor_i;
 
     return sign_bit | static_cast<uint8_t>(idx);
 }

@@ -3,31 +3,178 @@ import math
 import torch
 from torch import nn
 
+from nmoe.csrc import rdep as _C
+
+
+_rope_buf: dict[tuple, torch.Tensor] = {}
+
+
+class _FusedRoPEFunction(torch.autograd.Function):
+  """Autograd wrapper for the fused CUDA RoPE kernel."""
+
+  @staticmethod
+  def forward(ctx, x: torch.Tensor, cos_2d: torch.Tensor, sin_2d: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+      x:      [B, T, H, D] contiguous BF16 tensor
+      cos_2d: [T, half_dim] contiguous BF16 tensor (already sliced to seq_len)
+      sin_2d: [T, half_dim] contiguous BF16 tensor (already sliced to seq_len)
+    """
+    B, T, H, D = x.shape
+
+    # Reuse cached output buffer to avoid per-call allocation
+    key = (x.shape, x.dtype, x.device)
+    buf = _rope_buf.get(key)
+    if buf is None or buf.shape != x.shape:
+      buf = torch.empty_like(x)
+      _rope_buf[key] = buf
+    out = buf
+
+    total_vecs = B * T * H
+    stream = torch.cuda.current_stream()
+
+    _C.fused_rope_forward(
+      x.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(), out.data_ptr(),
+      total_vecs, T, H, D,
+      stream,
+    )
+
+    ctx.save_for_backward(cos_2d, sin_2d)
+    ctx.T = T
+    ctx.H = H
+    ctx.D = D
+    return out
+
+  @staticmethod
+  def backward(ctx, grad_output: torch.Tensor):
+    cos_2d, sin_2d = ctx.saved_tensors
+    T, H, D = ctx.T, ctx.H, ctx.D
+
+    grad_output = grad_output.contiguous()
+    grad_x = torch.empty_like(grad_output)
+    total_vecs = grad_output.numel() // D
+    stream = torch.cuda.current_stream()
+
+    _C.fused_rope_backward(
+      grad_output.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(), grad_x.data_ptr(),
+      total_vecs, T, H, D,
+      stream,
+    )
+    return grad_x, None, None
+
+
+class _FusedRoPEPartialFunction(torch.autograd.Function):
+  """Autograd wrapper for in-place partial RoPE CUDA kernel.
+
+  Applies RoPE only to elements [nope_dim:head_dim] within each head,
+  leaving elements [0:nope_dim] unchanged. Operates IN-PLACE.
+
+  This eliminates the need for torch.split + rotate_pe + torch.cat
+  (3 kernels -> 1 kernel), saving 4 kernel launches per MLA layer
+  (2 for Q, 2 for K) = 244 kernel launches per step for 61 layers.
+  """
+
+  @staticmethod
+  def forward(ctx, x: torch.Tensor, cos_2d: torch.Tensor, sin_2d: torch.Tensor, nope_dim: int) -> torch.Tensor:
+    """
+    Args:
+      x:       [B, T, H, D] contiguous BF16 tensor (modified IN-PLACE)
+      cos_2d:  [T, half_dim] contiguous BF16 tensor (half_dim = (D - nope_dim) / 2)
+      sin_2d:  [T, half_dim] contiguous BF16 tensor
+      nope_dim: number of elements at start of head_dim to leave unchanged
+    """
+    B, T, H, D = x.shape
+
+    total_vecs = B * T * H
+    stream = torch.cuda.current_stream()
+
+    _C.fused_rope_forward_partial(
+      x.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(),
+      total_vecs, T, H, D, nope_dim,
+      stream,
+    )
+
+    ctx.save_for_backward(cos_2d, sin_2d)
+    ctx.T = T
+    ctx.H = H
+    ctx.D = D
+    ctx.nope_dim = nope_dim
+    return x
+
+  @staticmethod
+  def backward(ctx, grad_output: torch.Tensor):
+    cos_2d, sin_2d = ctx.saved_tensors
+    T, H, D = ctx.T, ctx.H, ctx.D
+    nope_dim = ctx.nope_dim
+
+    # grad_output is already the right shape, apply in-place backward
+    grad_output = grad_output.contiguous()
+    total_vecs = grad_output.numel() // D
+    stream = torch.cuda.current_stream()
+
+    _C.fused_rope_backward_partial(
+      grad_output.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(),
+      total_vecs, T, H, D, nope_dim,
+      stream,
+    )
+    return grad_output, None, None, None
+
+
+def rotate_pe_partial(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, nope_dim: int) -> torch.Tensor:
+  """Apply rotary position embedding IN-PLACE to the rope portion of tensor x.
+
+  Only elements [nope_dim:head_dim] are rotated. Elements [0:nope_dim] are unchanged.
+  This eliminates the need for torch.split + rotate_pe + torch.cat (3 kernels -> 1).
+
+  Args:
+    x:        [B, S, H, D] contiguous BF16 tensor (modified IN-PLACE)
+    cos, sin: [max_seq_len, half_dim] where half_dim = (D - nope_dim) / 2
+    nope_dim: number of elements at start of head_dim to leave unchanged
+
+  Returns:
+    x (modified in-place)
+  """
+  x_contig = x.contiguous()
+  seq_len = x.size(1)
+  rope_dim = x.size(-1) - nope_dim
+  half_dim = rope_dim // 2
+
+  # Slice cos/sin to [seq_len, half_dim] and ensure contiguous BF16
+  cos_2d = cos[:seq_len, :half_dim].contiguous()
+  sin_2d = sin[:seq_len, :half_dim].contiguous()
+  if cos_2d.dtype != torch.bfloat16:
+    cos_2d = cos_2d.to(torch.bfloat16)
+  if sin_2d.dtype != torch.bfloat16:
+    sin_2d = sin_2d.to(torch.bfloat16)
+
+  return _FusedRoPEPartialFunction.apply(x_contig, cos_2d, sin_2d, nope_dim)
+
 
 def rotate_pe(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-  """Apply rotary position embedding to tensor x.
+  """Apply rotary position embedding to tensor x using a fused CUDA kernel.
 
-  cos/sin can be:
-    - 2D [S, D]: standard sequential positions (broadcast over batch and heads)
-    - 3D [B, S, D]: per-batch-element positions (packed sequences with reset positions)
+  cos/sin should be 2D [S, D] (standard sequential positions).  A head dimension
+  is inserted internally for broadcasting against x: [B, S, H, D].
 
-  In both cases, a head dimension is inserted for broadcasting against x: [B, S, H, D].
+  Uses a cached output buffer to avoid allocation on every call (called once per
+  layer, ~61 layers per forward pass).  The cache is keyed on (shape, dtype, device)
+  so buffer reuse is safe across layers with identical tensor geometry.
+
+  The fused CUDA kernel replaces ~8 PyTorch kernel launches with a single launch
+  (BF16 I/O, FP32 compute).
   """
-  if cos.ndim == 2:
-    # [S, D] -> [S, 1, D] for broadcasting over [B, S, H, D]
-    cos = cos[:x.size(1), :].unsqueeze(-2)
-    sin = sin[:x.size(1), :].unsqueeze(-2)
-  else:
-    # [B, S, D] -> [B, S, 1, D] for broadcasting over [B, S, H, D]
-    cos = cos.unsqueeze(-2)
-    sin = sin.unsqueeze(-2)
-  half = x.size(-1) // 2
-  x1 = x[..., :half]
-  x2 = x[..., half:]
-  out = torch.empty_like(x)
-  out[..., :half] = x1 * cos - x2 * sin
-  out[..., half:] = x2 * cos + x1 * sin
-  return out
+  x_contig = x.contiguous()
+  seq_len = x.size(1)
+
+  # Slice cos/sin to [seq_len, half_dim] and ensure contiguous BF16
+  cos_2d = cos[:seq_len, :].contiguous()
+  sin_2d = sin[:seq_len, :].contiguous()
+  if cos_2d.dtype != torch.bfloat16:
+    cos_2d = cos_2d.to(torch.bfloat16)
+  if sin_2d.dtype != torch.bfloat16:
+    sin_2d = sin_2d.to(torch.bfloat16)
+
+  return _FusedRoPEFunction.apply(x_contig, cos_2d, sin_2d)
 
 
 class RotaryEmbedding(nn.Module):

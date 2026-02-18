@@ -13,14 +13,13 @@ Usage:
 import logging
 import os
 import sys
-import tomllib
+import tomllib  # Kept for backward compat; prefer load_config_file
 import time
 from contextlib import nullcontext
 
 import torch
-import torch.nn.functional as F
 
-from nmoe.config import Config, fingerprint
+from nmoe.config import Config, fingerprint, load_config_file
 from nmoe.model import Transformer
 from nmoe.data.loader import build_loader
 from nmoe.data.sft_loader import build_sft_loader
@@ -30,6 +29,8 @@ from nmoe.metrics import init_metrics, start_metrics, log_training_step, stop_me
 from nmoe.experiments import ExperimentTracker
 from nmoe import runtime
 from nmoe.eval.hooks import maybe_schedule_eval
+from nmoe.fused_grad_clip import fused_clip_grad_norm_, fused_grad_norm_
+from nmoe.fused_ce_loss import simple_fused_masked_ce_loss
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -126,6 +127,27 @@ def train(cfg: Config):
     plan = None  # SFT has no MixturePlan
   else:
     loader, plan = build_loader(cfg, rank, world)
+
+  # ── Epoch → steps resolution ──────────────────────────────────────────────
+  if cfg.epochs is not None:
+    if sft_mode:
+      # SFT: one epoch = one pass over all SFT examples
+      micro_batch = cfg.batch_size // world
+      dataset_len = len(loader.dataset) if hasattr(loader, 'dataset') else len(loader)
+      resolved_steps = cfg.epochs * (dataset_len // micro_batch)
+    else:
+      # Pretraining: one epoch = one pass over all tokens
+      # total_tokens estimated from dataset size * seq_len
+      micro_batch = cfg.batch_size // world
+      dataset_len = len(loader.dataset) if hasattr(loader, 'dataset') else len(loader)
+      resolved_steps = cfg.epochs * (dataset_len // micro_batch)
+
+    if rank == 0:
+      print(f"[TRAIN] Epoch mode: {cfg.epochs} epoch(s) × {dataset_len} samples "
+            f"/ {micro_batch} micro_batch = {resolved_steps} steps")
+      sys.stdout.flush()
+
+    cfg.steps = resolved_steps
 
   model = Transformer(cfg).cuda()
   model.init_weights()
@@ -281,6 +303,7 @@ def train(cfg: Config):
 
         # Gradient accumulation: inner loop over micro-batches
         accumulated_loss = 0.0
+        accumulated_loss_gpu = torch.tensor(0.0, device='cuda')
         t0 = time.perf_counter()
 
         for micro_step in range(accum_steps):
@@ -299,20 +322,37 @@ def train(cfg: Config):
 
           with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
             logits = model(inputs, cu_seqlens=cu_seqlens)
+
+          # Fail-fast on token drops (indicates expert load collapse)
+          _dropped = getattr(model, 'total_dropped_tokens', 0)
+          if _dropped > 0:
+            _drop_pct = _dropped / (inputs.numel()) * 100
+            if rank == 0:
+              print(f"[WARN] RDEP dropped {_dropped:,} tokens ({_drop_pct:.1f}%) "
+                    f"at step {step_num} — expert load collapse detected. "
+                    f"Consider enabling aux_loss_alpha or reducing route_scale.",
+                    file=sys.stderr)
+              sys.stderr.flush()
+            # Hard fail if >5% tokens dropped (training is corrupted)
+            if _drop_pct > 5.0:
+              raise RuntimeError(
+                f"RDEP dropped {_dropped:,} tokens ({_drop_pct:.1f}% > 5% threshold). "
+                f"Expert routing has collapsed. Fix: set aux_loss_alpha > 0 "
+                f"and/or reduce route_scale (currently may be too high)."
+              )
+
           with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
-            # Cast logits to FP32 before cross_entropy: BF16 softmax over vocab_size=129,280
-            # causes catastrophic precision loss, producing NaN gradients in the backward pass.
-            # The .float() is intentionally placed before .reshape() so the full tensor is in FP32
-            # and both the forward softmax and backward gradient computation use FP32 precision.
-            logits_fp32 = logits.float()
-            loss_unreduced = F.cross_entropy(logits_fp32.reshape(-1, cfg.vocab_size), targets.reshape(-1), reduction='none')
-            if loss_mask is not None:
-              # SFT: use per-token loss mask from chat template (0=prompt, 1=response)
-              mask = loss_mask.reshape(-1)
-            else:
-              # Pre-training: mask out EOS tokens
-              mask = (targets != cfg.eos_token_id).reshape(-1).float()
-            loss = (loss_unreduced * mask).sum() / mask.sum().clamp(min=1.0)
+            # Fused masked cross-entropy loss: replaces ~12 kernels with ~6-7 kernels
+            # - FP32 cast for numerical stability (BF16 softmax over 129K vocab fails)
+            # - PyTorch's optimized cross_entropy (cuDNN backend)
+            # - torch.dot for fused mask*loss+sum (1 kernel vs 2)
+            loss = simple_fused_masked_ce_loss(
+              logits=logits,
+              targets=targets,
+              mask=loss_mask,
+              vocab_size=cfg.vocab_size,
+              eos_token_id=cfg.eos_token_id,
+            )
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
@@ -337,15 +377,16 @@ def train(cfg: Config):
           if fused_eco is not None:
             fused_eco.post_backward()
 
-          accumulated_loss += loss.detach().item() * (accum_steps if accum_steps > 1 else 1)
+          accumulated_loss_gpu += loss.detach() * (accum_steps if accum_steps > 1 else 1)
 
         # End of micro-batch loop. Now do optimizer step.
         loader_wait_ms = (time.perf_counter() - t0) * 1000.0
 
         # Lightweight NaN guard: compute grad_norm once and check for NaN/Inf
         # instead of iterating all 200K+ parameters with .item() calls.
+        # Uses fused foreach op (1 kernel) instead of per-param norm computation (~N kernels)
         _grad_params = [p for p in model.parameters() if p.grad is not None]
-        grad_norm = torch.nn.utils.clip_grad_norm_(_grad_params, float('inf')) if _grad_params else torch.tensor(0.0)
+        grad_norm = fused_grad_norm_(_grad_params) if _grad_params else torch.tensor(0.0, device='cuda')
         _grad_norm_bad = (grad_norm != grad_norm) or (grad_norm == float('inf'))  # NaN or Inf
         if _grad_norm_bad:
             if rank == 0:
@@ -357,19 +398,22 @@ def train(cfg: Config):
             # Gradient clipping (important for SFT stability with quantized training)
             # When fused_eco is active, expert grads are already consumed — only clip dense params.
             # Dense gradients accumulate across micro-steps (autograd adds them).
+            # Gradient clipping using fused multi-tensor ops (2 kernels instead of ~2*N+3)
+            # See nmoe/fused_grad_clip.py for implementation details
             grad_clip = getattr(cfg, 'grad_clip', 0.0)
             if grad_clip > 0:
               if fused_eco is not None:
                 # Only clip dense parameters (expert grads already consumed in backward)
                 dense_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
                 if dense_params:
-                  torch.nn.utils.clip_grad_norm_(dense_params, grad_clip)
+                  fused_clip_grad_norm_(dense_params, grad_clip)
               else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                fused_clip_grad_norm_(model.parameters(), grad_clip)
 
             with nvtx_ctx('train/opt_step'), time_ctx('time_ms/opt_step'):
               step(model, optimizer, dense_groups, zero2_state, cfg, world)
 
+        accumulated_loss = accumulated_loss_gpu.item()  # single GPU→CPU sync per step
         tokens_this_step = int(inputs.numel()) * accum_steps
         tokens_seen += cfg.batch_size * cfg.seq_len
         last_loss = torch.tensor(accumulated_loss / accum_steps if accum_steps > 1 else accumulated_loss)
@@ -386,6 +430,13 @@ def train(cfg: Config):
           ctx=metrics_ctx,
           loader_wait_ms=loader_wait_ms,
         )
+
+        # Log expert load imbalance
+        if s % cfg.log_every == 0 and rank == 0:
+          _cv = getattr(model, 'mean_expert_load_cv', 0.0)
+          if _cv > 0.5:
+            print(f"[WARN] Expert load CV={_cv:.3f} (>0.5 indicates severe imbalance) "
+                  f"at step {s}", file=sys.stderr)
 
         # Choice-based eval (fast forward-only scoring). All ranks participate.
         eval_every = int(getattr(cfg, "eval_every", 0) or 0)
@@ -467,9 +518,8 @@ def main():
     print("Usage: python -m nmoe.train <config.toml> [--key=value ...]", file=sys.stderr)
     sys.exit(1)
 
-  # Load base config from TOML
-  with open(sys.argv[1], 'rb') as f:
-    cfg_dict = tomllib.load(f)
+  # Load base config (auto-detect TOML or YAML)
+  cfg_dict = load_config_file(sys.argv[1])
 
   # Apply environment variable overrides (NMOE_DTYPE, NMOE_STEPS, etc.)
   for key in ['dtype', 'steps', 'batch_size', 'seq_len', 'resume']:

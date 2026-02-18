@@ -82,7 +82,7 @@ MUON_TARGET := $(OPT_DIR)/muon$(PYTHON_EXT_SUFFIX)
 FLASHMLA_TARGET := flashmla_sm100$(PYTHON_EXT_SUFFIX)
 
 # RDEP sources
-RDEP_CUDA_SRCS := rdep.cu quant.cu ptx.cu adamw.cu eco_adam.cu gemm.cu $(NVSHMEM_SRCS)
+RDEP_CUDA_SRCS := rdep.cu quant.cu ptx.cu adamw.cu adamw_fused_step.cu eco_adam.cu gemm.cu rope_fused.cu router_bwd.cu aux_loss.cu $(NVSHMEM_SRCS)
 # Compile bindings.cpp with BUILD_RDEP into a dedicated object to avoid flag clashes
 RDEP_CPP_OBJS := bindings_rdep.o
 
@@ -126,7 +126,7 @@ FLASHMLA_LDFLAGS := -shared \
 	-Wl,-rpath,$(TORCH_LIB_DIR) -Wl,-rpath,$(CUDA_HOME)/lib64
 
 # Objects
-RDEP_CUDA_OBJS := rdep.o quant.o ptx.o adamw.o eco_adam.o gemm.o $(NVSHMEM_SRCS:.cu=.o)
+RDEP_CUDA_OBJS := rdep.o quant.o ptx.o adamw.o adamw_fused_step.o eco_adam.o gemm.o rope_fused.o router_bwd.o aux_loss.o $(NVSHMEM_SRCS:.cu=.o)
 # Explicit binding object for RDEP pybind module
 RDEP_CPP_OBJS := bindings_rdep.o
 DLINK_OBJ := dlink.o

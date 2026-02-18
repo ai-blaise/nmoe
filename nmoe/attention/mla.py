@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import record_function
 
-from nmoe.attention.rope import rotate_pe
+from nmoe.attention.rope import rotate_pe, rotate_pe_partial
 from nmoe.config import Config
 from nmoe.norm import RMSNorm
 
@@ -87,6 +87,46 @@ def _mla_sdpa_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax
   return out.transpose(1, 2)
 
 
+def _build_block_causal_mask(
+    cu_seqlens: torch.Tensor,
+    seqlen: int,
+    device: torch.device,
+) -> torch.Tensor:
+  """Build block-diagonal causal mask from cumulative sequence lengths.
+
+  Uses torch.searchsorted to assign document IDs without .item() calls,
+  enabling fully GPU-resident mask construction.
+
+  Args:
+    cu_seqlens: [num_docs + 1] cumulative sequence lengths (int32)
+    seqlen: Total sequence length
+    device: Target device
+
+  Returns:
+    mask: [seqlen, seqlen] bool tensor where True = can attend
+  """
+  pos = torch.arange(seqlen, device=device, dtype=cu_seqlens.dtype)
+
+  # Assign document ID to each position using searchsorted
+  # cu_seqlens[1:] contains document end boundaries
+  # searchsorted(right=True) ensures position i belongs to doc d
+  # if cu_seqlens[d] <= i < cu_seqlens[d+1]
+  doc_ids = torch.searchsorted(cu_seqlens[1:], pos, right=True)  # [seqlen]
+
+  # Build 2D masks using broadcasting:
+  # - Causal: query position >= key position
+  # - Document isolation: query and key belong to same document
+  q_idx = pos.unsqueeze(1)  # [seqlen, 1] - query positions (rows)
+  k_idx = pos.unsqueeze(0)  # [1, seqlen] - key positions (cols)
+  causal_mask = q_idx >= k_idx  # [seqlen, seqlen]
+
+  q_doc = doc_ids.unsqueeze(1)  # [seqlen, 1]
+  k_doc = doc_ids.unsqueeze(0)  # [1, seqlen]
+  doc_mask = q_doc == k_doc  # [seqlen, seqlen]
+
+  return causal_mask & doc_mask
+
+
 def _mla_sdpa_packed_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -96,10 +136,13 @@ def _mla_sdpa_packed_forward(
 ) -> torch.Tensor:
   """MLA attention using SDPA for packed sequences (document-isolated causal).
 
-  Processes each document within a packed sequence independently via
-  F.scaled_dot_product_attention(is_causal=True).  This uses PyTorch's
-  built-in flash-attention kernel with zero mask materialization overhead,
-  avoiding the O(B*H*S^2) memory cost of FlexAttention's create_block_mask.
+  Uses a single SDPA call with a block-diagonal causal mask instead of
+  per-document Python loops. This eliminates:
+  - ~100 kernel launches per call (was 5 per doc × ~20 docs)
+  - CPU↔GPU synchronization from .item() calls on cu_seqlens
+
+  The mask is built using torch.searchsorted for document ID assignment,
+  keeping all operations on GPU without host synchronization.
 
   Args:
     q: Query tensor [B, S, H, D_qk]
@@ -112,33 +155,42 @@ def _mla_sdpa_packed_forward(
   Returns:
     Output tensor [B, S, H, D_v]
   """
-  bsz, seqlen, n_heads, d_qk = q.shape
-  d_v = v.shape[-1]
-
-  output = torch.zeros(bsz, seqlen, n_heads, d_v, device=q.device, dtype=q.dtype)
+  bsz, seqlen, n_heads, _ = q.shape
+  device = q.device
 
   with _nvtx("attn/sdpa_packed_fwd"):
+    # Build block-diagonal causal masks for all batch elements
+    # Each mask is [seqlen, seqlen] with True where attention is allowed
+    masks = []
     for b in range(bsz):
-      cu = cu_seqlens_list[b]
-      num_docs = cu.shape[0] - 1
-      for d in range(num_docs):
-        start = int(cu[d].item())
-        end = int(cu[d + 1].item())
-        if end <= start:
-          continue
-        # [doclen, H, D] → [1, H, doclen, D] for SDPA
-        q_d = q[b, start:end].transpose(0, 1).unsqueeze(0)  # [1, H, doclen, D_qk]
-        k_d = k[b, start:end].transpose(0, 1).unsqueeze(0)
-        v_d = v[b, start:end].transpose(0, 1).unsqueeze(0)
-        out_d = F.scaled_dot_product_attention(
-            q_d, k_d, v_d,
-            scale=softmax_scale,
-            is_causal=True,
-        )
-        # [1, H, doclen, D_v] → [doclen, H, D_v]
-        output[b, start:end] = out_d.squeeze(0).transpose(0, 1)
+      mask = _build_block_causal_mask(cu_seqlens_list[b], seqlen, device)
+      masks.append(mask)
 
-  return output
+    # Stack masks: [B, S, S] -> [B, 1, S, S] (broadcasts over heads)
+    mask = torch.stack(masks, dim=0).unsqueeze(1)
+
+    # Convert bool mask to additive float mask for SDPA
+    # True (attend) -> 0.0, False (block) -> -inf
+    float_mask = torch.where(
+        mask,
+        torch.tensor(0.0, device=device, dtype=q.dtype),
+        torch.tensor(float('-inf'), device=device, dtype=q.dtype),
+    )
+
+    # SDPA expects [B, H, S, D] layout
+    q_t = q.transpose(1, 2)  # [B, H, S, D_qk]
+    k_t = k.transpose(1, 2)  # [B, H, S, D_qk]
+    v_t = v.transpose(1, 2)  # [B, H, S, D_v]
+
+    # Single SDPA call with block-diagonal causal mask
+    out = F.scaled_dot_product_attention(
+        q_t, k_t, v_t,
+        attn_mask=float_mask,
+        scale=softmax_scale,
+    )
+
+    # Back to [B, S, H, D_v]
+    return out.transpose(1, 2)
 
 
 class _MlaFlashMlaVarlenPacked(torch.autograd.Function):
@@ -429,9 +481,9 @@ class MLA(nn.Module):
     bsz, seqlen, _ = x.size()
     q = self.wq_b(self.q_norm(self.wq_a(x)))
     q = q.view(bsz, seqlen, self.n_heads, self.qk_head_dim)
-    q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-    q_pe = rotate_pe(q_pe, cos, sin)
-    q = torch.cat([q_nope, q_pe], dim=-1)
+    # In-place partial RoPE: rotates q[..., nope_dim:] leaving q[..., :nope_dim] unchanged.
+    # Eliminates split+cat overhead (3 kernels -> 1 kernel).
+    rotate_pe_partial(q, cos, sin, nope_dim=self.qk_nope_head_dim)
     kv = self.wkv_a(x)
     kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_pe = rotate_pe(k_pe.unsqueeze(2), cos, sin)

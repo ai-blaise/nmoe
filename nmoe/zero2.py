@@ -13,7 +13,23 @@ import math
 import torch
 import torch.distributed as dist
 
+from nmoe.nccl_watchdog import get_watchdog
+
 _log = logging.getLogger(__name__)
+
+# Check for multi-tensor copy op (available in PyTorch 2.0+).
+# This allows batching ~100 copy kernels into a single launch.
+_HAS_FOREACH_COPY = hasattr(torch, '_foreach_copy_')
+
+# ---------------------------------------------------------------------------
+# Fused CUDA kernel for dense AdamW (direct import, no fallback)
+# ---------------------------------------------------------------------------
+from nmoe.csrc import rdep as _C
+
+_fused_adamw_fns = {
+    torch.float32: _C.fused_adamw_step_fp32,
+    torch.bfloat16: _C.fused_adamw_step_bf16,
+}
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -106,6 +122,9 @@ def _get_or_init_flat_group(
   shard_chunk, total_chunk_elems = _rs_chunk_elems(dtype=dtype, world=world, shard_size=shard_size)
   rs_in = torch.empty(total_chunk_elems, dtype=dtype, device=dev)
   rs_out = torch.empty(shard_chunk, dtype=dtype, device=dev)
+  # Double-buffer pair for pipelined reduce-scatter (overlap NCCL with grad packing).
+  rs_in_b = torch.empty(total_chunk_elems, dtype=dtype, device=dev)
+  rs_out_b = torch.empty(shard_chunk, dtype=dtype, device=dev)
   if world == 1:
     param_shard = flat_param[:shard_size]  # view (no comm)
   else:
@@ -124,6 +143,8 @@ def _get_or_init_flat_group(
     'param_shard': param_shard,
     'rs_in': rs_in,
     'rs_out': rs_out,
+    'rs_in_b': rs_in_b,
+    'rs_out_b': rs_out_b,
     'shard_chunk': shard_chunk,
   }
   cache[key] = flat
@@ -196,6 +217,8 @@ def step_dense_adamw(
 
   rank = dist.get_rank(pg) if (dist.is_available() and dist.is_initialized()) else 0
 
+  nccl_wd = get_watchdog()
+
   for group_idx, group in enumerate(param_groups):
     params = list(group['params'])
     if not params:
@@ -210,15 +233,30 @@ def step_dense_adamw(
 
     for dtype, group_params in by_dtype.items():
       flat = _get_or_init_flat_group(group, params=group_params, rank=rank, world=world, dtype=dtype)
+
+      # Wait for previous step's async all-gather to complete before
+      # reading gradients (which depend on the current parameters).
+      prev_ag = flat.get('_pending_ag')
+      if prev_ag is not None:
+        prev_ag.wait()
+        nccl_wd.clear()
+        flat['_pending_ag'] = None
+
       flat_param = flat['flat_param']
       param_shard = flat['param_shard']
-      rs_in = flat['rs_in']
-      rs_out = flat['rs_out']
       offsets: list[tuple[int, int]] = flat['offsets']
       total = int(flat['total'])
       padded_total = int(flat['padded_total'])
       shard_size = int(flat['shard_size'])
       shard_chunk = int(flat['shard_chunk'])
+
+      # Double-buffer pairs for pipelined reduce-scatter.
+      rs_in_a = flat['rs_in']
+      rs_out_a = flat['rs_out']
+      rs_in_b = flat['rs_in_b']
+      rs_out_b = flat['rs_out_b']
+      rs_in2d_a = rs_in_a.view(world, shard_chunk)
+      rs_in2d_b = rs_in_b.view(world, shard_chunk)
 
       # Get or initialize shard state
       state_key = f"shard_{rank}_{group_idx}_{dtype}"
@@ -245,6 +283,25 @@ def step_dense_adamw(
       step_size = lr / bias_correction1
       inv_bc2_sqrt = 1.0 / math.sqrt(bias_correction2)
 
+      # Local helper: apply AdamW on a single completed RS chunk.
+      # Defined once to avoid duplicating the update logic for the
+      # in-loop drain and the trailing drain after the loop.
+      # Uses the fused CUDA kernel (single launch replacing 9 PyTorch kernels).
+      _fused_fn = _fused_adamw_fns[dtype]
+
+      def _adamw_chunk(rs_out_buf: torch.Tensor, clen: int, soff: int) -> None:
+        _fused_fn(
+            param_shard.data_ptr() + soff * param_shard.element_size(),
+            rs_out_buf.data_ptr(),
+            exp_avg.data_ptr() + soff * exp_avg.element_size(),
+            exp_avg_sq.data_ptr() + soff * exp_avg_sq.element_size(),
+            clen,
+            beta1, beta2,
+            lr, wd, eps,
+            step_size, inv_bc2_sqrt,
+            torch.cuda.current_stream(),
+        )
+
       # Precompute flat views of grads (avoid repeated reshape work).
       grad_views: list[torch.Tensor | None] = []
       for p in group_params:
@@ -253,24 +310,47 @@ def step_dense_adamw(
         else:
           grad_views.append(p.grad.detach().reshape(-1))
 
-      # Chunked reduce-scatter:
+      # Double-buffered reduce-scatter with pipelined packing.
       # Treat conceptual flat_grad as [world, shard_size] laid out row-major.
-      # For each shard offset, build rs_in[r, :] for each rank r, then RS(AVG) into rs_out.
-      rs_in2d = rs_in.view(world, shard_chunk)
+      # While NCCL runs the RS on the current buffer, we pack grads into the
+      # alternate buffer for the next chunk.
       cursors = [0 for _ in range(world)]
+      pending_work = None          # NCCL async handle for in-flight RS
+      pending_rs_out = None        # Which rs_out holds the result
+      pending_chunk_len = 0
+      pending_shard_off = 0
+      chunks = list(range(0, shard_size, shard_chunk))
 
       with time_ctx('time_ms/zero2_reduce_scatter'):
-        for shard_off in range(0, shard_size, shard_chunk):
+        for ci, shard_off in enumerate(chunks):
           chunk_len = min(shard_chunk, shard_size - shard_off)
-          # Zero rs_in for this chunk (required to avoid leaking previous chunk values).
-          rs_in2d.zero_()
 
+          # Pick current buffers (alternating A/B).
+          if ci % 2 == 0:
+            cur_rs_in2d = rs_in2d_a
+            cur_rs_in = rs_in_a
+            cur_rs_out = rs_out_a
+          else:
+            cur_rs_in2d = rs_in2d_b
+            cur_rs_in = rs_in_b
+            cur_rs_out = rs_out_b
+
+          # Pack gradients into the current buffer.
+          # This can execute on the CPU/GPU compute stream while the NCCL
+          # stream is still running the previous chunk's reduce-scatter.
+          #
+          # Optimization: collect all (dst, src) slice pairs and execute with
+          # a single torch._foreach_copy_ call instead of ~100 individual
+          # .copy_() calls. This reduces kernel launch overhead significantly.
+          cur_rs_in2d.zero_()
+          dst_slices: list[torch.Tensor] = []
+          src_slices: list[torch.Tensor] = []
           for src_rank in range(world):
             g0 = src_rank * shard_size + shard_off
             if g0 >= total:
               continue
             g1 = min(g0 + chunk_len, total)
-            row = rs_in2d[src_rank]
+            row = cur_rs_in2d[src_rank]
 
             i = cursors[src_rank]
             while i < len(offsets) and offsets[i][1] <= g0:
@@ -284,31 +364,55 @@ def step_dense_adamw(
               if o1 > o0:
                 gv = grad_views[i]
                 if gv is not None:
-                  row[(o0 - g0):(o1 - g0)].copy_(gv[(o0 - a):(o1 - a)])
+                  dst_slices.append(row[(o0 - g0):(o1 - g0)])
+                  src_slices.append(gv[(o0 - a):(o1 - a)])
               i += 1
 
+          # Execute all gradient copies in a single batched kernel.
+          if dst_slices:
+            if _HAS_FOREACH_COPY:
+              torch._foreach_copy_(dst_slices, src_slices)
+            else:
+              # Fallback for older PyTorch versions (sequential copies).
+              for dst, src in zip(dst_slices, src_slices):
+                dst.copy_(src)
+
+          # Wait for the PREVIOUS chunk's RS to finish, then apply AdamW.
+          if pending_work is not None:
+            pending_work.wait()
+            nccl_wd.clear()
+          if pending_rs_out is not None:
+            _adamw_chunk(pending_rs_out, pending_chunk_len, pending_shard_off)
+
+          # Launch async reduce-scatter for the current chunk.
           if world == 1:
-            rs_out[:chunk_len].copy_(rs_in2d[0, :chunk_len])
+            cur_rs_out[:chunk_len].copy_(cur_rs_in2d[0, :chunk_len])
+            pending_work = None
           else:
-            dist.reduce_scatter_tensor(rs_out, rs_in, op=dist.ReduceOp.AVG, group=pg)
+            pending_work = dist.reduce_scatter_tensor(
+              cur_rs_out, cur_rs_in, op=dist.ReduceOp.AVG, group=pg, async_op=True
+            )
+            nccl_wd.watch(pending_work, f"reduce_scatter chunk {ci}")
+          pending_rs_out = cur_rs_out
+          pending_chunk_len = chunk_len
+          pending_shard_off = shard_off
 
-          g = rs_out[:chunk_len]
-          p = param_shard[shard_off:(shard_off + chunk_len)]
-          m = exp_avg[shard_off:(shard_off + chunk_len)]
-          v = exp_avg_sq[shard_off:(shard_off + chunk_len)]
+      # Drain the last pending chunk (outside the timer context).
+      if pending_work is not None:
+        pending_work.wait()
+        nccl_wd.clear()
+      if pending_rs_out is not None:
+        _adamw_chunk(pending_rs_out, pending_chunk_len, pending_shard_off)
 
-          m.mul_(beta1).add_(g, alpha=1 - beta1)
-          v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-
-          denom = v.sqrt().mul_(inv_bc2_sqrt).add_(eps)
-          if wd > 0.0:
-            p.mul_(1.0 - lr * wd)
-          p.addcdiv_(m, denom, value=-step_size)
-
-      # Sync updated params to all ranks (no-op when world==1).
+      # Async all-gather updated params to all ranks (no-op when world==1).
+      # The work handle is stored in the flat dict so the next step waits
+      # before reading gradients, allowing the current AG to overlap with
+      # the next forward pass.
       if world > 1:
         with time_ctx('time_ms/zero2_all_gather'):
-          dist.all_gather_into_tensor(flat_param, param_shard, group=pg)
+          ag_work = dist.all_gather_into_tensor(flat_param, param_shard, group=pg, async_op=True)
+          nccl_wd.watch(ag_work, f"all_gather params dtype={dtype}")
+        flat['_pending_ag'] = ag_work
       elif total < padded_total:
         # Keep padding clean for determinism.
         flat_param[total:padded_total].zero_()

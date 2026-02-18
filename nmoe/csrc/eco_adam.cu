@@ -112,7 +112,15 @@ __global__ void k_factored_v_row(
             const int64_t vr_idx = static_cast<int64_t>(e) * in_dim + i;
             float vr = beta2 * v_row[vr_idx] + one_minus_b2 * grad_sq_row_mean;
             v_row[vr_idx] = vr;
-            atomicAdd(&v_rms[e], vr);
+            // Warp-level reduction to minimize atomic contention
+            float warp_sum = vr;
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+            }
+            // Only lane 0 of each warp does the atomic
+            if ((threadIdx.x & 31) == 0) {
+                atomicAdd(&v_rms[e], warp_sum);
+            }
         }
     }
 }
@@ -328,7 +336,7 @@ __global__ void k_eco_adam_nvfp4_update(
     // ============================================================
     // Phase 1: Load all inputs, do AdamW update, store w to shared
     // ============================================================
-    __shared__ float sh_w[TILE_OUT][TILE_IN];      // Updated weights for requant
+    __shared__ float sh_w[TILE_OUT][TILE_IN + 1];   // +1 padding to avoid bank conflicts
     __shared__ uint8_t sh_nibble[TILE_OUT][TILE_IN]; // E2M1 nibbles for packed write
     float m_reg[ELEMS_PER_THREAD];              // Updated momentum (for ECO + requant)
     float v_reg[ELEMS_PER_THREAD];              // Updated variance (for requant)
@@ -985,6 +993,287 @@ inline cudaError_t launch_eco_mv_accumulate_fv(
 }
 
 
+// ============================================================================
+// NVFP4 per-group scale recomputation kernel
+// ============================================================================
+// After the ECO Adam kernel requantizes NVFP4 weights with per-tile E8M0
+// block scales, the per-group E4M3 scale factors (group_size=16) may be
+// stale because the kernel writes the same block scale (computed over
+// TILE_IN=32 elements) to all groups within a tile.
+//
+// This kernel recomputes correct per-group E4M3 scales by:
+//   1. Unpacking E2M1 nibbles from W_packed
+//   2. Dequantizing to FP32 using the current (stale) E4M3 group scale
+//   3. Computing group amax over group_size elements
+//   4. Encoding the new scale as E4M3
+//   5. Re-quantizing E2M1 nibbles against the new scale (round-to-nearest)
+//   6. Repacking nibbles and writing both W_packed and W_scale in-place
+//
+// Replaces ~33 separate PyTorch kernel launches in eco.py
+// _recompute_nvfp4_group_scales with a single fused kernel.
+//
+// Thread mapping (matches k_eco_adam_nvfp4_update):
+//   blockDim = (32, 8, 1) = 256 threads
+//   gridDim  = (ceil(out_dim, 32), ceil(in_dim, 32), E)
+//   Each thread processes 4 elements across in_dim (TILE_IN/THREADS_Y = 32/8).
+//
+// For group_size=16 (half a warp), the 16 elements within a group are handled
+// by threads across both threadIdx.x and threadIdx.y dimensions. Within each
+// tile, groups are processed independently — shared memory gathers nibbles
+// for race-free packed byte write-back.
+// ============================================================================
+
+template <int kGroupSize = 16>
+__global__ void k_nvfp4_recompute_group_scales(
+    uint8_t* __restrict__ W_packed,     // [E, out_dim, in_dim/2]
+    uint8_t* __restrict__ W_scale,      // [E, out_dim, in_dim/group_size]
+    const float* __restrict__ W_gs,     // [E]
+    int E, int out_dim, int in_dim,
+    int group_size)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // E2M1 magnitude LUT (indexed by 3-bit unsigned code, sign ignored)
+    // Code: 0=0.0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
+    constexpr float kE2M1Mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+    // Grid: blockIdx.x = out_tile, blockIdx.y = in_tile, blockIdx.z = expert
+    const int e = static_cast<int>(blockIdx.z);
+    const int out0 = static_cast<int>(blockIdx.x) * TILE_OUT;
+    const int in0 = static_cast<int>(blockIdx.y) * TILE_IN;
+
+    const int out_local = static_cast<int>(threadIdx.x);  // [0, 31]
+    const int in_iter = static_cast<int>(threadIdx.y);     // [0, 7]
+    const int out_row = out0 + out_local;
+
+    // Bounds check: skip threads beyond tensor dimensions
+    const bool out_valid = (out_row < out_dim);
+
+    // Strides for HF layout indexing
+    const int64_t hf_packed_stride_e = static_cast<int64_t>(out_dim) * (in_dim / 2);
+    const int64_t hf_scale_stride_e = static_cast<int64_t>(out_dim) * (in_dim / group_size);
+
+    // Cache global scale for this expert
+    __shared__ float sh_gs;
+    if (out_local == 0 && in_iter == 0) {
+        sh_gs = W_gs[e];
+    }
+    __syncthreads();
+    const float gs = sh_gs;
+
+    // Shared memory for nibble collection (race-free packed byte write-back)
+    __shared__ uint8_t sh_nibble[TILE_OUT][TILE_IN];
+    // Shared memory for dequantized real values (needed for group amax + requant)
+    __shared__ float sh_real[TILE_OUT][TILE_IN + 1];  // +1 to avoid bank conflicts
+    // Shared memory for cross-warp amax reduction (one slot per row per warp)
+    __shared__ float sh_amax[TILE_OUT][THREADS_Y];
+    // Shared memory for broadcasting new scale to all threads
+    __shared__ float sh_new_scale_f32[TILE_OUT];
+
+    // ================================================================
+    // Phase 1: Unpack, dequantize, store to shared memory
+    // ================================================================
+    // Initialize nibble buffer to zero (for out-of-bounds elements that may
+    // still be read during packed byte write-back in Phase 3).
+    #pragma unroll
+    for (int t = 0; t < ELEMS_PER_THREAD; ++t) {
+        const int in_local = t * THREADS_Y + in_iter;
+        sh_nibble[out_local][in_local] = 0;
+    }
+
+    #pragma unroll
+    for (int t = 0; t < ELEMS_PER_THREAD; ++t) {
+        const int in_local = t * THREADS_Y + in_iter;
+        const int in_col = in0 + in_local;
+        const bool in_valid = (in_col < in_dim);
+
+        float real_val = 0.0f;
+        if (out_valid && in_valid) {
+            // Load packed byte and extract nibble
+            const int64_t packed_idx = static_cast<int64_t>(e) * hf_packed_stride_e
+                                     + static_cast<int64_t>(out_row) * (in_dim / 2)
+                                     + (in_col / 2);
+            uint8_t packed_byte = W_packed[packed_idx];
+            uint8_t nibble = (in_col & 1) ? (packed_byte >> 4) : (packed_byte & 0x0F);
+
+            // Decode E2M1 magnitude (absolute value only for amax)
+            float magnitude = kE2M1Mag[nibble & 0x7];
+
+            // Load current E4M3 group scale
+            const int64_t wscale_idx = static_cast<int64_t>(e) * hf_scale_stride_e
+                                     + static_cast<int64_t>(out_row) * (in_dim / group_size)
+                                     + (in_col / group_size);
+            float old_scale = ptx::e4m3_byte_to_f32(W_scale[wscale_idx]);
+
+            // Dequantize to true FP32 value (signed)
+            float sign = (nibble & 0x8) ? -1.0f : 1.0f;
+            real_val = sign * magnitude * old_scale * gs;
+        }
+        sh_real[out_local][in_local] = real_val;
+    }
+
+    __syncthreads();
+
+    // ================================================================
+    // Phase 2: Compute per-group amax, new E4M3 scale, re-quantize
+    // ================================================================
+    // groups_per_tile = TILE_IN / group_size.
+    // For group_size=16, TILE_IN=32: 2 groups per tile row.
+    // For group_size=32, TILE_IN=32: 1 group per tile row.
+    //
+    // Strategy: each thread iterates over its elements. For each element,
+    // determine which group it belongs to. Use shared memory to collect
+    // the group amax, then re-quantize.
+    //
+    // We process groups sequentially within each row.  threadIdx.y threads
+    // (8 threads) collaborate to reduce group_size elements.
+
+    const int groups_per_tile = TILE_IN / group_size;
+
+    // For each group in this tile row:
+    for (int g = 0; g < groups_per_tile; ++g) {
+        const int group_start = g * group_size;  // local offset within tile
+        const int group_start_global = in0 + group_start;
+
+        // Skip if this group is entirely out of bounds
+        if (group_start_global >= in_dim) break;
+
+        // Each thread computes partial amax over elements it owns within this group
+        float thread_amax = 0.0f;
+        #pragma unroll
+        for (int t = 0; t < ELEMS_PER_THREAD; ++t) {
+            const int in_local = t * THREADS_Y + in_iter;
+            // Check if this element belongs to the current group
+            if (in_local >= group_start && in_local < group_start + group_size) {
+                if (out_valid && (in0 + in_local) < in_dim) {
+                    thread_amax = fmaxf(thread_amax, fabsf(sh_real[out_local][in_local]));
+                }
+            }
+        }
+
+        // Cross-warp amax reduction.
+        // threadIdx.y threads span different warps (warp_id = threadIdx.y for
+        // blockDim.x=32), so we reduce via shared memory rather than shuffles.
+        sh_amax[out_local][in_iter] = thread_amax;
+        __syncthreads();
+
+        // threadIdx.y == 0 reduces across all THREADS_Y entries for this row
+        float group_amax = 0.0f;
+        if (in_iter == 0 && out_valid) {
+            #pragma unroll
+            for (int y = 0; y < THREADS_Y; ++y) {
+                group_amax = fmaxf(group_amax, sh_amax[out_local][y]);
+            }
+
+            // Compute new scale: amax / FP4_MAX
+            float new_scale = group_amax / NVFP4_MAX;
+            // Clamp to avoid zero scale (E4M3 can't represent 0 as a scale)
+            new_scale = fmaxf(new_scale, 1e-12f);
+            // Encode as E4M3
+            uint8_t new_e4m3 = ptx::f32_to_e4m3_byte(new_scale);
+            // Decode back to get the actual represented value
+            float new_scale_decoded = ptx::e4m3_byte_to_f32(new_e4m3);
+
+            sh_new_scale_f32[out_local] = new_scale_decoded;
+
+            // Write new E4M3 scale to W_scale
+            if (group_start_global < in_dim) {
+                const int64_t wscale_idx = static_cast<int64_t>(e) * hf_scale_stride_e
+                                         + static_cast<int64_t>(out_row) * (in_dim / group_size)
+                                         + (group_start_global / group_size);
+                W_scale[wscale_idx] = new_e4m3;
+            }
+        }
+
+        __syncthreads();
+
+        // Re-quantize: each thread re-quantizes its elements in this group
+        #pragma unroll
+        for (int t = 0; t < ELEMS_PER_THREAD; ++t) {
+            const int in_local = t * THREADS_Y + in_iter;
+            if (in_local >= group_start && in_local < group_start + group_size) {
+                const int in_col = in0 + in_local;
+                if (out_valid && in_col < in_dim) {
+                    float real_val = sh_real[out_local][in_local];
+                    float decoded_scale = sh_new_scale_f32[out_local];
+
+                    // Compute the denominator for requantization
+                    float denom = decoded_scale * gs;
+                    float inv_denom = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+
+                    // Scale the value and round to nearest E2M1
+                    float ax = fabsf(real_val) * inv_denom;
+                    uint8_t sign_bit = (real_val < 0.0f) ? 0x8u : 0x0u;
+                    uint8_t nibble = ptx::e2m1_round_nearest(ax, sign_bit);
+
+                    sh_nibble[out_local][in_local] = nibble;
+                }
+            }
+        }
+
+        __syncthreads();
+    }  // end for each group
+
+    // ================================================================
+    // Phase 3: Race-free packed byte write-back
+    // ================================================================
+    // All nibbles are in sh_nibble[][]. Threads with even in_local
+    // pack both nibbles and write the full byte.
+
+    #pragma unroll
+    for (int t = 0; t < ELEMS_PER_THREAD; ++t) {
+        const int in_local = t * THREADS_Y + in_iter;
+        const int in_col = in0 + in_local;
+
+        if ((in_col & 1) == 0 && out_valid && in_col < in_dim) {
+            uint8_t lo_nibble = sh_nibble[out_local][in_local];
+            uint8_t hi_nibble = sh_nibble[out_local][in_local + 1];
+            uint8_t packed_byte = (hi_nibble << 4) | (lo_nibble & 0x0F);
+
+            const int64_t packed_idx = static_cast<int64_t>(e) * hf_packed_stride_e
+                                     + static_cast<int64_t>(out_row) * (in_dim / 2)
+                                     + (in_col / 2);
+            W_packed[packed_idx] = packed_byte;
+        }
+    }
+
+#else
+    (void)W_packed; (void)W_scale; (void)W_gs;
+    (void)E; (void)out_dim; (void)in_dim; (void)group_size;
+    __trap();
+#endif
+}
+
+
+// Launch wrapper for NVFP4 per-group scale recomputation.
+inline cudaError_t launch_nvfp4_recompute_group_scales(
+    uint8_t* W_packed, uint8_t* W_scale, const float* W_gs,
+    int E, int out_dim, int in_dim, int group_size,
+    cudaStream_t stream)
+{
+    const dim3 block(THREADS_X, THREADS_Y, 1);
+    const dim3 grid(ceil_div(out_dim, TILE_OUT), ceil_div(in_dim, TILE_IN), E);
+
+    // Dispatch on group_size template parameter for compile-time optimization
+    switch (group_size) {
+        case 16:
+            k_nvfp4_recompute_group_scales<16><<<grid, block, 0, stream>>>(
+                W_packed, W_scale, W_gs, E, out_dim, in_dim, group_size);
+            break;
+        case 32:
+            k_nvfp4_recompute_group_scales<32><<<grid, block, 0, stream>>>(
+                W_packed, W_scale, W_gs, E, out_dim, in_dim, group_size);
+            break;
+        default:
+            // Fallback: use runtime group_size with default template
+            k_nvfp4_recompute_group_scales<16><<<grid, block, 0, stream>>>(
+                W_packed, W_scale, W_gs, E, out_dim, in_dim, group_size);
+            break;
+    }
+
+    return cudaGetLastError();
+}
+
+
 }  // namespace eco_adam
 }  // namespace nmoe
 
@@ -1092,4 +1381,18 @@ extern "C" cudaError_t eco_mv_accumulate_fv(
         reinterpret_cast<const float*>(grad),
         E, in_dim, out_dim,
         beta1_frac, beta2_frac, stream);
+}
+
+// NVFP4 per-group scale recomputation entry point
+extern "C" cudaError_t nvfp4_recompute_group_scales(
+    void* W_packed, void* W_scale, const void* W_gs,
+    int E, int out_dim, int in_dim, int group_size,
+    cudaStream_t stream)
+{
+    return nmoe::eco_adam::launch_nvfp4_recompute_group_scales(
+        reinterpret_cast<uint8_t*>(W_packed),
+        reinterpret_cast<uint8_t*>(W_scale),
+        reinterpret_cast<const float*>(W_gs),
+        E, out_dim, in_dim, group_size,
+        stream);
 }

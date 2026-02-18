@@ -195,6 +195,22 @@ extern "C" {
       float weight_decay, float eps,
       float step_size, float inv_bias_correction2_sqrt,
       cudaStream_t stream);
+  cudaError_t fused_adamw_step_fp32(
+      void* param, const void* grad,
+      void* exp_avg, void* exp_avg_sq,
+      int N,
+      float beta1, float beta2,
+      float lr, float weight_decay, float eps,
+      float step_size, float inv_bc2_sqrt,
+      cudaStream_t stream);
+  cudaError_t fused_adamw_step_bf16(
+      void* param, const void* grad,
+      void* exp_avg, void* exp_avg_sq,
+      int N,
+      float beta1, float beta2,
+      float lr, float weight_decay, float eps,
+      float step_size, float inv_bc2_sqrt,
+      cudaStream_t stream);
   cudaError_t eco_adam_nvfp4_update(
       void* W_packed, void* W_scale, void* W_gs,
       void* m_data, void* m_scale, void* v_data, void* v_scale,
@@ -247,6 +263,31 @@ extern "C" {
 	      int32_t N, int32_t K,
 	      int32_t* sizes_mnkl, int32_t* strides_abc, int64_t* ptrs_abc, int64_t* ptrs_sfasfb,
 	      cudaStream_t stream);
+
+  // Fused RoPE (rope_fused.cu)
+  cudaError_t fused_rope_forward(
+      const void* x, const void* cos_buf, const void* sin_buf, void* out,
+      int total_vecs, int seq_len, int n_heads, int head_dim,
+      cudaStream_t stream);
+  cudaError_t fused_rope_backward(
+      const void* grad_out, const void* cos_buf, const void* sin_buf, void* grad_x,
+      int total_vecs, int seq_len, int n_heads, int head_dim,
+      cudaStream_t stream);
+  // Partial RoPE (in-place, rope portion only - eliminates split/cat)
+  cudaError_t fused_rope_forward_partial(
+      void* x, const void* cos_buf, const void* sin_buf,
+      int total_vecs, int seq_len, int n_heads, int head_dim, int nope_dim,
+      cudaStream_t stream);
+  cudaError_t fused_rope_backward_partial(
+      void* grad_x, const void* cos_buf, const void* sin_buf,
+      int total_vecs, int seq_len, int n_heads, int head_dim, int nope_dim,
+      cudaStream_t stream);
+
+  // NVFP4 scale recomputation (eco_adam.cu)
+  cudaError_t nvfp4_recompute_group_scales(
+      void* W_packed, void* W_scale, const void* W_gs,
+      int E, int out_dim, int in_dim, int group_size,
+      cudaStream_t stream);
 }
 #endif
 
@@ -659,6 +700,63 @@ PYBIND11_MODULE(rdep, m) {
       py::arg("inv_bias_correction2_sqrt"),
       py::arg("stream") = py::none(),
       "Fused expert AdamW update + packed weight cache emission (FP8/NVFP4)");
+
+  // ========== Fused Dense AdamW (ZeRO-2 shard update, single kernel) ==========
+  m.def(
+      "fused_adamw_step_fp32",
+      [](uintptr_t param_ptr, uintptr_t grad_ptr,
+         uintptr_t exp_avg_ptr, uintptr_t exp_avg_sq_ptr,
+         int N,
+         float beta1, float beta2,
+         float lr, float weight_decay, float eps,
+         float step_size, float inv_bc2_sqrt,
+         py::object stream) {
+        auto err = fused_adamw_step_fp32(
+            reinterpret_cast<void*>(param_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            reinterpret_cast<void*>(exp_avg_ptr),
+            reinterpret_cast<void*>(exp_avg_sq_ptr),
+            N, beta1, beta2, lr, weight_decay, eps,
+            step_size, inv_bc2_sqrt,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("fused_adamw_step_fp32 failed: " + cuda_err(err));
+      },
+      py::arg("param"), py::arg("grad"),
+      py::arg("exp_avg"), py::arg("exp_avg_sq"),
+      py::arg("N"),
+      py::arg("beta1"), py::arg("beta2"),
+      py::arg("lr"), py::arg("weight_decay"), py::arg("eps"),
+      py::arg("step_size"), py::arg("inv_bc2_sqrt"),
+      py::arg("stream") = py::none(),
+      "Fused dense AdamW step (FP32): single vectorized kernel replacing 9 PyTorch launches");
+
+  m.def(
+      "fused_adamw_step_bf16",
+      [](uintptr_t param_ptr, uintptr_t grad_ptr,
+         uintptr_t exp_avg_ptr, uintptr_t exp_avg_sq_ptr,
+         int N,
+         float beta1, float beta2,
+         float lr, float weight_decay, float eps,
+         float step_size, float inv_bc2_sqrt,
+         py::object stream) {
+        auto err = fused_adamw_step_bf16(
+            reinterpret_cast<void*>(param_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            reinterpret_cast<void*>(exp_avg_ptr),
+            reinterpret_cast<void*>(exp_avg_sq_ptr),
+            N, beta1, beta2, lr, weight_decay, eps,
+            step_size, inv_bc2_sqrt,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("fused_adamw_step_bf16 failed: " + cuda_err(err));
+      },
+      py::arg("param"), py::arg("grad"),
+      py::arg("exp_avg"), py::arg("exp_avg_sq"),
+      py::arg("N"),
+      py::arg("beta1"), py::arg("beta2"),
+      py::arg("lr"), py::arg("weight_decay"), py::arg("eps"),
+      py::arg("step_size"), py::arg("inv_bc2_sqrt"),
+      py::arg("stream") = py::none(),
+      "Fused dense AdamW step (BF16): single vectorized kernel replacing 9 PyTorch launches");
 
   // ========== ECO Adam NVFP4 Update (fused optimizer for NVFP4 primary weights) ==========
   m.def(
@@ -1161,6 +1259,100 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("ptrs_abc"), py::arg("ptrs_sfasfb"),
      py::arg("stream") = py::none(),
      "Build grouped GEMM metadata on GPU for strided grouped interface");
+
+  // ========== Fused RoPE (rope_fused.cu) ==========
+  m.def("fused_rope_forward", [](uintptr_t x_ptr, uintptr_t cos_ptr, uintptr_t sin_ptr,
+                                 uintptr_t out_ptr,
+                                 int total_vecs, int seq_len, int n_heads, int head_dim,
+                                 py::object stream) {
+    auto err = fused_rope_forward(
+        reinterpret_cast<const void*>(x_ptr),
+        reinterpret_cast<const void*>(cos_ptr),
+        reinterpret_cast<const void*>(sin_ptr),
+        reinterpret_cast<void*>(out_ptr),
+        total_vecs, seq_len, n_heads, head_dim,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("fused_rope_forward failed: " + cuda_err(err));
+  }, py::arg("x"), py::arg("cos_buf"), py::arg("sin_buf"), py::arg("out"),
+     py::arg("total_vecs"), py::arg("seq_len"), py::arg("n_heads"), py::arg("head_dim"),
+     py::arg("stream") = py::none(),
+     "Fused RoPE forward: out[..,:half]=x1*cos-x2*sin; out[..,half:]=x2*cos+x1*sin. "
+     "BF16 I/O, FP32 compute. x=[total_vecs,head_dim], cos/sin=[seq_len,half_dim].");
+
+  m.def("fused_rope_backward", [](uintptr_t grad_out_ptr, uintptr_t cos_ptr, uintptr_t sin_ptr,
+                                  uintptr_t grad_x_ptr,
+                                  int total_vecs, int seq_len, int n_heads, int head_dim,
+                                  py::object stream) {
+    auto err = fused_rope_backward(
+        reinterpret_cast<const void*>(grad_out_ptr),
+        reinterpret_cast<const void*>(cos_ptr),
+        reinterpret_cast<const void*>(sin_ptr),
+        reinterpret_cast<void*>(grad_x_ptr),
+        total_vecs, seq_len, n_heads, head_dim,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("fused_rope_backward failed: " + cuda_err(err));
+  }, py::arg("grad_out"), py::arg("cos_buf"), py::arg("sin_buf"), py::arg("grad_x"),
+     py::arg("total_vecs"), py::arg("seq_len"), py::arg("n_heads"), py::arg("head_dim"),
+     py::arg("stream") = py::none(),
+     "Fused RoPE backward: grad_x[..,:half]=go1*cos+go2*sin; grad_x[..,half:]=-go1*sin+go2*cos. "
+     "BF16 I/O, FP32 compute.");
+
+  // ========== Partial RoPE (in-place, rope portion only) ==========
+  m.def("fused_rope_forward_partial", [](uintptr_t x_ptr, uintptr_t cos_ptr, uintptr_t sin_ptr,
+                                         int total_vecs, int seq_len, int n_heads, int head_dim,
+                                         int nope_dim,
+                                         py::object stream) {
+    auto err = fused_rope_forward_partial(
+        reinterpret_cast<void*>(x_ptr),
+        reinterpret_cast<const void*>(cos_ptr),
+        reinterpret_cast<const void*>(sin_ptr),
+        total_vecs, seq_len, n_heads, head_dim, nope_dim,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("fused_rope_forward_partial failed: " + cuda_err(err));
+  }, py::arg("x"), py::arg("cos_buf"), py::arg("sin_buf"),
+     py::arg("total_vecs"), py::arg("seq_len"), py::arg("n_heads"), py::arg("head_dim"),
+     py::arg("nope_dim"),
+     py::arg("stream") = py::none(),
+     "In-place partial RoPE forward: applies rotation only to x[...,nope_dim:]. "
+     "Elements [0:nope_dim] are unchanged. Eliminates split+cat overhead in MLA. "
+     "BF16 I/O, FP32 compute. cos/sin are [seq_len, half_dim] where half_dim=(head_dim-nope_dim)/2.");
+
+  m.def("fused_rope_backward_partial", [](uintptr_t grad_x_ptr, uintptr_t cos_ptr, uintptr_t sin_ptr,
+                                          int total_vecs, int seq_len, int n_heads, int head_dim,
+                                          int nope_dim,
+                                          py::object stream) {
+    auto err = fused_rope_backward_partial(
+        reinterpret_cast<void*>(grad_x_ptr),
+        reinterpret_cast<const void*>(cos_ptr),
+        reinterpret_cast<const void*>(sin_ptr),
+        total_vecs, seq_len, n_heads, head_dim, nope_dim,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("fused_rope_backward_partial failed: " + cuda_err(err));
+  }, py::arg("grad_x"), py::arg("cos_buf"), py::arg("sin_buf"),
+     py::arg("total_vecs"), py::arg("seq_len"), py::arg("n_heads"), py::arg("head_dim"),
+     py::arg("nope_dim"),
+     py::arg("stream") = py::none(),
+     "In-place partial RoPE backward: applies inverse rotation only to grad_x[...,nope_dim:]. "
+     "Elements [0:nope_dim] gradients are unchanged. BF16 I/O, FP32 compute.");
+
+  m.def("nvfp4_recompute_group_scales", [](uintptr_t packed_ptr, uintptr_t scale_ptr,
+                                           uintptr_t gs_ptr,
+                                           int E, int out_dim, int in_dim, int group_size,
+                                           py::object stream) {
+    auto err = nvfp4_recompute_group_scales(
+        reinterpret_cast<void*>(packed_ptr),
+        reinterpret_cast<void*>(scale_ptr),
+        reinterpret_cast<const void*>(gs_ptr),
+        E, out_dim, in_dim, group_size,
+        to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("nvfp4_recompute_group_scales failed: " + cuda_err(err));
+  }, py::arg("W_packed"), py::arg("W_scale"), py::arg("W_gs"),
+     py::arg("E"), py::arg("out_dim"), py::arg("in_dim"), py::arg("group_size"),
+     py::arg("stream") = py::none(),
+     "Recompute NVFP4 E4M3 per-group scales at correct group_size granularity. "
+     "Tightens scales from 32-element tile amax to true group_size amax, "
+     "re-quantizes E2M1 nibbles in-place. W_packed=[E,out_dim,in_dim/2] uint8, "
+     "W_scale=[E,out_dim,in_dim/group_size] uint8(E4M3).");
 
 #ifdef WITH_NVSHMEM
   // ========== NVSHMEM Functions ==========

@@ -12,7 +12,81 @@ from nmoe.attention.rope import RotaryEmbedding
 from nmoe.rdep import Rdep
 from nmoe.blockscaled.grouped import quantize_weights, quantize_weights_from_nvfp4
 from nmoe.norm import RMSNorm
-from nmoe.fused_router import FusedRouterTopKDispatch
+from nmoe.fused_router import (
+    FusedRouterTopKDispatch,
+    fused_update_bias_from_expert_ids,
+    fused_update_bias_from_counts,
+)
+from nmoe.fused_aux_loss import fused_aux_loss
+
+
+# =============================================================================
+# Fused Residual Add Helpers
+# =============================================================================
+# These compiled functions fuse the residual add with the surrounding computation
+# (RMSNorm + layer), eliminating 2 separate residual add kernel launches per block.
+# With 61 layers, this saves ~122 kernel launches per forward pass.
+#
+# torch.compile enables the compiler to:
+# 1. Fuse the residual add with the preceding layer output
+# 2. Potentially fuse RMSNorm + matmul operations
+# 3. Reduce memory bandwidth by avoiding intermediate tensor allocations
+# =============================================================================
+
+
+def _make_fused_residual_attn():
+    """Create compiled fused residual + attention function."""
+    @torch.compile(fullgraph=False, dynamic=True)
+    def _fused_residual_attn(x, normed_x, attn, cos, sin):
+        # x: residual input, normed_x: pre-computed RMSNorm(x)
+        # Compiler fuses: attn output + residual add into single kernel
+        return x + attn(normed_x, cos, sin)
+    return _fused_residual_attn
+
+
+def _make_fused_residual_attn_cu():
+    """Create compiled fused residual + attention function with cu_seqlens."""
+    @torch.compile(fullgraph=False, dynamic=True)
+    def _fused_residual_attn_cu(x, normed_x, attn, cos, sin, cu_seqlens):
+        return x + attn(normed_x, cos, sin, cu_seqlens=cu_seqlens)
+    return _fused_residual_attn_cu
+
+
+def _make_fused_residual_ffn():
+    """Create compiled fused residual + FFN/MoE function."""
+    @torch.compile(fullgraph=False, dynamic=True)
+    def _fused_residual_ffn(x, normed_x, ffn):
+        # x: residual input, normed_x: pre-computed RMSNorm(x)
+        # Compiler fuses: ffn output + residual add into single kernel
+        return x + ffn(normed_x)
+    return _fused_residual_ffn
+
+
+# Lazy initialization of compiled functions to avoid import-time compilation
+_fused_residual_attn = None
+_fused_residual_attn_cu = None
+_fused_residual_ffn = None
+
+
+def _get_fused_residual_attn():
+    global _fused_residual_attn
+    if _fused_residual_attn is None:
+        _fused_residual_attn = _make_fused_residual_attn()
+    return _fused_residual_attn
+
+
+def _get_fused_residual_attn_cu():
+    global _fused_residual_attn_cu
+    if _fused_residual_attn_cu is None:
+        _fused_residual_attn_cu = _make_fused_residual_attn_cu()
+    return _fused_residual_attn_cu
+
+
+def _get_fused_residual_ffn():
+    global _fused_residual_ffn
+    if _fused_residual_ffn is None:
+        _fused_residual_ffn = _make_fused_residual_ffn()
+    return _fused_residual_ffn
 
 
 ATTN = {
@@ -138,11 +212,37 @@ class Router(nn.Module):
     return weights.to(x.dtype), indices
 
   @torch.no_grad()
-  def update_bias(self, expert_loads: torch.Tensor, gamma: float = 0.001):
-    expected = 1.0 / self.n_experts
-    s = torch.sign(expert_loads - expected)
-    self.bias -= gamma * (s - s.mean())
-    self.bias.clamp_(-16.0, 16.0)
+  def update_bias(
+    self,
+    expert_loads: torch.Tensor,
+    gamma: float = 0.001,
+    *,
+    expert_ids: Optional[torch.Tensor] = None,
+  ):
+    """Update bias for load balancing using fused Triton kernels.
+
+    This method uses fused GPU kernels to eliminate CPU synchronization
+    and reduce kernel launch overhead from 8 kernels + 1 sync to 2 kernels.
+
+    Args:
+        expert_loads: [E] expert counts (unnormalized int32 or normalized float32).
+                     Used when expert_ids is not provided.
+        gamma: Learning rate for bias update (default 0.001)
+        expert_ids: Optional [T, K] int32 tensor of selected expert IDs.
+                   When provided, computes counts internally via fused bincount.
+                   This is the most efficient path - 2 kernel launches total.
+
+    Note:
+        - NO torch.cuda.synchronize() - runs entirely on GPU
+        - When expert_ids is provided: uses fused bincount + update (2 kernels)
+        - When expert_loads is provided: uses fused update only (1 kernel)
+    """
+    if expert_ids is not None:
+      # Most efficient path: fused bincount + bias update
+      fused_update_bias_from_expert_ids(expert_ids, self.bias, gamma)
+    else:
+      # Fallback: expert counts already computed, just do fused update
+      fused_update_bias_from_counts(expert_loads, self.bias, gamma)
 
   def init_weights(self, init_std: float = 0.02):
     nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
@@ -268,7 +368,7 @@ class MoE(nn.Module):
         self._W_cache = quantize_weights(self.W1, self.W3, self.W2, profile=self._dtype)
 
   def _compute_aux_loss(self, gates: torch.Tensor, expert_ids: torch.Tensor, T: int) -> torch.Tensor:
-    """Compute auxiliary load balancing loss.
+    """Compute auxiliary load balancing loss using fused CUDA kernel.
 
     Standard load balancing loss from "GShard: Scaling Giant Models with Conditional Computation":
     aux_loss = alpha * E * sum_i(f_i * P_i)
@@ -281,6 +381,10 @@ class MoE(nn.Module):
     This loss encourages balanced expert utilization by penalizing when
     both the dispatch fraction AND probability are high for the same expert.
 
+    Implementation:
+    Uses a fused CUDA kernel that computes f and P in a single pass over the data,
+    replacing ~12 separate PyTorch operations with 1-2 kernel launches.
+
     Args:
         gates: [T, K] routing weights (normalized)
         expert_ids: [T, K] selected expert indices
@@ -289,32 +393,10 @@ class MoE(nn.Module):
     Returns:
         Scalar auxiliary loss tensor
     """
-    if self.aux_loss_alpha == 0.0:
-      return gates.new_zeros((), dtype=torch.float32)
-
-    E = self.n_experts
-    K = self.K
-
-    # Compute dispatch fraction f_i: tokens sent to each expert / total token-expert assignments
-    # Shape: [E]
-    expert_ids_flat = expert_ids.reshape(-1)  # [T*K]
-    f = torch.zeros(E, dtype=torch.float32, device=gates.device)
-    f.scatter_add_(0, expert_ids_flat.long(), torch.ones_like(expert_ids_flat, dtype=torch.float32))
-    f = f / (T * K)  # Normalize to get fraction
-
-    # Compute mean routing probability P_i for each expert
-    # For each expert, sum the gates where that expert was selected, then average
-    # Shape: [E]
-    gates_flat = gates.float().reshape(-1)  # [T*K]
-    P = torch.zeros(E, dtype=torch.float32, device=gates.device)
-    P.scatter_add_(0, expert_ids_flat.long(), gates_flat)
-    P = P / (T * K)  # Normalize: mean probability assigned to each expert
-
-    # Auxiliary loss = alpha * E * sum(f_i * P_i)
-    # The multiplication f*P penalizes experts that are both frequently selected AND have high probability
-    aux_loss = self.aux_loss_alpha * E * (f * P).sum()
-
-    return aux_loss
+    # Use fused CUDA kernel for aux loss computation.
+    # This replaces ~12 PyTorch ops (scatter_add, zeros, ones_like, div, mul, sum, etc.)
+    # with a single fused kernel, reducing kernel launch overhead by 6-12x.
+    return fused_aux_loss(expert_ids, gates, self.n_experts, self.aux_loss_alpha)
 
   @record_function("moe")
   def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -344,6 +426,16 @@ class MoE(nn.Module):
       with torch.no_grad():
         loads = torch.bincount(eid.reshape(-1), minlength=self.router.n_experts).to(torch.float32)
         self.last_loads = loads
+
+    # Track load imbalance for monitoring (coefficient of variation)
+    with torch.no_grad():
+      loads = self.last_loads
+      if loads is not None and loads.numel() > 0:
+        _load_mean = loads.float().mean()
+        _load_std = loads.float().std()
+        self._last_load_cv = (_load_std / _load_mean.clamp(min=1.0)).item() if _load_mean > 0 else 0.0
+      else:
+        self._last_load_cv = 0.0
 
     if self._use_blockscaled:
       if self._W_cache is None:
@@ -448,6 +540,11 @@ class TransformerBlock(nn.Module):
     if self._use_gradient_checkpointing:
       # Checkpoint both attention and FFN/MoE for memory efficiency
       # Use configured kwargs (defaults to use_reentrant=False for modern PyTorch)
+      # NOTE: In checkpointed regions, we use standard residual adds because:
+      # 1. In-place operations break recomputation during backward pass
+      # 2. torch.compile works best outside checkpoint boundaries
+      # The checkpoint itself provides memory savings, and the recomputation
+      # naturally fuses operations during the backward pass.
       if pass_cu:
         x = x + torch.utils.checkpoint.checkpoint(
           self.attn, self.attn_norm(x), cos, sin, cu_seqlens, **self._gradient_checkpointing_kwargs
@@ -460,13 +557,22 @@ class TransformerBlock(nn.Module):
         self.ffn, self.ffn_norm(x), **self._gradient_checkpointing_kwargs
       )
     else:
-      # No checkpointing - faster but more memory
-      # Pass cu_seqlens to attention if supported (MLA, KDA)
+      # No checkpointing - use fused residual add helpers
+      # torch.compile fuses: RMSNorm output consumed immediately + layer + residual add
+      # This eliminates separate residual add kernels (saves ~122 kernel launches across 61 layers)
+      #
+      # Pre-compute normed inputs so the compiler can fuse the entire pattern:
+      # x_normed = RMSNorm(x)  -> consumed by attn/ffn
+      # out = layer(x_normed) -> fused with residual
+      # x = x + out           -> single fused kernel
       if pass_cu:
-        x = x + self.attn(self.attn_norm(x), cos, sin, cu_seqlens=cu_seqlens)
+        normed_x = self.attn_norm(x)
+        x = _get_fused_residual_attn_cu()(x, normed_x, self.attn, cos, sin, cu_seqlens)
       else:
-        x = x + self.attn(self.attn_norm(x), cos, sin)
-      x = x + self.ffn(self.ffn_norm(x))
+        normed_x = self.attn_norm(x)
+        x = _get_fused_residual_attn()(x, normed_x, self.attn, cos, sin)
+      normed_x = self.ffn_norm(x)
+      x = _get_fused_residual_ffn()(x, normed_x, self.ffn)
     return x
 
 
@@ -564,6 +670,31 @@ class Transformer(nn.Module):
     if not self.blocks:
       return False
     return self.blocks[0]._use_gradient_checkpointing
+
+  @property
+  def total_dropped_tokens(self) -> int:
+    """Sum of dropped tokens across all MoE layers in the last forward pass."""
+    total = 0
+    for block in self.blocks:
+      ffn = getattr(block, 'ffn', None)
+      if ffn is not None and hasattr(ffn, '_last_dropped_count'):
+        total += ffn._last_dropped_count
+    return total
+
+  @property
+  def mean_expert_load_cv(self) -> float:
+    """Mean coefficient of variation of expert loads across MoE layers.
+
+    A CV > 0.5 indicates severe load imbalance where some experts handle
+    significantly more tokens than others, wasting compute and degrading
+    model quality. Values near 0 indicate perfectly balanced routing.
+    """
+    cvs = []
+    for block in self.blocks:
+      ffn = getattr(block, 'ffn', None)
+      if ffn is not None and hasattr(ffn, '_last_load_cv'):
+        cvs.append(ffn._last_load_cv)
+    return sum(cvs) / max(len(cvs), 1)
 
   @record_function("transformer")
   def forward(self, tokens: torch.Tensor,
