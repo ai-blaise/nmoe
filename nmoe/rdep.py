@@ -222,52 +222,90 @@ class Rdep:
                 operation="setup_hybrid",
             ) from e
 
+    @staticmethod
+    def _ipc_handle_to_int32(handle_np: np.ndarray) -> torch.Tensor:
+        """Convert an int8 IPC handle (numpy) to a CUDA int32 tensor for NCCL all_gather.
+
+        NCCL's Tree algorithm does not support ncclInt8, but it does support
+        ncclInt32.  We reinterpret the raw bytes as int32 (same underlying data,
+        just 4x fewer elements).  The byte count must be divisible by 4; IPC
+        handles are 64 bytes so this is always satisfied.
+
+        Args:
+            handle_np: 1-D int8 numpy array from the C extension.
+
+        Returns:
+            1-D int32 CUDA tensor (length = handle_np.nbytes / 4).
+        """
+        assert handle_np.dtype == np.int8, f"expected int8, got {handle_np.dtype}"
+        n = handle_np.nbytes
+        assert n % 4 == 0, f"IPC handle byte count ({n}) must be divisible by 4"
+        # reinterpret bytes as int32 on the numpy side, then move to CUDA
+        handle_i32_np = handle_np.view(np.int32)
+        return torch.from_numpy(handle_i32_np.copy()).cuda()
+
+    @staticmethod
+    def _int32_handles_to_numpy(handle_tensors: list) -> np.ndarray:
+        """Convert gathered int32 CUDA tensors back to a contiguous int8 numpy array.
+
+        Args:
+            handle_tensors: List of 1-D int32 CUDA tensors (one per EP rank).
+
+        Returns:
+            Contiguous 1-D int8 numpy array containing all handles concatenated.
+        """
+        # View each int32 tensor back as int8, move to CPU, convert to numpy
+        parts = []
+        for h in handle_tensors:
+            # h is int32 on CUDA; view as int8 to get original bytes
+            h_cpu = h.cpu()
+            h_bytes = h_cpu.view(torch.int8).numpy()
+            parts.append(h_bytes)
+        return np.concatenate(parts)
+
     def _setup_ipc(self):
-        """Exchange IPC handles via Gloo all_gather on CPU (one-time at init).
+        """Exchange IPC handles via NCCL all_gather on the EP group (one-time at init).
 
         IPC handles are raw byte arrays (int8).  NCCL's Tree algorithm does not
-        support AllGather with ncclInt8, so we use the Gloo CPU process group
-        instead.  This is a small, one-time bootstrap operation and has no
-        impact on training throughput.
+        support AllGather with ncclInt8, so we reinterpret the bytes as int32
+        (which Tree does support) before the collective and view them back to
+        int8 afterwards.  This keeps us on the NCCL EP group (correct rank
+        count) and avoids creating a separate Gloo process group.
 
-        Falls back to the ep_group (NCCL) only when Gloo is unavailable
-        (single-GPU or dist not initialized), which should not happen in
-        practice for multi-GPU IPC mode.
+        The handles are small (typically 64 bytes each), so the dtype
+        reinterpretation has negligible overhead.
 
         Raises:
             RdepError: If IPC handle exchange fails with CUDA error.
         """
         wd = get_watchdog()
-        # Use Gloo CPU process group to avoid NCCL Tree + int8 incompatibility
-        cpu_pg = _cpu_pg()
-        ipc_group = cpu_pg if cpu_pg is not None else self.ep_group
-        use_cpu = cpu_pg is not None
+        ipc_group = self.ep_group
         try:
+            # --- bf16 handles ---
             with cuda_error_context("get_ipc_handle_bf16"):
                 local_handle_bf16 = _C.get_ipc_handle_bf16()
-            handle_tensor_bf16 = torch.from_numpy(local_handle_bf16)
-            if not use_cpu:
-                handle_tensor_bf16 = handle_tensor_bf16.cuda()
+            handle_tensor_bf16 = self._ipc_handle_to_int32(local_handle_bf16)
 
             all_handles_bf16 = [torch.zeros_like(handle_tensor_bf16) for _ in range(self.world)]
             with wd.guard("all_gather IPC handles bf16"):
                 dist.all_gather(all_handles_bf16, handle_tensor_bf16, group=ipc_group)
 
-            all_handles_bf16_np = np.concatenate([h.cpu().numpy() if h.is_cuda else h.numpy() for h in all_handles_bf16])
+            all_handles_bf16_np = self._int32_handles_to_numpy(all_handles_bf16)
             with cuda_error_context("open_ipc_handles_bf16"):
                 _C.open_ipc_handles_bf16(all_handles_bf16_np, self.world)
                 _C.sync_buffer_ptrs_bf16()
 
+            # --- blockscaled handles (fp8 / nvfp4) ---
             if self.profile != 'bf16':
                 with cuda_error_context("get_ipc_handle_blockscaled"):
                     local_handle_block = _C.get_ipc_handle_blockscaled()
-                handle_tensor_block = torch.from_numpy(local_handle_block)
-                if not use_cpu:
-                    handle_tensor_block = handle_tensor_block.cuda()
+                handle_tensor_block = self._ipc_handle_to_int32(local_handle_block)
+
                 all_handles_block = [torch.zeros_like(handle_tensor_block) for _ in range(self.world)]
                 with wd.guard("all_gather IPC handles blockscaled"):
                     dist.all_gather(all_handles_block, handle_tensor_block, group=ipc_group)
-                all_handles_block_np = np.concatenate([h.cpu().numpy() if h.is_cuda else h.numpy() for h in all_handles_block])
+
+                all_handles_block_np = self._int32_handles_to_numpy(all_handles_block)
                 with cuda_error_context("open_ipc_handles_blockscaled"):
                     _C.open_ipc_handles_blockscaled(all_handles_block_np, self.world)
                     _C.sync_buffer_ptrs_blockscaled()
