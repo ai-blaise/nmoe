@@ -18,6 +18,7 @@ from .cuda_errors import (
     RdepError,
     cuda_error_context,
 )
+from .nccl_watchdog import get_watchdog
 
 
 def _get_local_world_size() -> int:
@@ -229,13 +230,15 @@ class Rdep:
         Raises:
             RdepError: If IPC handle exchange fails with CUDA error.
         """
+        wd = get_watchdog()
         try:
             with cuda_error_context("get_ipc_handle_bf16"):
                 local_handle_bf16 = _C.get_ipc_handle_bf16()
             handle_tensor_bf16 = torch.from_numpy(local_handle_bf16).cuda()
 
             all_handles_bf16 = [torch.zeros_like(handle_tensor_bf16) for _ in range(self.world)]
-            dist.all_gather(all_handles_bf16, handle_tensor_bf16, group=self.ep_group)
+            with wd.guard("all_gather IPC handles bf16"):
+                dist.all_gather(all_handles_bf16, handle_tensor_bf16, group=self.ep_group)
 
             all_handles_bf16_np = np.concatenate([h.cpu().numpy() for h in all_handles_bf16])
             with cuda_error_context("open_ipc_handles_bf16"):
@@ -247,7 +250,8 @@ class Rdep:
                     local_handle_block = _C.get_ipc_handle_blockscaled()
                 handle_tensor_block = torch.from_numpy(local_handle_block).cuda()
                 all_handles_block = [torch.zeros_like(handle_tensor_block) for _ in range(self.world)]
-                dist.all_gather(all_handles_block, handle_tensor_block, group=self.ep_group)
+                with wd.guard("all_gather IPC handles blockscaled"):
+                    dist.all_gather(all_handles_block, handle_tensor_block, group=self.ep_group)
                 all_handles_block_np = np.concatenate([h.cpu().numpy() for h in all_handles_block])
                 with cuda_error_context("open_ipc_handles_blockscaled"):
                     _C.open_ipc_handles_blockscaled(all_handles_block_np, self.world)

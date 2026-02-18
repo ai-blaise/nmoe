@@ -68,7 +68,7 @@ def _compute_indexer_scores(
         w_h = tl.load(w_ptrs, mask=mask_m, other=0.0).to(tl.float32)
 
         # Compute q · k^T and apply ReLU
-        dots = tl.dot(q_h, tl.trans(k_block), allow_tf32=False)  # [BLOCK_M, BLOCK_N]
+        dots = tl.dot(q_h, tl.trans(k_block), allow_tf32=True)  # [BLOCK_M, BLOCK_N]
         dots = tl.maximum(dots, 0.0)  # ReLU
 
         # Weighted sum
@@ -248,7 +248,7 @@ def _lightning_indexer_fused_small_k(
         q_h = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
         w_ptrs = W_base + offs_m * stride_wm + h * stride_wh
         w_h = tl.load(w_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-        dots = tl.dot(q_h, tl.trans(k_block), allow_tf32=False)
+        dots = tl.dot(q_h, tl.trans(k_block), allow_tf32=True)
         dots = tl.maximum(dots, 0.0)
         scores += w_h[:, None] * dots
 
@@ -283,7 +283,7 @@ def _lightning_indexer_fused_small_k(
             q_h = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
             w_ptrs = W_base + offs_m * stride_wm + h * stride_wh
             w_h = tl.load(w_ptrs, mask=mask_m, other=0.0).to(tl.float32)
-            dots = tl.dot(q_h, tl.trans(k_block), allow_tf32=False)
+            dots = tl.dot(q_h, tl.trans(k_block), allow_tf32=True)
             dots = tl.maximum(dots, 0.0)
             scores += w_h[:, None] * dots
 

@@ -46,7 +46,8 @@ n_heads = 128
 n_routed_experts = 128          # REAP has 128 (NOT 256 like base V3.2)
 n_shared_experts = 1
 n_activated_experts = 8
-route_scale = 2.5
+route_scale = 1.5
+aux_loss_alpha = 0.01
 
 # MLA (Multi-head Latent Attention)
 q_lora_rank = 1536
@@ -83,7 +84,7 @@ adam_beta2 = 0.98
 adam_eps = 1e-9
 
 # LR Schedule (WSD: Warmup-Sustain-Decay)
-warmup_steps = 200               # Linear warmup over 200 steps (~2% of total)
+warmup_steps = 1000               # Linear warmup over 200 steps (~2% of total)
 
 # =============================================================================
 # ECO Optimizer — NVFP4 Primary + FP8 States
@@ -100,9 +101,9 @@ gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a tim
 # =============================================================================
 steps = 10000
 dtype = "nvfp4"
-batch_size = 32                  # Global batch size (32 / DP=16 / accum=2 = 1 per micro-batch) - reduced for OOM fix
+batch_size = 128                  # Global batch size (32 / DP=16 / accum=2 = 1 per micro-batch) - reduced for OOM fix
 seq_len = 2048                   # Reduced from 4096 to further reduce activation memory
-gradient_accumulation_steps = 2  # B=1 micro-batch per GPU (batch=32 / dp=16 / accum=2 = 1)
+gradient_accumulation_steps = 4  # B=1 micro-batch per GPU (batch=32 / dp=16 / accum=2 = 1)
 resume = true
 grad_clip = 1.0
 log_every = 1                    # Log every step (default=10 is too coarse for short runs)

@@ -135,6 +135,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     _MoEBlockscaledFused._dispatch_count += 1
     if _MoEBlockscaledFused._dispatch_count % 100 == 1:  # Check on 1st call and every 100th
       dropped = _C.get_dropped_blockscaled(stream)
+      # Store dropped count on the MoE module for training loop monitoring
+      if moe_ref is not None:
+        moe_ref._last_dropped_count = dropped
       if dropped > 0:
         import logging
         logging.getLogger(__name__).warning(
@@ -142,6 +145,10 @@ class _MoEBlockscaledFused(torch.autograd.Function):
           f"(capacity={rdep.capacity:,}, T={T}, K={K}). "
           f"Increase rdep_capacity or reduce batch_size."
         )
+    else:
+      # On non-check iterations, reset to 0 so stale counts don't persist
+      if moe_ref is not None and not hasattr(moe_ref, '_last_dropped_count'):
+        moe_ref._last_dropped_count = 0
 
     out_f32 = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
     if M_recv <= 0:

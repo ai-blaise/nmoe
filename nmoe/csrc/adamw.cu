@@ -107,8 +107,8 @@ __global__ void k_expert_adamw_w13_update_quant(
   const int64_t base_w = static_cast<int64_t>(e) * static_cast<int64_t>(H) * static_cast<int64_t>(Dff);
 
   // Shared tile stores updated weights for the current 32x32 (k_block x out_tile).
-  __shared__ float gate_sh[TILE_K][TILE_OUT];
-  __shared__ float up_sh[TILE_K][TILE_OUT];
+  __shared__ float gate_sh[TILE_K][TILE_OUT + 1];  // +1 padding to avoid bank conflicts
+  __shared__ float up_sh[TILE_K][TILE_OUT + 1];   // +1 padding to avoid bank conflicts
   __shared__ uint8_t scale_gate[TILE_OUT];
   __shared__ uint8_t scale_up[TILE_OUT];
 
@@ -296,7 +296,7 @@ __global__ void k_expert_adamw_w2_update_quant(
 
   const int64_t base_w = static_cast<int64_t>(e) * static_cast<int64_t>(Dff) * static_cast<int64_t>(H);
 
-  __shared__ float sh[TILE_OUT][TILE_K];  // [h_local, d_local]
+  __shared__ float sh[TILE_OUT][TILE_K + 1];  // +1 padding to avoid bank conflicts
   __shared__ uint8_t scale_row[TILE_OUT];
 
   // Update + stage. Iterate over 32 Dff columns in 4 groups of 8.

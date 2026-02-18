@@ -99,7 +99,8 @@ class Config:
   # =============================================================================
   # Training
   # =============================================================================
-  steps: int = 10000
+  epochs: Optional[int] = None       # Epoch-based training (mutually exclusive with steps)
+  steps: Optional[int] = 10000
   batch_size: int = 8
   seq_len: int = 4096
   seed: int = 42
@@ -214,6 +215,23 @@ class Config:
   attn_swa: Dict[str, Any] = field(default_factory=dict)
   attn_nsa: Dict[str, Any] = field(default_factory=dict)
   attn_dsa: Dict[str, Any] = field(default_factory=dict)
+
+  def __post_init__(self):
+    """Validate mutual exclusivity of epochs and steps."""
+    if self.epochs is not None and self.steps is not None:
+      raise ValueError(
+        "Config error: `epochs` and `steps` are mutually exclusive. "
+        "Set one to None (or omit it) when using the other. "
+        f"Got epochs={self.epochs}, steps={self.steps}."
+      )
+    if self.epochs is None and self.steps is None:
+      raise ValueError(
+        "Config error: either `epochs` or `steps` must be set. Both are None."
+      )
+    if self.epochs is not None and self.epochs < 1:
+      raise ValueError(f"Config error: `epochs` must be >= 1, got {self.epochs}.")
+    if self.steps is not None and self.steps < 1:
+      raise ValueError(f"Config error: `steps` must be >= 1, got {self.steps}.")
 
 # =============================================================================
 # Config attributes used by nmoe.attention.*
@@ -401,3 +419,66 @@ def load_toml(path: Union[str, Path]) -> dict:
     obj = _expand_env_vars(obj, str(path))
     _check_unresolved(obj, str(path))
     return obj
+
+
+def load_yaml(path: Union[str, Path]) -> dict:
+    """Load YAML config via OmegaConf, extracting the training section.
+
+    If the YAML has a top-level `training:` key, returns its contents.
+    Otherwise, treats the entire file as training config fields.
+
+    Environment variable expansion uses the same ${VAR} / ${VAR:-default}
+    syntax as load_toml, with the same NMOE_/HYDRA_ allowlist.
+
+    Args:
+        path: Path to YAML file.
+
+    Returns:
+        Parsed config dict suitable for Config(**result).
+    """
+    from omegaconf import OmegaConf
+
+    path = Path(path)
+    raw = OmegaConf.load(str(path))
+    d = OmegaConf.to_container(raw, resolve=True)
+
+    # If unified format, extract training section
+    if isinstance(d, dict) and "training" in d:
+        d = d["training"]
+
+    # Apply env var expansion (reuse existing logic)
+    d = _expand_env_vars(d, str(path))
+    _check_unresolved(d, str(path))
+    return d
+
+
+def load_config_file(path: Union[str, Path]) -> dict:
+    """Auto-detect config format (.toml vs .yaml/.yml) and load.
+
+    This is the primary entry point for loading training configs in a
+    format-agnostic way.
+
+    Args:
+        path: Path to config file (.toml, .yaml, or .yml).
+
+    Returns:
+        Parsed config dict suitable for Config(**result).
+
+    Raises:
+        ValueError: If file extension is not recognized.
+        FileNotFoundError: If file does not exist.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix == ".toml":
+        return load_toml(path)
+    elif suffix in (".yaml", ".yml"):
+        return load_yaml(path)
+    else:
+        raise ValueError(
+            f"Unsupported config format: '{suffix}'. "
+            f"Expected .toml, .yaml, or .yml. File: {path}"
+        )

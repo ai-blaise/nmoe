@@ -15,6 +15,7 @@ authors = [{ name = "The NMoE Authors" }]
 dependencies = [
     "numpy>=2.4.0,<3.0",
     "safetensors>=0.7.0,<1.0",
+    "omegaconf>=2.3.0",
     # PyTorch B200/SM100 nightly - pinned versions
     "torch==2.11.0.dev20260202+cu128",
     "torchvision==0.25.0.dev20260202+cu128",

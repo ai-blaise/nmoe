@@ -250,7 +250,10 @@ class DeterministicLoader:
                     self._advance_from_source_idx(idx)
         if not seqs:
             raise StopIteration
-        batch = torch.stack(seqs).to(self.device, non_blocking=True)
+        batch = torch.stack(seqs)
+        if self.device == 'cuda' or (hasattr(self.device, 'type') and self.device.type == 'cuda'):
+            batch = batch.pin_memory()
+        batch = batch.to(self.device, non_blocking=True)
         return batch[:, :-1], batch[:, 1:]
 
     def close(self) -> None:
