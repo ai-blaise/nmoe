@@ -6,6 +6,7 @@ Seamlessly supports single GPU, single-node multi-GPU, and multi-node training.
 import logging
 import os
 import sys
+from datetime import timedelta
 from pathlib import Path
 import torch
 import torch.distributed as dist
@@ -71,7 +72,7 @@ def init(seed: int = 42, ep_size: int = 1, tp_size: int = 1) -> tuple[int, int]:
   # Distributed init (only when launched under torchrun)
   world_env = int(os.environ.get('WORLD_SIZE', '1'))
   if world_env > 1 and not dist.is_initialized():
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", timeout=timedelta(seconds=1800))
 
   # Get rank and world (or default to single GPU)
   rank = dist.get_rank() if dist.is_initialized() else 0
