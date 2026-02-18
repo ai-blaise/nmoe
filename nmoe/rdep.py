@@ -237,11 +237,12 @@ class Rdep:
         Returns:
             1-D int32 CUDA tensor (length = handle_np.nbytes / 4).
         """
-        assert handle_np.dtype == np.int8, f"expected int8, got {handle_np.dtype}"
+        assert handle_np.dtype in (np.int8, np.uint8), f"expected int8/uint8, got {handle_np.dtype}"
         n = handle_np.nbytes
         assert n % 4 == 0, f"IPC handle byte count ({n}) must be divisible by 4"
         # reinterpret bytes as int32 on the numpy side, then move to CUDA
-        handle_i32_np = handle_np.view(np.int32)
+        # Use .view(np.uint8) first to normalise, then reinterpret as int32
+        handle_i32_np = handle_np.view(np.uint8).view(np.int32)
         return torch.from_numpy(handle_i32_np.copy()).cuda()
 
     @staticmethod
