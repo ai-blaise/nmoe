@@ -35,7 +35,7 @@ Scope:
 - [x] A-004 Propagate the new `nmoe` commit to all nodes and verify file-level parity.
   - Files: `../nmoe-multinode/orchestrate.py` flow (`provision`)
   - Acceptance: all nodes show same `git rev-parse HEAD` and expected guardrail code strings.
-  - Status note: `uv run ./orchestrate.py provision --clone-only --force` completed 16/16 and strict parity verified all nodes at `2173c357b88d5a29ead9e66507f92300179ef694`.
+  - Status note: `uv run ./orchestrate.py provision --clone-only --force` completed 16/16 and strict parity verified all nodes at `662b162332bdf9117ee08507e41b11a7156daa07`.
 
 ## B) Highest ROI Hot-Path Sync Removal
 
@@ -299,7 +299,7 @@ Scope:
 - [x] K-002 Add an explicit "force full repo refresh" runbook and verify it for all 16 nodes.
   - Command target: `../nmoe-multinode/orchestrate.py provision --clone-only --force`
   - Acceptance: all nodes report provision success and SHA parity check passes.
-  - Status note: live run completed successfully (16/16 provisioned) and `repo-parity --strict --expected-sha 2173c357b88d5a29ead9e66507f92300179ef694` returned 16/16 OK.
+  - Status note: live run completed successfully (16/16 provisioned) and `repo-parity --strict --expected-sha 662b162332bdf9117ee08507e41b11a7156daa07` returned 16/16 OK.
 
 - [ ] K-003 Add an explicit "force full stack refresh" runbook (agent + torch + repo + csrc).
   - Commands: `deploy --force`, `provision --force`, then launch.
