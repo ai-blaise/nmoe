@@ -32,7 +32,7 @@ Fused Bias Update (Performance Optimization):
 
 import os
 import ctypes
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import torch
 import triton
 import triton.language as tl
@@ -42,6 +42,14 @@ from typing import Optional, Tuple
 @contextmanager
 def _nvtx(name: str):
     """Emit an NVTX range visible in Nsight Systems / nvprof."""
+    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
+        with nullcontext():
+            yield
+        return
+    if not (torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range_push')):
+        with nullcontext():
+            yield
+        return
     torch.cuda.nvtx.range_push(name)
     try:
         yield
@@ -358,6 +366,31 @@ def fused_update_bias_from_counts(
 # ---------------------------------------------------------------------------
 
 _router_bwd_lib: Optional[ctypes.CDLL] = None
+_router_bwd_sig_initialized: bool = False
+
+
+def _init_router_bwd_signatures(lib: ctypes.CDLL) -> None:
+    """Initialize ctypes signatures once to avoid per-call Python overhead."""
+    global _router_bwd_sig_initialized
+    if _router_bwd_sig_initialized:
+        return
+
+    lib.fused_router_backward.restype = ctypes.c_int
+    lib.fused_router_backward.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_float,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    lib.fused_router_bwd_transpose.restype = ctypes.c_int
+    lib.fused_router_bwd_transpose.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    _router_bwd_sig_initialized = True
 
 
 def _load_router_bwd() -> ctypes.CDLL:
@@ -386,6 +419,7 @@ def _load_router_bwd() -> ctypes.CDLL:
                 lib = ctypes.CDLL(path)
                 _ = lib.fused_router_backward
                 _ = lib.fused_router_bwd_transpose
+                _init_router_bwd_signatures(lib)
                 _router_bwd_lib = lib
                 return lib
             except (OSError, AttributeError) as exc:
@@ -441,16 +475,6 @@ def _call_fused_router_backward_impl(
     # Get raw data pointers.
     stream = torch.cuda.current_stream(hidden.device).cuda_stream
 
-    lib.fused_router_backward.restype = ctypes.c_int
-    lib.fused_router_backward.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_float,
-        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        ctypes.c_void_p,
-    ]
-
     err = lib.fused_router_backward(
         ctypes.c_void_p(hidden.data_ptr()),
         ctypes.c_void_p(router_weight.data_ptr()),
@@ -467,13 +491,6 @@ def _call_fused_router_backward_impl(
         raise RuntimeError(f"fused_router_backward returned CUDA error {err}")
 
     # Transpose + cast [E, D] FP32 -> [D, E] BF16.
-    lib.fused_router_bwd_transpose.restype = ctypes.c_int
-    lib.fused_router_bwd_transpose.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int,
-        ctypes.c_void_p,
-    ]
-
     err = lib.fused_router_bwd_transpose(
         ctypes.c_void_p(grad_rw_fp32.data_ptr()),
         ctypes.c_void_p(grad_rw_bf16.data_ptr()),
@@ -812,4 +829,3 @@ class FusedRouterTopKDispatch(torch.nn.Module):
                 # Fallback: expert counts already computed, just do fused update
                 # 1 Triton kernel launch, no CPU sync
                 fused_update_bias_from_counts(expert_loads, self.bias, gamma)
-

@@ -72,6 +72,7 @@ class Config:
   aux_loss_alpha: float = 0.0
   norm_topk_prob: bool = True
   route_scale: float = 1.0
+  use_fused_router: bool = True      # Enforce fused router kernel in production training
 
   # Precision
   dtype: Optional[str] = "bf16"  # bf16 | fp8 | nvfp4
@@ -166,8 +167,9 @@ class Config:
   eco_require_cuda: bool = True       # Hard-fail if CUDA kernels unavailable (no silent Python fallback)
   eco_factored_v: bool = False         # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
   eco_allreduce_mode: str = "async"    # async | sync DP all-reduce mode inside fused ECO
-  eco_allreduce_dtype: str = "fp32"    # fp32 | bf16 payload dtype for DP all-reduce
-  eco_allreduce_chunk_mb: int = 0      # 0 disables chunking; >0 chunks DP all-reduce payloads
+  eco_allreduce_dtype: str = "bf16"    # fp32 | bf16 payload dtype for DP all-reduce
+  eco_allreduce_chunk_mb: int = 0      # Per-chunk size in MB (0 => async default chunk size)
+  eco_allreduce_chunk_threshold_mb: int = 0  # Payload threshold MB (<= threshold => single all-reduce)
   eco_max_pending_allreduce_mb: int = 4096  # Async queue byte budget for in-flight ECO all-reduces
   eco_max_pending_allreduce_ops: int = 4    # Async queue depth cap (number of in-flight gradient payloads)
   eco_comm_stall_warn_s: float = 30.0  # Warn when an ECO DP all-reduce has no progress for this many seconds
