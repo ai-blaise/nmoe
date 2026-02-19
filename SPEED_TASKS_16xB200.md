@@ -333,9 +333,10 @@ Scope:
   - Files: `../nmoe-multinode/orchestrate.py` (`agent-logs --all`)
   - Acceptance: user can fetch `nmoe-agent` logs from any/all nodes.
 
-- [ ] L-003 Ensure training launch always emits per-rank log files on each node.
+- [x] L-003 Ensure training launch always emits per-rank log files on each node.
   - Files: `../nmoe-multinode/agent.py`, launcher command assembly.
   - Acceptance: every node has `train_rank*.log` for the active run.
+  - Status note: `agent.py launch_training()` now bootstraps `train_rank{node_rank}.log` before preflight checks and appends explicit launch success/failure markers; `orchestrate.py launch_training()` now validates expected rank log presence/freshness and fails launch if missing/stale.
 
 - [~] L-004 Add automatic crash bundle collection on failed launch.
   - Bundle: last N training log lines, last N agent journal lines, `nvidia-smi`, `dmesg`, socket stats.
@@ -412,9 +413,10 @@ Scope:
   - Acceptance: run fails fast if expected custom CUDA bindings are unavailable.
   - Status note: validator now runs from both `main()` and direct `train(cfg)` entry, with optional FA4+FlashMLA import checks; end-to-end launch validation pending.
 
-- [ ] O-002 Add runtime counters proving fused kernel path usage every step.
+- [x] O-002 Add runtime counters proving fused kernel path usage every step.
   - Output: step-level counters for fused-router, ECO fused update, RDEP dispatch kernel variant.
   - Acceptance: counters stay at 100% expected path for production config.
+  - Status note: added per-step `runtime/*` metrics in `train.py` sourced from new counters in `model.py`, `moe.py`, and `eco.py` (`fused_router_calls`, ECO fused calls, and RDEP IPC/hybrid dispatch variants).
 
 - [x] O-003 Add CI/static audits for hot-path anti-patterns.
   - Checks: `.item()` in forward hot path, host spin waits, host metadata sync in dispatch path.
@@ -441,9 +443,10 @@ Scope:
   - Files: `../nmoe-multinode/orchestrate.py`
   - Acceptance: failed sync cannot strand nodes in partial state.
 
-- [ ] P-004 Capture run provenance manifest.
+- [x] P-004 Capture run provenance manifest.
   - Manifest: nmoe SHA, nmoe-multinode SHA, torch lock hash, FlashMLA SHA, config hash.
   - Acceptance: each launch writes immutable provenance artifact.
+  - Status note: `orchestrate.py launch` now creates immutable `artifacts/provenance/<run_id>.json` + `.sha256`, includes run ID propagation (`NMOE_RUN`), repo/dependency/config fingerprints, and redacted forwarded env.
 
 - [ ] P-005 Rotate and re-issue any exposed third-party API credentials before production runs.
   - Acceptance: revoked old tokens and new secrets distributed via secure env management.

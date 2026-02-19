@@ -554,6 +554,30 @@ def train(cfg: Config):
           loader_wait_ms=loader_wait_ms,
         )
 
+        runtime_counts: dict[str, float] = {
+          "fused_router_calls": 0.0,
+          "rdep_dispatch_blockscaled_ipc_calls": 0.0,
+          "rdep_dispatch_blockscaled_hybrid_calls": 0.0,
+          "rdep_dispatch_bf16_ipc_calls": 0.0,
+          "rdep_dispatch_bf16_hybrid_calls": 0.0,
+          "eco_fused_update_calls": 0.0,
+          "eco_cuda_fused_kernel_calls": 0.0,
+        }
+        if hasattr(model, "consume_runtime_counters"):
+          model_counts = model.consume_runtime_counters()
+          for key in runtime_counts:
+            runtime_counts[key] += float(model_counts.get(key, 0.0))
+        if fused_eco is not None and hasattr(fused_eco, "consume_runtime_counters"):
+          eco_counts = fused_eco.consume_runtime_counters()
+          for key in runtime_counts:
+            runtime_counts[key] += float(eco_counts.get(key, 0.0))
+        if getattr(metrics_ctx, "writer", None) is not None:
+          try:
+            runtime_items = [(f"runtime/r{rank}/{key}", value) for key, value in runtime_counts.items()]
+            metrics_ctx.writer.insert_many(step=s, items=runtime_items)
+          except Exception:
+            logger.debug("metrics: runtime counter write failed", exc_info=True)
+
         # Log expert load imbalance
         if s % cfg.log_every == 0 and rank == 0:
           _cv = getattr(model, 'mean_expert_load_cv', 0.0)
@@ -585,6 +609,12 @@ def train(cfg: Config):
           except Exception as e:
             if rank == 0:
               logger.exception("Eval failed")
+          finally:
+            # Prevent eval-only forwards from leaking into the next step's runtime counters.
+            if hasattr(model, "consume_runtime_counters"):
+              model.consume_runtime_counters()
+            if fused_eco is not None and hasattr(fused_eco, "consume_runtime_counters"):
+              fused_eco.consume_runtime_counters()
 
         # Opportunistically schedule evaluation (async or inline), if enabled
         try:

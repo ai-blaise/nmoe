@@ -210,6 +210,8 @@ class FusedBackwardECO:
         self._pending_bytes: int = 0
         self._allreduce_seq: int = 0
         self._dp_comm_stream: torch.cuda.Stream | None = None
+        self._runtime_fused_update_calls: int = 0
+        self._runtime_cuda_fused_kernel_calls: int = 0
 
         # CUDA kernel requirement: fail fast if kernels are unavailable
         self._require_cuda = getattr(cfg, 'eco_require_cuda', True)
@@ -546,6 +548,16 @@ class FusedBackwardECO:
                 norm_sq = 0.0
             self._prev_global_norm = math.sqrt(max(norm_sq, 1e-30))
 
+    def consume_runtime_counters(self) -> dict[str, float]:
+        """Return and reset per-step ECO CUDA-path counters."""
+        counters = {
+            "eco_fused_update_calls": float(self._runtime_fused_update_calls),
+            "eco_cuda_fused_kernel_calls": float(self._runtime_cuda_fused_kernel_calls),
+        }
+        self._runtime_fused_update_calls = 0
+        self._runtime_cuda_fused_kernel_calls = 0
+        return counters
+
     def _cuda_fused_update(
         self, moe: nn.Module, param_name: str, grad: torch.Tensor, st: dict,
         beta1_eff: float | None = None, beta2_eff: float | None = None,
@@ -683,6 +695,7 @@ class FusedBackwardECO:
                 st["exp_avg_scale"] = m_sc_flat.reshape(m_sc.shape)
                 st["exp_avg_sq_scale"] = v_sc_flat.reshape(v_sc.shape)
 
+            self._runtime_cuda_fused_kernel_calls += 1
             return True
 
     def _launch_dp_allreduce(self, grad: torch.Tensor, async_op: bool) -> tuple[object, ...]:
@@ -884,6 +897,7 @@ class FusedBackwardECO:
             grad_bf16: [E, dim1, dim2] BF16 gradient (nmoe layout).
         """
         with _nvtx("eco/fused_update"):
+            self._runtime_fused_update_calls += 1
             assert id(moe) in self._moe_to_idx, (
                 f"fused_update called with unknown MoE module (id={id(moe)}). "
                 f"Known ids: {list(self._moe_to_idx.keys())}"

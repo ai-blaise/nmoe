@@ -315,6 +315,11 @@ class MoE(nn.Module):
     self._shared = MLP(self.dim, n_shared * self.moe_inter_dim) if n_shared else None
     self.last_loads = None
     self.last_aux_loss = None
+    self._runtime_fused_router_calls = 0
+    self._runtime_rdep_dispatch_blockscaled_ipc_calls = 0
+    self._runtime_rdep_dispatch_blockscaled_hybrid_calls = 0
+    self._runtime_rdep_dispatch_bf16_ipc_calls = 0
+    self._runtime_rdep_dispatch_bf16_hybrid_calls = 0
 
   def init_weights(self, init_std: float = 0.02):
     for W in (self.W1, self.W3, self.W2):
@@ -424,6 +429,8 @@ class MoE(nn.Module):
 
     with _nvtx("moe/router"):
       if self._use_fused_router:
+        if self.training:
+          self._runtime_fused_router_calls += 1
         # Fused router returns: expert_ids, gates, dispatch_indices, expert_counts
         # dispatch_indices and expert_counts are computed by the fused kernel
         # but the actual dispatch is still handled by rdep
@@ -485,6 +492,22 @@ class MoE(nn.Module):
       with _nvtx("moe/shared_expert"):
         out = out + self._shared(X)
     return out.view_as(x)
+
+  def consume_runtime_counters(self) -> dict[str, int]:
+    """Return and reset per-step runtime counters for CUDA-path auditing."""
+    counters = {
+      "fused_router_calls": int(self._runtime_fused_router_calls),
+      "rdep_dispatch_blockscaled_ipc_calls": int(self._runtime_rdep_dispatch_blockscaled_ipc_calls),
+      "rdep_dispatch_blockscaled_hybrid_calls": int(self._runtime_rdep_dispatch_blockscaled_hybrid_calls),
+      "rdep_dispatch_bf16_ipc_calls": int(self._runtime_rdep_dispatch_bf16_ipc_calls),
+      "rdep_dispatch_bf16_hybrid_calls": int(self._runtime_rdep_dispatch_bf16_hybrid_calls),
+    }
+    self._runtime_fused_router_calls = 0
+    self._runtime_rdep_dispatch_blockscaled_ipc_calls = 0
+    self._runtime_rdep_dispatch_blockscaled_hybrid_calls = 0
+    self._runtime_rdep_dispatch_bf16_ipc_calls = 0
+    self._runtime_rdep_dispatch_bf16_hybrid_calls = 0
+    return counters
 
 
 class TransformerBlock(nn.Module):
@@ -732,6 +755,24 @@ class Transformer(nn.Module):
     if cvs:
       tensor_sum = tensor_sum + float(sum(cvs))
     return float((tensor_sum / total).item())
+
+  def consume_runtime_counters(self) -> dict[str, float]:
+    """Return and reset per-step runtime counters across all MoE layers."""
+    totals = {
+      "fused_router_calls": 0.0,
+      "rdep_dispatch_blockscaled_ipc_calls": 0.0,
+      "rdep_dispatch_blockscaled_hybrid_calls": 0.0,
+      "rdep_dispatch_bf16_ipc_calls": 0.0,
+      "rdep_dispatch_bf16_hybrid_calls": 0.0,
+    }
+    for block in self.blocks:
+      ffn = getattr(block, 'ffn', None)
+      if ffn is None or not hasattr(ffn, 'consume_runtime_counters'):
+        continue
+      layer_counts = ffn.consume_runtime_counters()
+      for key in totals:
+        totals[key] += float(layer_counts.get(key, 0))
+    return totals
 
   @record_function("transformer")
   def forward(self, tokens: torch.Tensor,

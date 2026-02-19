@@ -138,6 +138,16 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         offs_pad.data_ptr(), M_host.data_ptr(),
         stream,
       )
+    if moe_ref is not None and getattr(moe_ref, 'training', False):
+      mode = getattr(rdep, '_mode', '')
+      if mode == 'ipc':
+        moe_ref._runtime_rdep_dispatch_blockscaled_ipc_calls = (
+          getattr(moe_ref, '_runtime_rdep_dispatch_blockscaled_ipc_calls', 0) + 1
+        )
+      elif mode == 'hybrid':
+        moe_ref._runtime_rdep_dispatch_blockscaled_hybrid_calls = (
+          getattr(moe_ref, '_runtime_rdep_dispatch_blockscaled_hybrid_calls', 0) + 1
+        )
 
     # Check for dropped tokens periodically (avoid per-call GPU-CPU sync)
     if not hasattr(_MoEBlockscaledFused, '_dispatch_count'):
@@ -269,6 +279,16 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         offs_pad.data_ptr(), M_host.data_ptr(),
         stream,
       )
+    if moe_ref is not None and getattr(moe_ref, 'training', False):
+      mode = getattr(rdep, '_mode', '')
+      if mode == 'ipc':
+        moe_ref._runtime_rdep_dispatch_bf16_ipc_calls = (
+          getattr(moe_ref, '_runtime_rdep_dispatch_bf16_ipc_calls', 0) + 1
+        )
+      elif mode == 'hybrid':
+        moe_ref._runtime_rdep_dispatch_bf16_hybrid_calls = (
+          getattr(moe_ref, '_runtime_rdep_dispatch_bf16_hybrid_calls', 0) + 1
+        )
 
     if M_recv <= 0:
       dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
