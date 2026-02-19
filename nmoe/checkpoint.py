@@ -1,6 +1,7 @@
 import logging
 import os
 import json
+import hashlib
 import pickle
 import sys
 import threading
@@ -62,6 +63,93 @@ def _ep_rank() -> int:
     return _rank()
 
 
+def _ep_size() -> int:
+    """Get EP size if nmoe process groups are initialized."""
+    try:
+        from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_ep_size
+        if is_nmoe_parallel_initialized():
+            return max(1, int(get_ep_size()))
+    except ImportError:
+        pass
+    return 1
+
+
+def _use_local_ep_checkpoint_layout() -> bool:
+    """Whether checkpoint files are stored per-node using EP-local shard IDs."""
+    raw = os.getenv("NMOE_CHECKPOINT_LOCAL_EP", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _checkpoint_shard_rank() -> int:
+    """Shard index used for dp_rank_XXX checkpoint file naming."""
+    if _use_local_ep_checkpoint_layout():
+        return _ep_rank()
+    return _rank()
+
+
+def _checkpoint_shard_count() -> int:
+    """Number of dp_rank shards expected in a completed checkpoint iteration."""
+    if _use_local_ep_checkpoint_layout():
+        return _ep_size()
+    return _world_size()
+
+
+def _is_checkpoint_writer() -> bool:
+    """Whether this rank is responsible for rd.pt + manifest/tracker writes."""
+    if _use_local_ep_checkpoint_layout():
+        return _ep_rank() == 0
+    return _rank() == 0
+
+
+def _validate_checkpoint_layout_safety() -> None:
+    """Fail fast on known-unsafe layout combinations."""
+    if not _use_local_ep_checkpoint_layout():
+        return
+    shared_raw = os.getenv("NMOE_CHECKPOINT_SHARED_FS", "").strip().lower()
+    if shared_raw == "":
+        raise RuntimeError(
+            "NMOE_CHECKPOINT_LOCAL_EP=1 requires explicit NMOE_CHECKPOINT_SHARED_FS=0|1."
+        )
+    truthy = ("1", "true", "yes", "on")
+    falsy = ("0", "false", "no", "off")
+    if shared_raw not in truthy + falsy:
+        raise RuntimeError(
+            "Invalid NMOE_CHECKPOINT_SHARED_FS value. Expected one of "
+            f"{truthy + falsy}, got {shared_raw!r}."
+        )
+    if shared_raw in truthy:
+        raise RuntimeError(
+            "NMOE_CHECKPOINT_LOCAL_EP=1 is incompatible with shared checkpoint storage. "
+            "Use node-local checkpoint paths or disable local-EP checkpoint layout."
+        )
+
+    if _is_dist():
+        ep_size = _ep_size()
+        world = _world_size()
+        if world > 1 and ep_size <= 1:
+            raise RuntimeError(
+                "NMOE_CHECKPOINT_LOCAL_EP=1 requires initialized EP groups (ep_size > 1)."
+            )
+
+        local_world_raw = os.getenv("LOCAL_WORLD_SIZE", "").strip()
+        if world > 1:
+            if not local_world_raw:
+                raise RuntimeError(
+                    "NMOE_CHECKPOINT_LOCAL_EP=1 requires LOCAL_WORLD_SIZE to be set."
+                )
+            try:
+                local_world = int(local_world_raw)
+            except ValueError as e:
+                raise RuntimeError(
+                    f"Invalid LOCAL_WORLD_SIZE={local_world_raw!r} for local-EP checkpoint mode"
+                ) from e
+            if local_world != ep_size:
+                raise RuntimeError(
+                    "NMOE_CHECKPOINT_LOCAL_EP=1 requires one full EP group per checkpoint "
+                    f"directory. Got LOCAL_WORLD_SIZE={local_world}, ep_size={ep_size}."
+                )
+
+
 def iteration_dir(base: str | Path, step: int) -> str:
     return str(Path(base) / f"iter_{step:07d}")
 
@@ -71,8 +159,6 @@ def tracker_path(base: str | Path) -> str:
 
 
 def write_tracker(base: str | Path, step: int) -> None:
-    if _rank() != 0:
-        return
     os.makedirs(base, exist_ok=True)
     out = tracker_path(base)
     tmp = out + f".tmp.{os.getpid()}"
@@ -358,35 +444,96 @@ def _read_git_sha_from_rd(base: str | Path, step: int) -> str:
     return str(info.get('git_sha', 'unknown'))
 
 
-def _read_world_from_rd(base: str | Path, step: int) -> int:
+def _read_checkpoint_layout_from_rd(base: str | Path, step: int) -> tuple[int, int]:
+    """Return (checkpoint_dp_count, world) from rd metadata."""
     rd = _safe_load(_rd_path(base, step))
     if not rd:
-        return -1
+        return (-1, -1)
     info = rd.get('run_info', {}) if isinstance(rd, dict) else {}
     try:
-        return int(info.get('world', -1))
+        world = int(info.get('world', -1))
+        checkpoint_dp_count = info.get('checkpoint_dp_count')
+        if checkpoint_dp_count is not None:
+            return (int(checkpoint_dp_count), world)
+        return (world, world)
     except (ValueError, TypeError) as e:
-        _log.warning("Invalid 'world' value in checkpoint metadata at step %d: %s", step, e)
-        return -1
+        _log.warning("Invalid checkpoint dp_count metadata at step %d: %s", step, e)
+        return (-1, -1)
 
 
-def _all_dp_present(base: str | Path, step: int, world: int) -> bool:
-    if world <= 0:
+def _read_checkpoint_layout_mode_from_rd(base: str | Path, step: int) -> Optional[bool]:
+    """Read explicit checkpoint layout mode if present.
+
+    Returns:
+        True for local-EP layout, False for global-rank layout, None if unknown.
+    """
+    rd = _safe_load(_rd_path(base, step))
+    if not rd:
+        return None
+    info = rd.get('run_info', {}) if isinstance(rd, dict) else {}
+    mode = str(info.get('checkpoint_layout', '')).strip().lower()
+    if mode in ('local_ep', 'ep_local', 'local'):
+        return True
+    if mode in ('global_rank', 'global', 'world'):
+        return False
+    return None
+
+
+def _read_dp_count_from_rd(base: str | Path, step: int) -> int:
+    dp_count, _ = _read_checkpoint_layout_from_rd(base, step)
+    return dp_count
+
+
+def _checkpoint_uses_local_layout(base: str | Path, step: int) -> Optional[bool]:
+    """Infer checkpoint shard layout for a saved step.
+
+    Returns:
+        True:  EP-local shard layout (dp_count != world)
+        False: global-rank shard layout (dp_count == world)
+        None:  unknown (missing/invalid metadata)
+    """
+    explicit_layout = _read_checkpoint_layout_mode_from_rd(base, step)
+    if explicit_layout is not None:
+        return explicit_layout
+
+    dp_count, world = _read_checkpoint_layout_from_rd(base, step)
+    if dp_count <= 0:
+        return None
+    if world > 0 and dp_count == world:
+        # Ambiguous legacy metadata case: DP=1 local-EP checkpoints can also
+        # have dp_count==world. If current run is explicitly local-EP and EP
+        # size matches world, treat it as local-EP.
+        if _use_local_ep_checkpoint_layout() and _ep_size() == world:
+            return True
+        return False
+    return True
+
+
+def _shard_rank_for_checkpoint_step(base: str | Path, step: int) -> int:
+    """Pick the correct shard rank for a specific checkpoint step layout."""
+    local_layout = _checkpoint_uses_local_layout(base, step)
+    if local_layout is None:
+        return _checkpoint_shard_rank()
+    return _ep_rank() if local_layout else _rank()
+
+
+def _all_dp_present(base: str | Path, step: int, dp_count: int) -> bool:
+    if dp_count <= 0:
         return False
     it = iteration_dir(base, step)
     if not os.path.isdir(it):
         return False
-    for r in range(world):
+    for r in range(dp_count):
         if not os.path.exists(_dp_path(base, step, r)):
             return False
     return True
 
 
-def _write_manifest(base: str | Path, step: int, world: int) -> None:
+def _write_manifest(base: str | Path, step: int, dp_count: int) -> None:
     it_dir = iteration_dir(base, step)
     os.makedirs(it_dir, exist_ok=True)
     rd = _rd_path(base, step)
-    files = [rd] + [_dp_path(base, step, r) for r in range(world)]
+    files = [rd] + [_dp_path(base, step, r) for r in range(dp_count)]
     bytes_total = 0
     for p in files:
         try:
@@ -396,8 +543,8 @@ def _write_manifest(base: str | Path, step: int, world: int) -> None:
     git_sha = _read_git_sha_from_rd(base, step)
     manifest = {
         'step': int(step),
-        'world': int(world),
-        'dp_count': int(world),
+        'world': int(dp_count),
+        'dp_count': int(dp_count),
         'bytes_total': int(bytes_total),
         'git_sha': git_sha,
         'files': [os.path.basename(p) for p in files],
@@ -413,20 +560,20 @@ def _write_manifest(base: str | Path, step: int, world: int) -> None:
     _fsync_dir(it_dir)
 
 
-def try_finalize_step(base: str | Path, step: int) -> bool:
-    """Rank‑0 helper: if rd.pt and all dp shards exist, write manifest then flip tracker.
-    Returns True if completion succeeded.
-    """
+def try_finalize_step(base: str | Path, step: int, dp_count: Optional[int] = None) -> bool:
+    """Writer helper: finalize a step when rd.pt and all dp shards are present."""
+    if not _is_checkpoint_writer():
+        return False
     try:
-        world = _read_world_from_rd(base, step)
-        if world <= 0:
+        shard_count = int(dp_count) if dp_count is not None else _read_dp_count_from_rd(base, step)
+        if shard_count <= 0:
             return False
         # Require rd.pt present
         if not os.path.exists(_rd_path(base, step)):
             return False
-        if not _all_dp_present(base, step, world):
+        if not _all_dp_present(base, step, shard_count):
             return False
-        _write_manifest(base, step, world)
+        _write_manifest(base, step, shard_count)
         write_tracker(base, step)
         return True
     except Exception:
@@ -603,6 +750,7 @@ class Checkpointer:
 
     def __init__(self, base: str, keep_last: int = 5, async_io: bool = False, async_max_queue:int = 1) -> None:
         # Normalize base to absolute to avoid CWD-related surprises in background threads
+        _validate_checkpoint_layout_safety()
         self.base = str(Path(base).absolute())
         self.keep_last = keep_last
         self.async_io = async_io
@@ -616,13 +764,13 @@ class Checkpointer:
             self.last_ms = ms
             if self._purger:
                 self._purger.trigger()
-            # Rank 0 opportunistically attempts to finalize this step
+            # Writer rank opportunistically attempts to finalize this step.
             try:
-                if _rank() == 0:
-                    try_finalize_step(self.base, step)
+                if _is_checkpoint_writer():
+                    try_finalize_step(self.base, step, dp_count=_checkpoint_shard_count())
             except Exception:
                 _log.debug("Opportunistic finalize failed for step=%d", step, exc_info=True)
-        # Ensure capacity for rd.pt + dp_rank_XXX.pt on rank 0 without dropping
+        # Ensure capacity for rd.pt + dp_rank_XXX.pt without dropping.
         max_q = max(2, async_max_queue)
         self._saver = _AsyncSaver(max_queue=max_q, on_saved=_on_saved) if async_io else None
 
@@ -639,7 +787,7 @@ class Checkpointer:
         self._last_requested_step = max(self._last_requested_step, int(step))
         it_dir = iteration_dir(self.base, step)
         os.makedirs(it_dir, exist_ok=True)
-        path = os.path.join(it_dir, f"dp_rank_{_rank():03d}.pt")
+        path = os.path.join(it_dir, f"dp_rank_{_checkpoint_shard_rank():03d}.pt")
 
         if self._saver is not None:
             self._saver.submit(path, self.base, step, state)
@@ -650,15 +798,15 @@ class Checkpointer:
             torch.save(cpu_state, tmp)
             os.replace(tmp, path)
             # Finalize may flip tracker if complete
-            if _rank() == 0:
-                try_finalize_step(self.base, step)
+            if _is_checkpoint_writer():
+                try_finalize_step(self.base, step, dp_count=_checkpoint_shard_count())
             if self._purger is not None:
                 self._purger.trigger()
 
         return path
 
     def save_dense(self, step: int, state: dict[str, Any]) -> str:
-        """Save replicated (dense/router) parameters once per step (call on rank 0)."""
+        """Save replicated (dense/router) parameters once per checkpoint writer."""
         self._raise_if_async_failed()
         self._last_requested_step = max(self._last_requested_step, int(step))
         it_dir = iteration_dir(self.base, step)
@@ -673,8 +821,8 @@ class Checkpointer:
             tmp = path + ".tmp"
             torch.save(cpu_state, tmp)
             os.replace(tmp, path)
-            if _rank() == 0:
-                try_finalize_step(self.base, step)
+            if _is_checkpoint_writer():
+                try_finalize_step(self.base, step, dp_count=_checkpoint_shard_count())
             if self._purger is not None:
                 self._purger.trigger()
 
@@ -683,15 +831,13 @@ class Checkpointer:
     def find_latest(self) -> tuple[int, str] | tuple[int, None]:
         """Find the latest checkpoint for this rank.
 
-        With EP sharding (ep_size > 1), uses EP rank instead of global rank
-        to determine which dp_rank_XXX.pt file to load. This ensures that
-        all DP replicas of the same EP rank load the same checkpoint shard.
+        Uses the active checkpoint shard layout:
+        - default: global-rank dp shards
+        - local EP mode (NMOE_CHECKPOINT_LOCAL_EP=1): EP-rank shards (0..ep_size-1)
         """
-        # Use EP rank for checkpoint file selection (handles EP>1 correctly)
-        ep_r = _ep_rank()
-
         def _candidate(step: int) -> str:
-            return os.path.join(iteration_dir(self.base, step), f"dp_rank_{ep_r:03d}.pt")
+            shard_rank = _shard_rank_for_checkpoint_step(self.base, step)
+            return os.path.join(iteration_dir(self.base, step), f"dp_rank_{shard_rank:03d}.pt")
 
         step = read_tracker(self.base)
         if step > 0:
@@ -710,18 +856,27 @@ class Checkpointer:
                 continue
             if not (p / "manifest.json").exists():
                 continue
-            path = str(p / f"dp_rank_{ep_r:03d}.pt")
+            shard_rank = _shard_rank_for_checkpoint_step(self.base, s)
+            path = str(p / f"dp_rank_{shard_rank:03d}.pt")
             if os.path.exists(path):
                 return s, path
         return -1, None
 
+    def path_for_step(self, step: int) -> Optional[str]:
+        """Return local shard path for a known checkpoint step, if present."""
+        if step < 0:
+            return None
+        shard_rank = _shard_rank_for_checkpoint_step(self.base, step)
+        candidate = os.path.join(iteration_dir(self.base, step), f"dp_rank_{shard_rank:03d}.pt")
+        if os.path.exists(candidate):
+            return candidate
+        return None
+
     def try_finalize(self, step: int) -> bool:
-        """Attempt to mark a step complete by writing manifest and flipping tracker.
-        Rank-0 only; returns True if completion succeeded.
-        """
-        if _rank() != 0:
+        """Attempt to finalize checkpoint step (writer rank only)."""
+        if not _is_checkpoint_writer():
             return False
-        return try_finalize_step(self.base, step)
+        return try_finalize_step(self.base, step, dp_count=_checkpoint_shard_count())
 
     def recommend_interval(self, step_time_ms: float, safety: float = 1.3) -> int:
         """Compute save_every given last measured save time and step time.
@@ -736,9 +891,13 @@ class Checkpointer:
         if self._saver is not None:
             # Wait for all pending saves to complete before closing
             self._saver.wait()
-            if _rank() == 0 and self._last_requested_step > 0:
+            if _is_checkpoint_writer() and self._last_requested_step > 0:
                 try:
-                    try_finalize_step(self.base, int(self._last_requested_step))
+                    try_finalize_step(
+                        self.base,
+                        int(self._last_requested_step),
+                        dp_count=_checkpoint_shard_count(),
+                    )
                 except Exception:
                     _log.error(
                         "Failed to finalize step=%d during checkpointer close",
@@ -1467,6 +1626,7 @@ def build_states(
 
     # Run metadata (immutable) for rd.pt
     world = _world_size()
+    checkpoint_dp_count = _checkpoint_shard_count()
     cfg = getattr(model, 'config', None)
     try:
         git_sha = subprocess.check_output(
@@ -1493,6 +1653,10 @@ def build_states(
             'H': getattr(cfg, 'dim', None),
             'L': getattr(cfg, 'n_layers', None),
             'world': world,
+            'checkpoint_dp_count': checkpoint_dp_count,
+            'checkpoint_layout': (
+                'local_ep' if _use_local_ep_checkpoint_layout() else 'global_rank'
+            ),
             'dataset_version': getattr(loader, 'dataset_version', None),
             'tokenizer_id': getattr(loader, 'tokenizer_id', None),
         }
@@ -2236,10 +2400,109 @@ def load_checkpoint(
     tokens_seen = 0
     zero2_state = {}
 
+    def _consensus_resume_step(local_step: int) -> int:
+        if not _is_dist():
+            return local_step
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        step_tensor = torch.tensor([int(local_step)], device=device, dtype=torch.int64)
+        min_tensor = step_tensor.clone()
+        max_tensor = step_tensor.clone()
+        dist.all_reduce(min_tensor, op=dist.ReduceOp.MIN)
+        dist.all_reduce(max_tensor, op=dist.ReduceOp.MAX)
+        min_step = int(min_tensor.item())
+        max_step = int(max_tensor.item())
+        if min_step != max_step:
+            if rank == 0:
+                print_fn(
+                    "[checkpoint] WARNING: step skew detected across ranks "
+                    f"(min={min_step}, max={max_step}); searching for last common step"
+                )
+
+            candidate = min_step
+            while candidate >= 0:
+                has_local = 1 if checkpointer.path_for_step(candidate) is not None else 0
+                has_tensor = torch.tensor([has_local], device=device, dtype=torch.int64)
+                dist.all_reduce(has_tensor, op=dist.ReduceOp.MIN)
+                if int(has_tensor.item()) == 1:
+                    if rank == 0 and candidate != max_step:
+                        print_fn(f"[checkpoint] Falling back to common step {candidate}")
+                    return candidate
+                candidate -= 1
+            return -1
+        return min_step
+
+    def _consensus_checkpoint_signature(step: int) -> None:
+        if not _is_dist():
+            return
+
+        rd = _safe_load(_rd_path(checkpointer.base, step))
+        run_info = rd.get('run_info', {}) if isinstance(rd, dict) else {}
+        dp_count, saved_world = _read_checkpoint_layout_from_rd(checkpointer.base, step)
+        local_sig_payload = {
+            "step": int(step),
+            "checkpoint_version": int(rd.get('checkpoint_version', 0)) if isinstance(rd, dict) else 0,
+            "config_fingerprint": str(rd.get('config_fingerprint', '')) if isinstance(rd, dict) else "",
+            "world": int(saved_world),
+            "dp_count": int(dp_count),
+            "layout": str(run_info.get('checkpoint_layout', '')),
+            "git_sha": str(run_info.get('git_sha', '')),
+        }
+        local_sig_json = json.dumps(local_sig_payload, sort_keys=True, separators=(",", ":"))
+        local_sig = hashlib.sha256(local_sig_json.encode("utf-8")).hexdigest()
+
+        signatures: list[str] = ["" for _ in range(_world_size())]
+        dist.all_gather_object(signatures, local_sig)
+        if len(set(signatures)) != 1:
+            raise RuntimeError(
+                "Checkpoint signature mismatch across ranks at resume step "
+                f"{step}: {signatures}"
+            )
+
     eco_fused = getattr(cfg, 'eco_fused_backward', False)
     if getattr(cfg, 'resume', True):
-        step, path = checkpointer.find_latest()
+        local_step, _ = checkpointer.find_latest()
+        step = _consensus_resume_step(local_step)
+        path = checkpointer.path_for_step(step) if step >= 0 else None
+        if step >= 0 and path is None:
+            raise FileNotFoundError(
+                f"Checkpoint step {step} selected by consensus but local shard file is missing"
+            )
+
         if path is not None:
+            saved_dp_count, saved_world = _read_checkpoint_layout_from_rd(checkpointer.base, step)
+            current_world = _world_size()
+            current_dp_count = _checkpoint_shard_count()
+            if saved_world > 0 and saved_world != current_world:
+                raise RuntimeError(
+                    "Checkpoint world-size mismatch: "
+                    f"saved={saved_world}, current={current_world}"
+                )
+            if saved_dp_count > 0 and saved_dp_count != current_dp_count:
+                raise RuntimeError(
+                    "Checkpoint shard-count mismatch: "
+                    f"saved={saved_dp_count}, current={current_dp_count}"
+                )
+
+            checkpoint_local_layout = _checkpoint_uses_local_layout(checkpointer.base, step)
+            env_local_layout = _use_local_ep_checkpoint_layout()
+            if (
+                checkpoint_local_layout is not None
+                and checkpoint_local_layout != env_local_layout
+            ):
+                mode = "local-ep" if checkpoint_local_layout else "global-rank"
+                expected_env = "1" if checkpoint_local_layout else "0"
+                raise RuntimeError(
+                    "Checkpoint layout mismatch: on-disk layout is "
+                    f"{mode} for step {step}, but NMOE_CHECKPOINT_LOCAL_EP={int(env_local_layout)}. "
+                    f"Set NMOE_CHECKPOINT_LOCAL_EP={expected_env} and retry."
+                )
+
+            _consensus_checkpoint_signature(step)
+
             nvfp4_direct = getattr(cfg, 'eco_enabled', False) or eco_fused
             if rank == 0 and nvfp4_direct:
                 print_fn(f"[checkpoint] Loading with nvfp4_direct=True (eco_fused_backward={eco_fused})")
@@ -2282,16 +2545,16 @@ def save_checkpoint(
             step, model, optimizer, tokens_seen, loader, config_fingerprint,
             zero2_state=zero2_state, plan=plan,
         )
-        if rank == 0:
+        if _is_checkpoint_writer():
             checkpointer.save_dense(step, rd_state)
         checkpointer.save_rank_local(step, dp_state)
 
-        if rank == 0 and checkpointer.last_ms > 0:
+        if _is_checkpoint_writer() and checkpointer.last_ms > 0:
             size_mb = checkpointer.last_bytes / (1024 * 1024)
             print_fn(f"[ckpt] saved step={step} size={size_mb:.1f}MB time={checkpointer.last_ms:.0f}ms")
 
-        # Try to finalize: rank 0 writes manifest.json and flips tracker
-        if rank == 0:
+        # Try to finalize: writer rank writes manifest.json and flips tracker.
+        if _is_checkpoint_writer():
             try:
                 done = checkpointer.try_finalize(step)
                 if done:
