@@ -165,6 +165,13 @@ class Config:
   eco_fused_backward: bool = True      # Fuse optimizer step into backward (eliminates 152 GiB of BF16 params + grads)
   eco_require_cuda: bool = True       # Hard-fail if CUDA kernels unavailable (no silent Python fallback)
   eco_factored_v: bool = False         # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
+  eco_allreduce_mode: str = "async"    # async | sync DP all-reduce mode inside fused ECO
+  eco_allreduce_dtype: str = "fp32"    # fp32 | bf16 payload dtype for DP all-reduce
+  eco_allreduce_chunk_mb: int = 0      # 0 disables chunking; >0 chunks DP all-reduce payloads
+  eco_max_pending_allreduce_mb: int = 4096  # Async queue byte budget for in-flight ECO all-reduces
+  eco_max_pending_allreduce_ops: int = 4    # Async queue depth cap (number of in-flight gradient payloads)
+  eco_comm_stall_warn_s: float = 30.0  # Warn when an ECO DP all-reduce has no progress for this many seconds
+  eco_comm_debug: bool = False         # Verbose ECO all-reduce enqueue telemetry
   gradient_checkpointing: bool = False # Required for NVFP4 primary (1 layer BF16 scratch)
 
   # =============================================================================

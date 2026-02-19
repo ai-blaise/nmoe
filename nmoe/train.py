@@ -12,6 +12,7 @@ Usage:
 """
 import logging
 import os
+import socket
 import sys
 import tomllib  # Kept for backward compat; prefer load_config_file
 import time
@@ -132,9 +133,10 @@ def train(cfg: Config):
   if cfg.epochs is not None:
     if sft_mode:
       # SFT: one epoch = one pass over all SFT examples
-      micro_batch = cfg.batch_size // world
+      micro_batch = max(1, cfg.batch_size // dp_size)
       dataset_len = len(loader.dataset) if hasattr(loader, 'dataset') else len(loader)
-      resolved_steps = cfg.epochs * (dataset_len // micro_batch)
+      steps_per_epoch = max(1, dataset_len // micro_batch)
+      resolved_steps = cfg.epochs * steps_per_epoch
     else:
       # Pretraining: one epoch = one pass over all tokens
       # total_tokens estimated from dataset size * seq_len
@@ -194,13 +196,21 @@ def train(cfg: Config):
   if getattr(cfg, 'eco_fused_backward', False):
     from nmoe.eco import FusedBackwardECO
     fused_eco = FusedBackwardECO(model, cfg)
-    # Set DP group for gradient AllReduce inside backward
-    try:
-      from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_data_parallel_group, get_dp_size
-      if is_nmoe_parallel_initialized():
-        fused_eco.set_dp_group(get_data_parallel_group(), get_dp_size())
-    except ImportError:
-      pass
+    # Set DP group for gradient AllReduce inside backward.
+    from nmoe.opt import _get_dp_group, _get_dp_size
+    dp_group = _get_dp_group()
+    dp_world_size = _get_dp_size()
+    if dp_group is not None and dp_world_size > 1:
+      fused_eco.set_dp_group(dp_group, dp_world_size)
+
+    expected_dp_size = getattr(cfg, 'dp_size', None)
+    if expected_dp_size is None:
+      expected_dp_size = max(1, world // max(1, ep_size))
+    if expected_dp_size > 1 and (dp_group is None or dp_world_size <= 1):
+      raise RuntimeError(
+        "eco_fused_backward=True requires initialized DP process groups when dp_size > 1. "
+        f"expected_dp_size={expected_dp_size}, detected_dp_size={dp_world_size}."
+      )
     # Restore FusedBackwardECO state from checkpoint if available
     pending_state = getattr(model, '_pending_fused_eco_state', None)
     if pending_state is not None:
@@ -567,8 +577,14 @@ def main():
   # === Enhanced startup logging ===
   rank = int(os.environ.get("RANK", 0))
   local_rank = int(os.environ.get("LOCAL_RANK", 0))
+  node_rank = int(os.environ.get("NODE_RANK", rank))
   world_size = int(os.environ.get('WORLD_SIZE', 1))
-  print(f"[TRAIN] rank={rank} local_rank={local_rank} world_size={world_size}")
+  host = socket.gethostname()
+  print(f"[TRAIN] host={host} node_rank={node_rank} rank={rank} local_rank={local_rank} world_size={world_size}")
+  master_addr = os.environ.get("MASTER_ADDR", "")
+  master_port = os.environ.get("MASTER_PORT", "")
+  if master_addr:
+    print(f"[TRAIN] master_addr={master_addr} master_port={master_port}")
   print(f"[TRAIN] config: steps={cfg.steps} batch_size={cfg.batch_size} seq_len={cfg.seq_len}")
   print(f"[TRAIN] dtype={cfg.dtype} rdep_capacity={getattr(cfg, 'rdep_capacity', 'N/A')}")
   print(f"[TRAIN] n_routed_experts={cfg.n_routed_experts} n_activated_experts={cfg.n_activated_experts}")

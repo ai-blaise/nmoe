@@ -94,6 +94,13 @@ eco_error_feedback = true        # Error correction feedback into momentum
 eco_stochastic_rounding = true   # SR for NVFP4 E2M1 quantization
 eco_fused_backward = true        # Fuse optimizer into backward — CUDA kernel path, no Python fallback
 eco_factored_v = true            # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
+eco_allreduce_mode = "async"     # Async overlap with bounded in-flight queue for 16-node TCP stability
+eco_allreduce_dtype = "bf16"     # Socket-mode speed path: halve DP all-reduce wire bytes vs FP32
+eco_allreduce_chunk_mb = 16      # Keep chunks modest on MTU-1460 gVNIC to reduce long-tail stalls
+eco_max_pending_allreduce_mb = 1024
+eco_max_pending_allreduce_ops = 1
+eco_comm_stall_warn_s = 15.0
+eco_comm_debug = false
 gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a time
 
 # =============================================================================
@@ -103,7 +110,7 @@ steps = 10000
 dtype = "nvfp4"
 batch_size = 64                   # Global batch size — reduced from 128 to prevent OOM on B200 GPUs
 seq_len = 1024                   # Reduced from 2048 to further reduce activation memory (OOM fix)
-gradient_accumulation_steps = 4  # B=1 micro-batch per GPU (batch=32 / dp=16 / accum=2 = 1)
+gradient_accumulation_steps = 4  # 64 global / 16 DP / 4 accum = 1 micro-batch per GPU
 resume = true
 grad_clip = 1.0
 log_every = 1                    # Log every step (default=10 is too coarse for short runs)
@@ -126,7 +133,7 @@ sft_packing_enabled = false      # Disabled for debugging - test basic SFT first
 
 # RDEP capacity override (worst-case token-expert dispatch slots per GPU)
 # Set to 0 to use auto-computed capacity: micro_batch * seq_len * K * ep_size
-# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 256 / (16 * 16) = 1
-# T per forward = micro_batch * seq_len = 1 * 4096 = 4,096
-# Auto-compute: 4096 * 8 * 8 = 262,144 (halved from 524,288 for OOM fix)
+# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 64 / (16 * 4) = 1
+# T per forward = micro_batch * seq_len = 1 * 1024 = 1,024
+# Auto-compute: 1024 * 8 * 8 = 65,536
 rdep_capacity = 0

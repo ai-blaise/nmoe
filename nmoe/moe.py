@@ -310,11 +310,13 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         dGates = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
 
       if fused_eco is not None:
-        # No tokens routed to this rank — skip fused_update entirely.
-        # Applying zero-gradient update would incorrectly apply weight decay and
-        # stale momentum, corrupting weights on ranks with no routed tokens.
-        # In practice M_recv=0 is unreachable with top-8 routing over 128 experts
-        # (each rank's 16 experts would need to receive zero out of ~32k assignments).
+        # Keep DP collectives aligned even if this rank received zero routed tokens.
+        # We use local zero gradients in the same W2/W1/W3 order as the regular path,
+        # so every rank executes identical collective counts.
+        fused_eco.fused_update_zero(moe_ref, 'W2')
+        fused_eco.fused_update_zero(moe_ref, 'W1')
+        fused_eco.fused_update_zero(moe_ref, 'W3')
+        fused_eco.refresh_layer_cache(moe_ref)
         return None, dX, None, dGates, None, None, None, None, None, None
 
       dW1 = torch.zeros_like(_W1)
