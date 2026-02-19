@@ -32,10 +32,10 @@ Scope:
   - Files: `configs/dsv3_reap_sft_16node.toml`
   - Acceptance: config includes `use_fused_router=true`, `eco_enabled=true`, `eco_fused_backward=true`, `eco_require_cuda=true`.
 
-- [ ] A-004 Propagate the new `nmoe` commit to all nodes and verify file-level parity.
+- [x] A-004 Propagate the new `nmoe` commit to all nodes and verify file-level parity.
   - Files: `../nmoe-multinode/orchestrate.py` flow (`provision`)
   - Acceptance: all nodes show same `git rev-parse HEAD` and expected guardrail code strings.
-  - Status note: live `progressive-scale` run failed on stale node code (`Config.__init__` missing `use_fused_router`), confirming rollout parity is still required.
+  - Status note: `uv run ./orchestrate.py provision --clone-only --force` completed 16/16 and strict parity verified all nodes at `2173c357b88d5a29ead9e66507f92300179ef694`.
 
 ## B) Highest ROI Hot-Path Sync Removal
 
@@ -296,9 +296,10 @@ Scope:
   - Files: `../nmoe-multinode/orchestrate.py` (`resolve_repo_target_sha`)
   - Acceptance: `orchestrate.py provision --clone-only` resolves one immutable remote tip SHA and applies same SHA to all nodes.
 
-- [ ] K-002 Add an explicit "force full repo refresh" runbook and verify it for all 16 nodes.
+- [x] K-002 Add an explicit "force full repo refresh" runbook and verify it for all 16 nodes.
   - Command target: `../nmoe-multinode/orchestrate.py provision --clone-only --force`
   - Acceptance: all nodes report provision success and SHA parity check passes.
+  - Status note: live run completed successfully (16/16 provisioned) and `repo-parity --strict --expected-sha 2173c357b88d5a29ead9e66507f92300179ef694` returned 16/16 OK.
 
 - [ ] K-003 Add an explicit "force full stack refresh" runbook (agent + torch + repo + csrc).
   - Commands: `deploy --force`, `provision --force`, then launch.
@@ -336,7 +337,7 @@ Scope:
 - [x] L-003 Ensure training launch always emits per-rank log files on each node.
   - Files: `../nmoe-multinode/agent.py`, launcher command assembly.
   - Acceptance: every node has `train_rank*.log` for the active run.
-  - Status note: `agent.py launch_training()` now bootstraps `train_rank{node_rank}.log` before preflight checks and appends explicit launch success/failure markers; `orchestrate.py launch_training()` now validates expected rank log presence/freshness and fails launch if missing/stale.
+  - Status note: `agent.py launch_training()` now bootstraps/truncates `train_rank{node_rank}.log` before preflight checks and appends explicit launch success/failure markers; `orchestrate.py launch_training()` performs best-effort per-rank log inventory checks with warnings.
 
 - [~] L-004 Add automatic crash bundle collection on failed launch.
   - Bundle: last N training log lines, last N agent journal lines, `nvidia-smi`, `dmesg`, socket stats.
