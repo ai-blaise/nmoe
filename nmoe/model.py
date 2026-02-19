@@ -262,7 +262,7 @@ class Router(nn.Module):
 
 
 class MoE(nn.Module):
-  def __init__(self, cfg, layer_id: int, *, rdep: Rdep, use_fused_router: bool = False):
+  def __init__(self, cfg, layer_id: int, *, rdep: Rdep, use_fused_router: bool = True):
     super().__init__()
     self.dim = cfg.dim
     self.moe_inter_dim = getattr(cfg, 'moe_inter_dim', cfg.inter_dim)
@@ -447,9 +447,11 @@ class MoE(nn.Module):
     with torch.no_grad():
       loads = self.last_loads
       if loads is not None and loads.numel() > 0:
-        _load_mean = loads.float().mean()
-        _load_std = loads.float().std()
-        self._last_load_cv = (_load_std / _load_mean.clamp(min=1.0)).item() if _load_mean > 0 else 0.0
+        loads_f = loads.float()
+        _load_mean = loads_f.mean()
+        _load_std = loads_f.std()
+        # Keep CV on-device in forward; convert to Python only at low-frequency logging.
+        self._last_load_cv = _load_std / _load_mean.clamp(min=1.0)
       else:
         self._last_load_cv = 0.0
 
@@ -493,7 +495,7 @@ class TransformerBlock(nn.Module):
     *,
     rdep: Rdep | None = None,
     n_layers: int | None = None,
-    use_fused_router: bool = False,
+    use_fused_router: bool = True,
   ):
     super().__init__()
     self.layer_id = layer_id
@@ -602,7 +604,7 @@ class Transformer(nn.Module):
   # HuggingFace compatibility attribute
   supports_gradient_checkpointing = True
 
-  def __init__(self, config: Config, use_fused_router: bool = False):
+  def __init__(self, config: Config, use_fused_router: bool = True):
     super().__init__()
     self.config = config
     self._use_fused_router = use_fused_router
@@ -711,12 +713,25 @@ class Transformer(nn.Module):
     significantly more tokens than others, wasting compute and degrading
     model quality. Values near 0 indicate perfectly balanced routing.
     """
-    cvs = []
+    cvs: list[float] = []
+    cv_tensors: list[torch.Tensor] = []
     for block in self.blocks:
       ffn = getattr(block, 'ffn', None)
       if ffn is not None and hasattr(ffn, '_last_load_cv'):
-        cvs.append(ffn._last_load_cv)
-    return sum(cvs) / max(len(cvs), 1)
+        cv = ffn._last_load_cv
+        if torch.is_tensor(cv):
+          cv_tensors.append(cv.detach())
+        else:
+          cvs.append(float(cv))
+    total = len(cvs) + len(cv_tensors)
+    if total == 0:
+      return 0.0
+    if not cv_tensors:
+      return sum(cvs) / total
+    tensor_sum = torch.stack([t.float() for t in cv_tensors]).sum()
+    if cvs:
+      tensor_sum = tensor_sum + float(sum(cvs))
+    return float((tensor_sum / total).item())
 
   @record_function("transformer")
   def forward(self, tokens: torch.Tensor,

@@ -173,7 +173,7 @@ class FusedBackwardECO:
             raise ValueError(
                 f"eco_allreduce_mode must be 'async' or 'sync', got {self._allreduce_mode!r}"
             )
-        self._allreduce_dtype = str(getattr(cfg, 'eco_allreduce_dtype', 'fp32')).lower()
+        self._allreduce_dtype = str(getattr(cfg, 'eco_allreduce_dtype', 'bf16')).lower()
         if self._allreduce_dtype not in {'fp32', 'bf16'}:
             raise ValueError(
                 f"eco_allreduce_dtype must be 'fp32' or 'bf16', got {self._allreduce_dtype!r}"
@@ -182,6 +182,12 @@ class FusedBackwardECO:
         if chunk_mb < 0:
             raise ValueError(f"eco_allreduce_chunk_mb must be >= 0, got {chunk_mb}")
         self._allreduce_chunk_bytes = chunk_mb * 1024 * 1024
+        threshold_mb = int(getattr(cfg, 'eco_allreduce_chunk_threshold_mb', 0))
+        if threshold_mb < 0:
+            raise ValueError(
+                f"eco_allreduce_chunk_threshold_mb must be >= 0, got {threshold_mb}"
+            )
+        self._allreduce_chunk_threshold_bytes = threshold_mb * 1024 * 1024
 
         max_pending_mb = int(getattr(cfg, 'eco_max_pending_allreduce_mb', 4096))
         if max_pending_mb <= 0:
@@ -214,7 +220,7 @@ class FusedBackwardECO:
                 raise ImportError(
                     "eco_require_cuda=True but nmoe.csrc.rdep is not importable. "
                     "Build the CUDA extension with `python setup.py build_ext --inplace`. "
-                    "Set eco_require_cuda=False to allow Python fallback (10x slower)."
+                    "No Python fallback is supported for fused ECO production path."
                 ) from e
 
             missing = []
@@ -228,7 +234,7 @@ class FusedBackwardECO:
             if missing:
                 raise RuntimeError(
                     f"eco_require_cuda=True but CUDA bindings missing: {missing}. "
-                    f"Rebuild the CUDA extension or set eco_require_cuda=False."
+                    "Rebuild the CUDA extension before launch."
                 )
             self._rdep = _rdep
             logger.info("FusedBackwardECO: CUDA kernels validated at init")
@@ -242,6 +248,7 @@ class FusedBackwardECO:
             f"allreduce_mode={self._allreduce_mode}, "
             f"allreduce_dtype={self._allreduce_dtype}, "
             f"allreduce_chunk_mb={chunk_mb}, "
+            f"allreduce_chunk_threshold_mb={threshold_mb}, "
             f"max_pending_allreduce_mb={max_pending_mb}, "
             f"max_pending_allreduce_ops={max_pending_ops}"
         )
@@ -685,8 +692,9 @@ class FusedBackwardECO:
         flat = grad.reshape(-1)
         if flat.numel() == 0:
             return tuple()
+        payload_bytes = flat.numel() * flat.element_size()
         chunk_bytes = self._allreduce_chunk_bytes
-        if chunk_bytes <= 0 and self._dp_size > 1:
+        if chunk_bytes <= 0 and async_op and self._dp_size > 1:
             chunk_bytes = self._async_default_chunk_bytes
             if not self._used_async_default_chunk:
                 self._used_async_default_chunk = True
@@ -694,10 +702,13 @@ class FusedBackwardECO:
                     "ECO DP all-reduce chunk size not set; defaulting to %d MB for stability",
                     chunk_bytes // (1024 * 1024),
                 )
-        if chunk_bytes > 0:
+        threshold_bytes = self._allreduce_chunk_threshold_bytes or chunk_bytes
+        if threshold_bytes > 0 and payload_bytes <= threshold_bytes:
+            chunk_elems = flat.numel()
+        elif chunk_bytes > 0:
             chunk_elems = max(1, chunk_bytes // flat.element_size())
         else:
-            chunk_elems = max(1, flat.numel())
+            chunk_elems = flat.numel()
 
         works: list[object] = []
         if async_op and self._dp_comm_stream is not None:

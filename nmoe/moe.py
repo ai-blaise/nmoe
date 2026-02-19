@@ -181,12 +181,10 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         ctx.save_for_backward(x, eid, gates, W1, W3, W2)
       return out_f32.to(dtype=torch.bfloat16)
 
-    # P3.13: Use non-blocking query loop instead of blocking synchronize()
-    # This allows overlapping with other work and reduces latency spikes
+    # Wait without Python busy-spin to avoid burning host CPU on every step.
     sync_event = torch.cuda.Event()
     sync_event.record(stream)
-    while not sync_event.query():
-      pass  # Busy-wait is faster than sleep for short waits
+    sync_event.synchronize()
     M_pad = int(M_host[0].item())  # Now safe to read
 
     # Gather blockscaled activations into padded layout (quantized + packed SF)
@@ -457,9 +455,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
           stream,
         )
 
-    # P3.13: Use non-blocking query loop instead of blocking synchronize()
-    while not copy_event.query():
-      pass  # Busy-wait for short D2H copies
+    # Wait without Python busy-spin to reduce host-side overhead/noise.
+    copy_event.synchronize()
     offs_host = offs_pinned
 
     if fused_eco is not None:

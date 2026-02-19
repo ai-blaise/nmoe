@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 import sys
+import ctypes
 import tomllib  # Kept for backward compat; prefer load_config_file
 import time
 from contextlib import nullcontext
@@ -85,11 +86,111 @@ def _validate_training_config(cfg: Config, world: int) -> None:
       )
 
 
+def _validate_required_cuda_bindings(cfg: Config) -> None:
+  """Fail fast if required custom CUDA bindings are missing.
+
+  This prevents expensive multi-node launches from silently drifting into
+  partial or fallback kernel paths.
+  """
+  dtype = str(getattr(cfg, 'dtype', 'bf16') or 'bf16').lower()
+  need_quant = dtype in {'fp8', 'nvfp4'}
+  need_router = bool(getattr(cfg, 'use_fused_router', True))
+  need_eco = bool(getattr(cfg, 'eco_fused_backward', False) and getattr(cfg, 'eco_require_cuda', True))
+  use_fa4 = os.getenv('NMOE_USE_FA4', '0') in ('1', 'true', 'True')
+  require_flashmla = os.getenv('NMOE_REQUIRE_FLASHMLA', '0') in ('1', 'true', 'True')
+
+  # All distributed MoE paths require the core RDEP extension.
+  try:
+    from nmoe.csrc import rdep as _rdep
+  except Exception as e:
+    raise RuntimeError(
+      "Required CUDA extension nmoe.csrc.rdep is not importable. "
+      "Build nmoe/csrc before launching multi-node training."
+    ) from e
+
+  missing: dict[str, list[str]] = {}
+
+  core_required = [
+    'init',
+    'dispatch_meta_bf16',
+    'dispatch_meta_blockscaled',
+    'gather_xe_blockscaled',
+    'return_scatter_from_pad_blockscaled',
+    'gather_dy_dist_bf16',
+    'scatter_dx_dist_bf16',
+    'bf16_wgrad_w2_cublaslt',
+    'bf16_wgrad_w13_cublaslt',
+  ]
+  missing_core = [name for name in core_required if not hasattr(_rdep, name)]
+  if missing_core:
+    missing['rdep_core'] = missing_core
+
+  if need_quant:
+    quant_required = [
+      'build_grouped_gemm_metadata',
+      'ct_nvfp4_to_bf16',
+    ]
+    if dtype == 'nvfp4':
+      quant_required.extend(['quant_nvfp4', 'quant_nvfp4_sf_strided_mma'])
+    else:
+      quant_required.extend(['quant_fp8', 'quant_fp8_sf_strided_mma'])
+    missing_quant = [name for name in quant_required if not hasattr(_rdep, name)]
+    if missing_quant:
+      missing['quant'] = missing_quant
+
+  if need_eco:
+    eco_required = [
+      'eco_adam_nvfp4_update',
+      'eco_mv_accumulate',
+      'nvfp4_recompute_group_scales',
+    ]
+    if bool(getattr(cfg, 'eco_factored_v', False)):
+      eco_required.extend(['eco_adam_nvfp4_fv_update', 'eco_mv_accumulate_fv'])
+    missing_eco = [name for name in eco_required if not hasattr(_rdep, name)]
+    if missing_eco:
+      missing['eco'] = missing_eco
+
+  if need_router:
+    try:
+      lib = ctypes.CDLL(_rdep.__file__)
+      router_required = ['fused_router_backward', 'fused_router_bwd_transpose']
+      missing_router = [name for name in router_required if not hasattr(lib, name)]
+    except OSError:
+      missing_router = ['fused_router_backward', 'fused_router_bwd_transpose']
+    if missing_router:
+      missing['router'] = missing_router
+
+  if require_flashmla and not use_fa4:
+    missing['attention'] = ['NMOE_USE_FA4=1 required when NMOE_REQUIRE_FLASHMLA=1']
+  if use_fa4:
+    attn_missing: list[str] = []
+    try:
+      from flash_attn.cute.interface import _flash_attn_fwd as _flash_attn_fwd  # noqa: F401
+    except Exception as e:
+      attn_missing.append(f"flash_attn.cute.interface._flash_attn_fwd ({e})")
+    try:
+      from nmoe.csrc import flashmla_sm100 as _flashmla
+      if not hasattr(_flashmla, 'dense_prefill_bwd'):
+        attn_missing.append('flashmla_sm100.dense_prefill_bwd')
+    except Exception as e:
+      attn_missing.append(f"nmoe.csrc.flashmla_sm100 ({e})")
+    if attn_missing:
+      missing['attention'] = attn_missing
+
+  if missing:
+    detail = "; ".join(f"{section}: {names}" for section, names in missing.items())
+    raise RuntimeError(
+      f"Missing required CUDA bindings for production launch ({detail}). "
+      "Rebuild nmoe/csrc and redeploy before starting training."
+    )
+
+
 def train(cfg: Config):
   """Train MoE model. One clear path: forward → loss → backward → step → log → checkpoint."""
   # Force line-buffered stdout so all print() output is immediately visible
   # in log files (Python defaults to block-buffering when stdout is redirected)
   sys.stdout.reconfigure(line_buffering=True)
+  _validate_required_cuda_bindings(cfg)
 
   ep_size = getattr(cfg, 'ep_size', 1)
   rank, world = runtime.init(cfg.seed, ep_size=ep_size)
@@ -152,7 +253,13 @@ def train(cfg: Config):
     cfg.steps = resolved_steps
 
   with nvtx_ctx('train/model_init'):
-    model = Transformer(cfg).cuda()
+    use_fused_router = bool(getattr(cfg, 'use_fused_router', True))
+    if not use_fused_router:
+      raise RuntimeError(
+        "use_fused_router=False is disabled for production training. "
+        "Set use_fused_router=true."
+      )
+    model = Transformer(cfg, use_fused_router=use_fused_router).cuda()
     model.init_weights()
     model.train()
 

@@ -33,6 +33,9 @@ jobs:
       - name: Run Ruff formatter check
         run: ruff format --check nmoe/ tests/
 
+      - name: Run hot-path regression guards
+        run: python scripts/check_hotpath_regressions.py
+
   test-cpu:
     name: CPU Tests
     runs-on: ubuntu-latest
