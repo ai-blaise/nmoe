@@ -394,11 +394,18 @@ def train(cfg: Config):
         "NVFP4 training requires direct expert NVFP4 checkpoint load, "
         "but no direct expert loads were recorded."
       )
-    if world <= 1 or runtime_rdep_mode != "hybrid":
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if world <= 1 or runtime_rdep_mode not in {"ipc", "hybrid"}:
       raise RuntimeError(
-        "dtype=nvfp4 production path requires distributed hybrid RDEP "
-        "(world>1, mode='hybrid'). "
+        "dtype=nvfp4 production path requires distributed RDEP "
+        "(world>1, mode in {'ipc','hybrid'}). "
         f"Got world={world}, mode={runtime_rdep_mode!r}."
+      )
+    if runtime_rdep_mode == "ipc" and int(ep_size) != int(local_world):
+      raise RuntimeError(
+        "dtype=nvfp4 IPC mode requires node-local EP grouping "
+        "(ep_size == LOCAL_WORLD_SIZE) to avoid cross-node expert dispatch. "
+        f"Got ep_size={ep_size}, LOCAL_WORLD_SIZE={local_world}."
       )
     non_primary_layers = [
       idx for idx, moe in enumerate(moe_layers)

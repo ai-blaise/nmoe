@@ -181,12 +181,13 @@ class Rdep:
                 f"[RDEP] unsupported mode from extension: {mode_int}",
                 operation="init",
             )
-        if self._mode in {"ipc", "hybrid"} and dist.is_initialized():
+        if self._mode == "hybrid" and dist.is_initialized():
             global_world = dist.get_world_size()
             global_rank = dist.get_rank()
             if self.world != global_world or self.rank != global_rank:
                 raise RuntimeError(
-                    "[RDEP] Multi-rank IPC/hybrid mode currently requires EP group == global WORLD group."
+                    "[RDEP] Hybrid mode requires EP group == global WORLD group "
+                    "(inter-node dispatch path)."
                 )
         if self._mode == 'hybrid' and not _C.has_nvshmem():
             raise RuntimeError(

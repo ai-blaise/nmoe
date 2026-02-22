@@ -432,10 +432,11 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     use_dist_blockscaled_meta = bool(
       is_dist and mode == "hybrid" and rdep_profile in ("fp8", "nvfp4")
     )
-    if rdep_profile == "nvfp4" and not use_dist_blockscaled_meta:
+    nvfp4_mode_ok = bool(mode in {"ipc", "hybrid"})
+    if rdep_profile == "nvfp4" and not nvfp4_mode_ok:
       raise RuntimeError(
-        "NVFP4 backward requires blockscaled distributed metadata path "
-        "(mode='hybrid', world>1). BF16 metadata/gather fallback is disabled."
+        "NVFP4 backward requires distributed IPC/hybrid RDEP mode. "
+        f"Got mode={mode!r}, world={rdep.world}."
       )
     require_fused_eco = bool(moe_ref is not None and getattr(moe_ref, "_nvfp4_primary", False))
     if require_fused_eco:
@@ -447,10 +448,10 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         raise RuntimeError(
           f"NVFP4 primary backward requires rdep profile='nvfp4', got profile={rdep_profile!r}."
         )
-      if not use_dist_blockscaled_meta:
+      if not nvfp4_mode_ok:
         raise RuntimeError(
-          "NVFP4 primary backward requires blockscaled distributed metadata path "
-          "(mode='hybrid', world>1). BF16 metadata/gather fallback is disabled."
+          "NVFP4 primary backward requires distributed IPC/hybrid RDEP mode. "
+          f"Got mode={mode!r}, world={rdep.world}."
         )
     _validate_backward_runtime_contract_once(
       is_dist=is_dist,
