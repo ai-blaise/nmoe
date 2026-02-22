@@ -770,16 +770,31 @@ class SFTLoader:
                     "Use a single format per dataset path."
                 )
 
+            # Avoid cross-rank Arrow cache races when many local processes
+            # materialize the same JSON/Parquet files at once.
+            hf_cache_root = Path(
+                os.getenv(
+                    "HF_DATASETS_CACHE",
+                    str(Path.home() / ".cache" / "huggingface" / "datasets"),
+                )
+            ).expanduser()
+            rank_tag = os.getenv("RANK", "na")
+            local_rank_tag = os.getenv("LOCAL_RANK", "na")
+            cache_dir = hf_cache_root / f"nmoe_local_sft_r{rank_tag}_lr{local_rank_tag}"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
             split_name = str(split).split("[", 1)[0] or "train"
             if all_json_files:
                 dataset = HFDataset.from_json(
                     all_json_files,
                     split=split_name,
+                    cache_dir=str(cache_dir),
                 )
             else:
                 dataset = HFDataset.from_parquet(
                     parquet_files,
                     split=split_name,
+                    cache_dir=str(cache_dir),
                 )
             dataset = _apply_local_split_slice(dataset, str(split), split_name)
         else:
