@@ -17,17 +17,29 @@ from nmoe.norm import RMSNorm
 from nmoe.fused_router import (
     FusedRouterTopKDispatch,
     fused_update_bias_from_expert_ids,
-    fused_update_bias_from_counts,
 )
 from nmoe.fused_aux_loss import fused_aux_loss
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) in ("1", "true", "True")
+
+
+_NVTX_ENABLED = (
+    _env_flag("NMOE_NVTX", "0")
+    and torch.cuda.is_available()
+    and hasattr(torch.cuda, "nvtx")
+    and hasattr(torch.cuda.nvtx, "range")
+)
+_VALIDATE_CU_SEQLENS = _env_flag("NMOE_VALIDATE_CU_SEQLENS", "0")
+_ROUTER_LOADS_EP_ALLREDUCE = _env_flag("NMOE_ROUTER_LOADS_EP_ALLREDUCE", "0")
+_NULL_NVTX_CTX = nullcontext()
+
+
 def _nvtx(tag: str):
-    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
-        return nullcontext()
-    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+    if _NVTX_ENABLED:
         return torch.cuda.nvtx.range(tag)
-    return nullcontext()
+    return _NULL_NVTX_CTX
 
 
 # =============================================================================
@@ -124,6 +136,24 @@ def _validate_moe_config(config, ep_size: int) -> None:
     raise ValueError(
       f"n_routed_experts ({config.n_routed_experts}) must be divisible by ep_size ({ep_size})"
     )
+  if config.n_routed_experts > 256:
+    raise ValueError(
+      f"n_routed_experts={config.n_routed_experts} exceeds fused-router forward limit E<=256."
+    )
+  if config.n_activated_experts <= 0:
+    raise ValueError(
+      f"n_activated_experts must be >= 1, got {config.n_activated_experts}"
+    )
+  if config.n_activated_experts > config.n_routed_experts:
+    raise ValueError(
+      "n_activated_experts cannot exceed n_routed_experts "
+      f"({config.n_activated_experts} > {config.n_routed_experts})"
+    )
+  # Current fused router backward CUDA kernel contract (`MAX_K` in router_bwd.cu).
+  if config.n_activated_experts > 16:
+    raise ValueError(
+      f"n_activated_experts={config.n_activated_experts} exceeds fused-router kernel limit K<=16."
+    )
 
 
 def _get_ep_group():
@@ -143,6 +173,13 @@ def _create_rdep(config, ep_size: int) -> Rdep:
   Uses ep_size (not world_size) to determine local expert count. With EP=8 and
   128 routed experts: n_local = 128 // 8 = 16 experts per GPU.
   """
+  _validate_moe_config(config, ep_size)
+  dtype = str(getattr(config, "dtype", "bf16") or "bf16").lower()
+  if dtype not in {"fp8", "nvfp4"}:
+    raise ValueError(
+      f"MoE training requires blockscaled dtype ('fp8' or 'nvfp4'), got dtype={dtype!r}."
+    )
+
   with _nvtx("model/create_rdep"):
     import sys
     dp = dist.get_world_size() // max(1, ep_size) if dist.is_initialized() else 1
@@ -157,19 +194,25 @@ def _create_rdep(config, ep_size: int) -> Rdep:
       capacity = auto_capacity
     # --- Enhanced RDEP logging ---
     rank = int(dist.get_rank()) if dist.is_initialized() else 0
+    profile = str(getattr(config, "dtype", "bf16") or "bf16").lower()
     if rank == 0:
       mem_est_gb = capacity * config.dim * 2 * n_local / (1024**3)  # bf16 estimate
       print(f"[RDEP] capacity={capacity:,} (auto={auto_capacity:,})", flush=True)
       print(f"[RDEP] micro_batch={micro_batch} seq_len={config.seq_len} K={config.n_activated_experts} ep={ep_size} dp={dp}", flush=True)
-      print(f"[RDEP] n_local={n_local} dim={config.dim} dtype={config.dtype}", flush=True)
+      print(f"[RDEP] n_local={n_local} dim={config.dim} dtype={profile}", flush=True)
       print(f"[RDEP] estimated_buffer_mem={mem_est_gb:.2f} GiB (bf16, {n_local} experts)", flush=True)
       sys.stdout.flush()
     ep_group = _get_ep_group()
+    if dist.is_initialized() and ep_size > 1 and ep_group is None:
+      raise RuntimeError(
+        "EP group is required for ep_size > 1 but was not initialized. "
+        "Initialize distributed EP groups before model construction."
+      )
     return Rdep(
       config.dim,
       n_local,
       config.n_routed_experts,
-      profile=config.dtype,
+      profile=profile,
       capacity=capacity,
       ep_group=ep_group,
     )
@@ -250,12 +293,12 @@ class Router(nn.Module):
         - When expert_ids is provided: uses fused bincount + update (2 kernels)
         - When expert_loads is provided: uses fused update only (1 kernel)
     """
-    if expert_ids is not None:
-      # Most efficient path: fused bincount + bias update
-      fused_update_bias_from_expert_ids(expert_ids, self.bias, gamma)
-    else:
-      # Fallback: expert counts already computed, just do fused update
-      fused_update_bias_from_counts(expert_loads, self.bias, gamma)
+    if expert_ids is None:
+      raise RuntimeError(
+        "router.update_bias requires expert_ids on the production no-fallback path."
+      )
+    # Most efficient path: fused bincount + bias update
+    fused_update_bias_from_expert_ids(expert_ids, self.bias, gamma)
 
   def init_weights(self, init_std: float = 0.02):
     nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
@@ -270,28 +313,35 @@ class MoE(nn.Module):
     self.n_local = rdep.n_local
     self.n_experts = cfg.n_routed_experts
     self.K = rdep.topk
-    self._use_fused_router = use_fused_router
-    self.aux_loss_alpha = getattr(cfg, 'aux_loss_alpha', 0.0)
-
-    if use_fused_router:
-      # Use fused Triton kernel for router + TopK + dispatch metadata
-      # This reduces kernel launch overhead from 3 to 1
-      route_scale = getattr(cfg, 'route_scale', 1.0)
-      self.router = FusedRouterTopKDispatch(
-        hidden_dim=cfg.dim,
-        n_experts=cfg.n_routed_experts,
-        topk=cfg.n_activated_experts,
-        route_scale=route_scale,
-        dtype=torch.bfloat16,
+    if not use_fused_router:
+      raise RuntimeError(
+        "use_fused_router=false is disabled for MoE. "
+        "Fused CUDA router is required."
       )
-    else:
-      self.router = Router(cfg)
+    self._use_fused_router = True
+    self.aux_loss_alpha = getattr(cfg, 'aux_loss_alpha', 0.0)
+    self._aux_loss_enabled = float(self.aux_loss_alpha) > 0.0
+    self._track_expert_loads = float(getattr(cfg, "router_bias_update_rate", 0.0)) > 0.0
+
+    # Use fused Triton kernel for router + TopK + dispatch metadata.
+    route_scale = getattr(cfg, 'route_scale', 1.0)
+    self.router = FusedRouterTopKDispatch(
+      hidden_dim=cfg.dim,
+      n_experts=cfg.n_routed_experts,
+      topk=cfg.n_activated_experts,
+      route_scale=route_scale,
+      dtype=torch.bfloat16,
+    )
 
     self.W1 = nn.Parameter(torch.empty(self.n_local, self.dim, self.moe_inter_dim, dtype=torch.bfloat16))
     self.W3 = nn.Parameter(torch.empty(self.n_local, self.dim, self.moe_inter_dim, dtype=torch.bfloat16))
     self.W2 = nn.Parameter(torch.empty(self.n_local, self.moe_inter_dim, self.dim, dtype=torch.bfloat16))
-    self._dtype = getattr(cfg, 'dtype', 'nvfp4')
+    self._dtype = str(getattr(cfg, 'dtype', 'nvfp4') or 'nvfp4').lower()
     self._use_blockscaled = self._dtype in ('fp8', 'nvfp4')
+    if not self._use_blockscaled:
+      raise ValueError(
+        f"MoE training requires blockscaled dtype ('fp8' or 'nvfp4'), got dtype={self._dtype!r}."
+      )
     self._W_cache = None  # QuantizedWeightsFused cache, refreshed after each optimizer step
     self._nvfp4_primary = False  # True when NVFP4 buffers are the primary weight storage
     self._fused_eco = None  # FusedBackwardECO controller, set by attach()
@@ -314,30 +364,42 @@ class MoE(nn.Module):
     n_shared = getattr(cfg, 'n_shared_experts', 0)
     self._shared = MLP(self.dim, n_shared * self.moe_inter_dim) if n_shared else None
     self.last_loads = None
+    self.last_expert_ids = None
     self.last_aux_loss = None
     self._runtime_fused_router_calls = 0
     self._runtime_rdep_dispatch_blockscaled_ipc_calls = 0
     self._runtime_rdep_dispatch_blockscaled_hybrid_calls = 0
     self._runtime_rdep_dispatch_bf16_ipc_calls = 0
     self._runtime_rdep_dispatch_bf16_hybrid_calls = 0
+    self._runtime_nvfp4_forward_bf16_materialization_fallback_calls = 0
+    # One-time contract checks to keep hot-path Python overhead minimal.
+    self._router_output_contract_validated = False
+    self._nvfp4_rdep_contract_validated = False
 
   def init_weights(self, init_std: float = 0.02):
     for W in (self.W1, self.W3, self.W2):
       nn.init.trunc_normal_(W, mean=0.0, std=init_std)
-    if self._use_fused_router:
-      # FusedRouterTopKDispatch uses kaiming init by default
-      # Reinit with truncated normal to match standard router
-      nn.init.trunc_normal_(self.router.router_weight, mean=0.0, std=init_std)
-    else:
-      self.router.init_weights(init_std)
+    # FusedRouterTopKDispatch uses kaiming init by default.
+    # Reinit with truncated normal to match standard router.
+    nn.init.trunc_normal_(self.router.router_weight, mean=0.0, std=init_std)
     if self._shared:
       self._shared.init_weights(init_std)
     if self._use_blockscaled:
-      self.refresh_weight_cache()
+      if self._dtype == 'nvfp4' and not self._nvfp4_primary:
+        # NVFP4-primary checkpoints populate packed buffers during load.
+        # Keep cache empty until then; forward will build from packed buffers.
+        self._W_cache = None
+      else:
+        self.refresh_weight_cache()
 
   def has_nvfp4_buffers(self) -> bool:
     """Check if NVFP4 primary buffers are populated."""
-    return self._nvfp4_primary and self._W1_packed is not None
+    return (
+      self._nvfp4_primary
+      and self._W1_packed is not None and self._W1_scale is not None and self._W1_gs is not None
+      and self._W3_packed is not None and self._W3_scale is not None and self._W3_gs is not None
+      and self._W2_packed is not None and self._W2_scale is not None and self._W2_gs is not None
+    )
 
   def set_nvfp4_buffers(
     self,
@@ -351,17 +413,54 @@ class MoE(nn.Module):
     After calling this, refresh_weight_cache() will use these buffers
     to build the blockscaled cache (no BF16 master weights needed).
     """
-    self._W1_packed = W1_packed
-    self._W1_scale = W1_scale
-    self._W1_gs = W1_gs
-    self._W3_packed = W3_packed
-    self._W3_scale = W3_scale
-    self._W3_gs = W3_gs
-    self._W2_packed = W2_packed
-    self._W2_scale = W2_scale
-    self._W2_gs = W2_gs
+    # Canonicalize once so cache refresh avoids hidden .contiguous() copies.
+    self._W1_packed = W1_packed.contiguous()
+    self._W1_scale = W1_scale.contiguous()
+    self._W1_gs = W1_gs.contiguous()
+    self._W3_packed = W3_packed.contiguous()
+    self._W3_scale = W3_scale.contiguous()
+    self._W3_gs = W3_gs.contiguous()
+    self._W2_packed = W2_packed.contiguous()
+    self._W2_scale = W2_scale.contiguous()
+    self._W2_gs = W2_gs.contiguous()
     self._nvfp4_group_size = group_size
     self._nvfp4_primary = True
+    self._nvfp4_rdep_contract_validated = False
+    # Invalidate any previously built cache to force rebuild from new NVFP4 buffers.
+    if self._W_cache is not None:
+      del self._W_cache
+      self._W_cache = None
+
+  def _validate_router_outputs_once(
+    self,
+    X: torch.Tensor,
+    eid: torch.Tensor,
+    gates: torch.Tensor,
+  ) -> None:
+    """Validate fused-router output contract once per MoE instance."""
+    if self._router_output_contract_validated:
+      return
+    if X.dtype != torch.bfloat16 or not X.is_contiguous():
+      raise RuntimeError("MoE input X must be contiguous BF16 on production no-fallback path.")
+    if eid.dtype != torch.int32 or not eid.is_contiguous():
+      raise RuntimeError("Router expert_ids must be contiguous int32 on production no-fallback path.")
+    if gates.dtype != torch.bfloat16 or not gates.is_contiguous():
+      raise RuntimeError("Router gates must be contiguous BF16 on production no-fallback path.")
+    self._router_output_contract_validated = True
+
+  def _validate_nvfp4_rdep_contract_once(self) -> None:
+    """Validate static RDEP contract for NVFP4-primary no-fallback path."""
+    if self._nvfp4_rdep_contract_validated or not self._nvfp4_primary:
+      return
+    rdep_mode = str(getattr(self._rdep, "_mode", "")).lower()
+    rdep_profile = str(getattr(self._rdep, "profile", "")).lower()
+    rdep_world = int(getattr(self._rdep, "world", 1))
+    if rdep_mode != "hybrid" or rdep_world <= 1 or rdep_profile != "nvfp4":
+      raise RuntimeError(
+        "NVFP4 primary no-fallback training requires distributed hybrid RDEP "
+        "(mode='hybrid', world>1, profile='nvfp4')."
+      )
+    self._nvfp4_rdep_contract_validated = True
 
   @torch.no_grad()
   def refresh_weight_cache(self):
@@ -372,7 +471,15 @@ class MoE(nn.Module):
         del self._W_cache
         self._W_cache = None
 
-      if self._nvfp4_primary and self._W1_packed is not None:
+      if self._nvfp4_primary:
+        if (
+          self._W1_packed is None or self._W1_scale is None or self._W1_gs is None
+          or self._W3_packed is None or self._W3_scale is None or self._W3_gs is None
+          or self._W2_packed is None or self._W2_scale is None or self._W2_gs is None
+        ):
+          raise RuntimeError(
+            "NVFP4 primary mode requires complete W1/W3/W2 packed+scale+global-scale buffers."
+          )
         # Option C: Build cache from NVFP4 buffers directly (no BF16 master)
         self._W_cache = quantize_weights_from_nvfp4(
           self._W1_packed, self._W1_scale, self._W1_gs,
@@ -382,7 +489,13 @@ class MoE(nn.Module):
           profile=self._dtype,
         )
       else:
-        # Standard path: quantize from BF16 parameters
+        if self._dtype == 'nvfp4':
+          raise RuntimeError(
+            "NVFP4 profile requires NVFP4-primary cache refresh from packed buffers. "
+            "BF16 re-quantization fallback is disabled; call set_nvfp4_buffers(...) first."
+          )
+        # Standard path: quantize from BF16 parameters.
+        # This remains valid for pre-NVFP4-primary startup/scratch states.
         self._W_cache = quantize_weights(self.W1, self.W3, self.W2, profile=self._dtype)
 
   def _compute_aux_loss(self, gates: torch.Tensor, expert_ids: torch.Tensor, T: int) -> torch.Tensor:
@@ -428,65 +541,55 @@ class MoE(nn.Module):
     T = X.size(0)
 
     with _nvtx("moe/router"):
-      if self._use_fused_router:
-        if self.training:
-          self._runtime_fused_router_calls += 1
-        # Fused router returns: expert_ids, gates, dispatch_indices, expert_counts
-        # dispatch_indices and expert_counts are computed by the fused kernel
-        # but the actual dispatch is still handled by rdep
-        eid, g, dispatch_indices, expert_counts = self.router(X)
-      else:
-        g, eid = self.router(X)
+      if self.training:
+        self._runtime_fused_router_calls += 1
+      # Fused router returns: expert_ids, gates, expert_counts.
+      # Dispatch itself is handled by RDEP.
+      eid, g, expert_counts = self.router(X, need_counts=self._track_expert_loads)
+      self._validate_router_outputs_once(X, eid, g)
 
     with _nvtx("moe/aux_loss"):
-      # Compute auxiliary loss for load balancing
-      self.last_aux_loss = self._compute_aux_loss(g, eid, T)
-      if self._use_fused_router:
-        with torch.no_grad():
-          # Use expert_counts directly instead of bincount
-          self.last_loads = expert_counts.float()
+      if self._aux_loss_enabled:
+        self.last_aux_loss = self._compute_aux_loss(g, eid, T)
       else:
+        self.last_aux_loss = None
+      if self._track_expert_loads:
         with torch.no_grad():
-          loads = torch.bincount(eid.reshape(-1), minlength=self.router.n_experts).to(torch.float32)
-          self.last_loads = loads
-
-    # Track load imbalance for monitoring (coefficient of variation)
-    with torch.no_grad():
-      loads = self.last_loads
-      if loads is not None and loads.numel() > 0:
-        loads_f = loads.float()
-        _load_mean = loads_f.mean()
-        _load_std = loads_f.std()
-        # Keep CV on-device in forward; convert to Python only at low-frequency logging.
-        self._last_load_cv = _load_std / _load_mean.clamp(min=1.0)
+          self.last_loads = expert_counts
+          self.last_expert_ids = eid
       else:
-        self._last_load_cv = 0.0
+        self.last_loads = None
+        self.last_expert_ids = None
 
     with _nvtx("moe/blockscaled_dispatch"):
-      if self._use_blockscaled:
-        if self._W_cache is None:
-          self.refresh_weight_cache()
+      if self._nvfp4_primary:
+        self._validate_nvfp4_rdep_contract_once()
+      if self._W_cache is None:
+        self.refresh_weight_cache()
 
-        # NVFP4 primary mode: transiently populate W1/W3/W2 data from NVFP4 buffers
-        # for backward pass (STE: forward uses blockscaled cache, backward uses BF16).
-        # When fused_eco is active, skip this — backward will dequant per-layer on-the-fly
-        # from moe_ref's NVFP4 buffers, avoiding 76 GiB of simultaneous BF16 allocations.
-        if self._nvfp4_primary and self._W1_packed is not None and self._fused_eco is None:
-          from nmoe.moe import dequant_nvfp4_to_bf16_transient
-          gs = self._nvfp4_group_size
-          # W1/W3: HF [E, moe_inter_dim, dim//2] → nmoe [E, dim, moe_inter_dim]
-          self.W1.data = dequant_nvfp4_to_bf16_transient(
-            self._W1_packed, self._W1_scale, self._W1_gs, gs, transpose=True)
-          self.W3.data = dequant_nvfp4_to_bf16_transient(
-            self._W3_packed, self._W3_scale, self._W3_gs, gs, transpose=True)
-          # W2: HF [E, dim, moe_inter_dim//2] → nmoe [E, moe_inter_dim, dim]
-          self.W2.data = dequant_nvfp4_to_bf16_transient(
-            self._W2_packed, self._W2_scale, self._W2_gs, gs, transpose=True)
+      # Production policy: never materialize full BF16 expert weights from NVFP4
+      # in forward. NVFP4 primary mode requires fused ECO attachment.
+      if (
+        self._nvfp4_primary
+        and self._fused_eco is None
+        and (
+          self._W1_packed is not None
+          or self._W3_packed is not None
+          or self._W2_packed is not None
+        )
+      ):
+        self._runtime_nvfp4_forward_bf16_materialization_fallback_calls += 1
+        raise RuntimeError(
+          "NVFP4 forward BF16 materialization fallback is forbidden. "
+          "Expected fused ECO attachment for NVFP4 primary mode "
+          "(set eco_fused_backward=true and load a valid NVFP4 checkpoint)."
+        )
 
-        out = self._rdep.moe_blockscaled(X.bfloat16(), eid, g, self.W1, self.W3, self.W2, self._W_cache,
-                                          fused_eco=self._fused_eco, moe_ref=self)
-      else:
-        out = self._rdep.moe_bf16(X.bfloat16(), eid, g, self.W1, self.W3, self.W2)
+      # _MoEBlockscaledFused.forward handles BF16 cast/contiguity.
+      out = self._rdep.moe_blockscaled(
+        X, eid, g, self.W1, self.W3, self.W2, self._W_cache,
+        fused_eco=self._fused_eco, moe_ref=self,
+      )
 
     if self._shared:
       with _nvtx("moe/shared_expert"):
@@ -501,12 +604,16 @@ class MoE(nn.Module):
       "rdep_dispatch_blockscaled_hybrid_calls": int(self._runtime_rdep_dispatch_blockscaled_hybrid_calls),
       "rdep_dispatch_bf16_ipc_calls": int(self._runtime_rdep_dispatch_bf16_ipc_calls),
       "rdep_dispatch_bf16_hybrid_calls": int(self._runtime_rdep_dispatch_bf16_hybrid_calls),
+      "nvfp4_forward_bf16_materialization_fallback_calls": int(
+        self._runtime_nvfp4_forward_bf16_materialization_fallback_calls
+      ),
     }
     self._runtime_fused_router_calls = 0
     self._runtime_rdep_dispatch_blockscaled_ipc_calls = 0
     self._runtime_rdep_dispatch_blockscaled_hybrid_calls = 0
     self._runtime_rdep_dispatch_bf16_ipc_calls = 0
     self._runtime_rdep_dispatch_bf16_hybrid_calls = 0
+    self._runtime_nvfp4_forward_bf16_materialization_fallback_calls = 0
     return counters
 
 
@@ -571,14 +678,20 @@ class TransformerBlock(nn.Module):
       try:
         sig = inspect.signature(self.attn.forward)
         self._attn_has_cu_seqlens = 'cu_seqlens' in sig.parameters
-      except (ValueError, TypeError):
-        self._attn_has_cu_seqlens = False
-    return self._attn_has_cu_seqlens
+      except (ValueError, TypeError) as e:
+        raise RuntimeError(
+          f"Unable to inspect {type(self.attn).__name__}.forward for cu_seqlens support."
+        ) from e
+    return bool(self._attn_has_cu_seqlens)
 
   @record_function("block")
   def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
               cu_seqlens: list[torch.Tensor] | None = None) -> torch.Tensor:
-    pass_cu = cu_seqlens is not None and self._attn_supports_cu_seqlens()
+    pass_cu = cu_seqlens is not None
+    if pass_cu and not self._attn_supports_cu_seqlens():
+      raise RuntimeError(
+        f"{type(self.attn).__name__} does not support packed cu_seqlens inputs."
+      )
 
     if self._use_gradient_checkpointing:
       # Checkpoint both attention and FFN/MoE for memory efficiency
@@ -630,13 +743,22 @@ class Transformer(nn.Module):
   def __init__(self, config: Config, use_fused_router: bool = True):
     super().__init__()
     self.config = config
+    has_moe = config.n_layers > config.n_dense_layers
+    if has_moe and not use_fused_router:
+      raise RuntimeError(
+        "use_fused_router=false is disabled for MoE models. "
+        "Set use_fused_router=true."
+      )
     self._use_fused_router = use_fused_router
     self._gradient_checkpointing_kwargs = {"use_reentrant": False}  # Default kwargs
-    ep_size = getattr(config, 'ep_size', 1)
-    if ep_size <= 1:
+    ep_size_cfg = getattr(config, 'ep_size', None)
+    if ep_size_cfg is None:
       # Backward compat: if no ep_size configured, use world_size (EP = world)
       ep_size = dist.get_world_size() if dist.is_initialized() else 1
-    has_moe = config.n_layers > config.n_dense_layers
+    else:
+      ep_size = int(ep_size_cfg)
+      if ep_size < 1:
+        raise ValueError(f"ep_size must be >= 1, got {ep_size}.")
     rdep: Rdep | None = _create_rdep(config, ep_size) if has_moe else None
     self.embedding = nn.Embedding(config.vocab_size, config.dim, dtype=torch.bfloat16)
     self.rope = RotaryEmbedding(
@@ -659,11 +781,15 @@ class Transformer(nn.Module):
       )
       for layer_id in range(config.n_layers)
     ])
+    self._moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
     self.norm = RMSNorm(config.dim, config.rms_norm_eps)
     self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False, dtype=torch.bfloat16)
     # μP scaling (validated via proxy sweep - both scales needed for proper gradient flow)
     self.mup_scale_factor = 10.667
     self.logits_scale_factor = 0.125
+    self._router_bias_update_enabled = float(getattr(config, "router_bias_update_rate", 0.0)) > 0.0
+    self._runtime_nvfp4_checkpoint_direct_expert_loads = 0
+    self._runtime_nvfp4_checkpoint_non_direct_expert_loads = 0
 
   def init_weights(self):
     nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
@@ -722,10 +848,8 @@ class Transformer(nn.Module):
   def total_dropped_tokens(self) -> int:
     """Sum of dropped tokens across all MoE layers in the last forward pass."""
     total = 0
-    for block in self.blocks:
-      ffn = getattr(block, 'ffn', None)
-      if ffn is not None and hasattr(ffn, '_last_dropped_count'):
-        total += ffn._last_dropped_count
+    for ffn in self._moe_layers:
+      total += getattr(ffn, '_last_dropped_count', 0)
     return total
 
   @property
@@ -736,25 +860,18 @@ class Transformer(nn.Module):
     significantly more tokens than others, wasting compute and degrading
     model quality. Values near 0 indicate perfectly balanced routing.
     """
-    cvs: list[float] = []
     cv_tensors: list[torch.Tensor] = []
-    for block in self.blocks:
-      ffn = getattr(block, 'ffn', None)
-      if ffn is not None and hasattr(ffn, '_last_load_cv'):
-        cv = ffn._last_load_cv
-        if torch.is_tensor(cv):
-          cv_tensors.append(cv.detach())
-        else:
-          cvs.append(float(cv))
-    total = len(cvs) + len(cv_tensors)
-    if total == 0:
-      return 0.0
+    for ffn in self._moe_layers:
+      loads = ffn.last_loads
+      if loads is None or loads.numel() == 0:
+        continue
+      loads_f = loads.float()
+      load_mean = loads_f.mean()
+      load_std = loads_f.std()
+      cv_tensors.append((load_std / load_mean.clamp_min(1e-12)).detach())
     if not cv_tensors:
-      return sum(cvs) / total
-    tensor_sum = torch.stack([t.float() for t in cv_tensors]).sum()
-    if cvs:
-      tensor_sum = tensor_sum + float(sum(cvs))
-    return float((tensor_sum / total).item())
+      return 0.0
+    return float(torch.stack([t.float() for t in cv_tensors]).mean().item())
 
   def consume_runtime_counters(self) -> dict[str, float]:
     """Return and reset per-step runtime counters across all MoE layers."""
@@ -764,14 +881,29 @@ class Transformer(nn.Module):
       "rdep_dispatch_blockscaled_hybrid_calls": 0.0,
       "rdep_dispatch_bf16_ipc_calls": 0.0,
       "rdep_dispatch_bf16_hybrid_calls": 0.0,
+      "nvfp4_forward_bf16_materialization_fallback_calls": 0.0,
+      "nvfp4_checkpoint_direct_expert_loads": 0.0,
+      "nvfp4_checkpoint_non_direct_expert_loads": 0.0,
     }
-    for block in self.blocks:
-      ffn = getattr(block, 'ffn', None)
-      if ffn is None or not hasattr(ffn, 'consume_runtime_counters'):
-        continue
+    for ffn in self._moe_layers:
       layer_counts = ffn.consume_runtime_counters()
-      for key in totals:
+      for key in (
+        "fused_router_calls",
+        "rdep_dispatch_blockscaled_ipc_calls",
+        "rdep_dispatch_blockscaled_hybrid_calls",
+        "rdep_dispatch_bf16_ipc_calls",
+        "rdep_dispatch_bf16_hybrid_calls",
+        "nvfp4_forward_bf16_materialization_fallback_calls",
+      ):
         totals[key] += float(layer_counts.get(key, 0))
+    totals["nvfp4_checkpoint_direct_expert_loads"] = float(
+      self._runtime_nvfp4_checkpoint_direct_expert_loads
+    )
+    totals["nvfp4_checkpoint_non_direct_expert_loads"] = float(
+      self._runtime_nvfp4_checkpoint_non_direct_expert_loads
+    )
+    self._runtime_nvfp4_checkpoint_direct_expert_loads = 0
+    self._runtime_nvfp4_checkpoint_non_direct_expert_loads = 0
     return totals
 
   @record_function("transformer")
@@ -801,17 +933,51 @@ class Transformer(nn.Module):
         #   positions 300-699 -> 0-399   (doc 1, subtract 300)
         #   positions 700+    -> 0-3395  (doc 2, subtract 700)
         bsz = tokens.size(0)
-        position_ids = torch.arange(seqlen, device=tokens.device).unsqueeze(0).expand(bsz, -1)
+        base_pos = torch.arange(seqlen, device=tokens.device, dtype=torch.int32)
         # Build doc_starts: for each position, the cu_seqlen boundary that starts its document.
         # Use searchsorted to find which document each position belongs to, then look up its start.
-        doc_starts = torch.zeros(bsz, seqlen, dtype=torch.long, device=tokens.device)
+        doc_starts = torch.zeros(bsz, seqlen, dtype=torch.int32, device=tokens.device)
+        cu_seqlens_cuda: list[torch.Tensor] = [None] * bsz
         for b in range(bsz):
-          cu = cu_seqlens[b].to(dtype=torch.long, device=tokens.device)
+          cu_in = cu_seqlens[b]
+          if cu_in.ndim != 1 or cu_in.numel() < 1:
+            raise RuntimeError(f"cu_seqlens[{b}] must be 1D with at least one element.")
+          # Keep cu_seqlens validation on-device to avoid GPU->CPU->GPU round-trips.
+          cu = cu_in
+          if cu.device != tokens.device or cu.dtype != torch.int32:
+            cu = cu.to(device=tokens.device, dtype=torch.int32, non_blocking=True)
+          if not cu.is_contiguous():
+            cu = cu.contiguous()
+          cu_seqlens_cuda[b] = cu
+          if _VALIDATE_CU_SEQLENS:
+            if bool((cu[0] != 0).item()):
+              raise RuntimeError(f"cu_seqlens[{b}] must start at 0.")
+            total_tokens = int(cu[-1].item())
+            if total_tokens < 0 or total_tokens > seqlen:
+              raise RuntimeError(
+                f"cu_seqlens[{b}] has invalid total_tokens={total_tokens} for seqlen={seqlen}."
+              )
+            if cu.numel() == 1:
+              if total_tokens != 0:
+                raise RuntimeError(
+                  f"cu_seqlens[{b}] must include an end boundary when total_tokens > 0."
+                )
+              doc_starts[b].zero_()
+              continue
+            if cu.numel() > 1:
+              deltas = cu[1:] - cu[:-1]
+              if bool(torch.any(deltas < 0).item()):
+                raise RuntimeError(f"cu_seqlens[{b}] must be nondecreasing.")
+          elif cu.numel() == 1:
+            # Fast path: one boundary means no packed docs in this sequence.
+            doc_starts[b].zero_()
+            continue
           # searchsorted(cu, positions, right=True) - 1 gives the document index for each position
-          doc_idx = torch.searchsorted(cu, position_ids[b], right=True) - 1
+          doc_idx = torch.searchsorted(cu, base_pos, right=True) - 1
           doc_idx = doc_idx.clamp(min=0, max=cu.shape[0] - 2)
           doc_starts[b] = cu[doc_idx]
-        position_ids = position_ids - doc_starts
+        cu_seqlens = cu_seqlens_cuda
+        position_ids = (base_pos.unsqueeze(0) - doc_starts).to(torch.long)
         # Index into precomputed RoPE table: [B, S] -> [B, S, head_dim//2]
         cos = self.rope.cos[position_ids]
         sin = self.rope.sin[position_ids]
@@ -823,18 +989,19 @@ class Transformer(nn.Module):
       for block in self.blocks:
         x = block(x, cos, sin, cu_seqlens=cu_seqlens)
     with torch.no_grad():
-      moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
-      if moe_layers:
-        loads = torch.stack([m.last_loads for m in moe_layers], dim=0)
-        if dist.is_available() and dist.is_initialized():
-          # Use EP group for load balancing AllReduce (not WORLD).
-          # Load counts should be aggregated across EP ranks that share
-          # the same expert partition, not across DP replicas.
-          ep_group = _get_ep_group()
-          dist.all_reduce(loads, op=dist.ReduceOp.SUM, group=ep_group)
-        loads = loads / loads.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        for m, l in zip(moe_layers, loads):
-          m.last_loads = l
+      if self.training and self._router_bias_update_enabled and self._moe_layers:
+        if _ROUTER_LOADS_EP_ALLREDUCE:
+          layer_loads = [m.last_loads for m in self._moe_layers]
+          if all(l is not None for l in layer_loads):
+            loads = torch.stack(layer_loads, dim=0).to(torch.float32)
+            if dist.is_available() and dist.is_initialized():
+              # Optional path: aggregate counts over EP ranks for monitoring only.
+              ep_group = _get_ep_group()
+              if ep_group is not None:
+                dist.all_reduce(loads, op=dist.ReduceOp.SUM, group=ep_group)
+            loads = loads / loads.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            for m, l in zip(self._moe_layers, loads):
+              m.last_loads = l
     with record_function("norm_f"), _nvtx("model/norm_f"):
       x = self.norm(x)
     # Dynamic amax scaling handles range - no clamp needed (TorchTitan/Megatron pattern)
@@ -865,12 +1032,11 @@ class Transformer(nn.Module):
         >>> total_loss = loss + aux_loss  # aux_loss already scaled by alpha
         >>> total_loss.backward()
     """
-    moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
-    if not moe_layers:
+    if not self._moe_layers:
       return torch.tensor(0.0, device=self.embedding.weight.device)
 
     aux_losses = []
-    for moe in moe_layers:
+    for moe in self._moe_layers:
       if hasattr(moe, 'last_aux_loss') and moe.last_aux_loss is not None:
         aux_losses.append(moe.last_aux_loss)
 
@@ -888,15 +1054,17 @@ class Transformer(nn.Module):
           - 'mean_load': Mean load across all experts
           - 'load_imbalance': Coefficient of variation (std/mean)
     """
-    moe_layers = [blk.ffn for blk in self.blocks if isinstance(getattr(blk, 'ffn', None), MoE)]
-    if not moe_layers:
+    if not self._moe_layers:
       return {'loads': [], 'mean_load': 0.0, 'load_imbalance': 0.0}
 
-    loads = [moe.last_loads for moe in moe_layers if hasattr(moe, 'last_loads')]
+    loads = [
+      moe.last_loads for moe in self._moe_layers
+      if hasattr(moe, 'last_loads') and moe.last_loads is not None
+    ]
     if not loads:
       return {'loads': [], 'mean_load': 0.0, 'load_imbalance': 0.0}
 
-    all_loads = torch.stack(loads)  # [n_moe_layers, n_experts]
+    all_loads = torch.stack(loads).to(torch.float32)  # [n_moe_layers, n_experts]
     mean_load = all_loads.mean().item()
     std_load = all_loads.std().item()
     load_imbalance = std_load / mean_load if mean_load > 0 else 0.0

@@ -20,20 +20,35 @@ Performance:
 
 import os
 import ctypes
-from contextlib import contextmanager
+import stat
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 
 
-@contextmanager
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) in ("1", "true", "True")
+
+
+_NVTX_ENABLED = (
+    _env_flag("NMOE_NVTX", "0")
+    and torch.cuda.is_available()
+    and hasattr(torch.cuda, "nvtx")
+    and hasattr(torch.cuda.nvtx, "range_push")
+)
+_AUX_LOSS_ALLOW_STANDALONE = _env_flag("NMOE_AUX_LOSS_ALLOW_STANDALONE", "0")
+_AUX_LOSS_STREAM_CACHE_LIMIT = max(1, int(os.getenv("NMOE_AUX_LOSS_STREAM_CACHE_LIMIT", "8")))
+_EXPECTED_RDEP_ABI = 1
+_AUX_LOSS_REQUIRED_CAPS = (1 << 0) | (1 << 1)  # internal reset + no two-kernel fallback
+_NULL_NVTX_CTX = nullcontext()
+
+
 def _nvtx(name: str):
     """Emit an NVTX range visible in Nsight Systems / nvprof."""
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+    if _NVTX_ENABLED:
+        return torch.cuda.nvtx.range(name)
+    return _NULL_NVTX_CTX
 
 # ---------------------------------------------------------------------------
 # Load the fused aux loss CUDA extension.
@@ -41,6 +56,71 @@ def _nvtx(name: str):
 # ---------------------------------------------------------------------------
 
 _aux_loss_lib: Optional[ctypes.CDLL] = None
+_aux_loss_sig_initialized: bool = False
+
+
+def _init_aux_loss_signatures(lib: ctypes.CDLL) -> None:
+    """Initialize ctypes signatures once to avoid per-call overhead."""
+    global _aux_loss_sig_initialized
+    if _aux_loss_sig_initialized:
+        return
+
+    # Keep full aux-loss symbol coverage required by runtime paths.
+    _ = lib.fused_aux_loss_f32
+    _ = lib.fused_aux_loss_bf16
+    _ = lib.fused_aux_loss_f16
+    _ = lib.fused_aux_loss_single_f32
+    _ = lib.fused_aux_loss_single_bf16
+    _ = lib.fused_aux_loss_single_f16
+    _ = lib.fused_aux_loss_single_caps
+
+    sig = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_float,
+        ctypes.c_void_p,
+    ]
+
+    lib.fused_aux_loss_single_f32.restype = ctypes.c_int
+    lib.fused_aux_loss_single_f32.argtypes = sig
+    lib.fused_aux_loss_single_bf16.restype = ctypes.c_int
+    lib.fused_aux_loss_single_bf16.argtypes = sig
+    lib.fused_aux_loss_single_f16.restype = ctypes.c_int
+    lib.fused_aux_loss_single_f16.argtypes = sig
+    lib.fused_aux_loss_single_caps.restype = ctypes.c_int
+    lib.fused_aux_loss_single_caps.argtypes = []
+
+    caps = int(lib.fused_aux_loss_single_caps())
+    missing = _AUX_LOSS_REQUIRED_CAPS & (~caps)
+    if missing != 0:
+        raise RuntimeError(
+            "Loaded aux-loss kernel does not satisfy required no-fallback capabilities "
+            f"(required=0x{_AUX_LOSS_REQUIRED_CAPS:x}, got=0x{caps:x}). Rebuild nmoe/csrc."
+        )
+
+    _aux_loss_sig_initialized = True
+
+
+def _resolve_primary_rdep_path() -> str:
+    from nmoe.csrc import rdep as _rdep_mod  # type: ignore
+
+    path = getattr(_rdep_mod, "__file__", None)
+    if not (isinstance(path, str) and path):
+        raise RuntimeError("nmoe.csrc.rdep did not expose a valid extension path.")
+    abi_fn = getattr(_rdep_mod, "abi_version", None)
+    if not callable(abi_fn):
+        raise RuntimeError("nmoe.csrc.rdep missing abi_version(); rebuild extension.")
+    abi = int(abi_fn())
+    if abi != _EXPECTED_RDEP_ABI:
+        raise RuntimeError(
+            f"nmoe.csrc.rdep ABI mismatch: expected {_EXPECTED_RDEP_ABI}, got {abi}. Rebuild extension."
+        )
+    real = os.path.realpath(path)
+    mode = os.stat(real).st_mode
+    if (mode & stat.S_IWGRP) or (mode & stat.S_IWOTH):
+        raise RuntimeError(f"Refusing writable extension path: {real}")
+    return real
 
 
 def _load_aux_loss_lib() -> ctypes.CDLL:
@@ -54,25 +134,27 @@ def _load_aux_loss_lib() -> ctypes.CDLL:
     if _aux_loss_lib is not None:
         return _aux_loss_lib
 
-    _this_dir = os.path.dirname(os.path.abspath(__file__))
-    _candidates = [
-        # Primary: bundled with rdep extension
-        os.path.join(_this_dir, "csrc", "rdep.cpython-313-x86_64-linux-gnu.so"),
-        os.path.join(_this_dir, "csrc", "rdep.cpython-314-x86_64-linux-gnu.so"),
-        # Standalone builds
-        os.path.join(_this_dir, "csrc", "aux_loss.so"),
-        os.path.join(_this_dir, "csrc", "libaux_loss.so"),
-    ]
+    _candidates: list[str] = []
+    try:
+        _candidates.append(_resolve_primary_rdep_path())
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to resolve primary nmoe.csrc.rdep extension for fused aux loss."
+        ) from e
+    # Standalone aux-loss libs are forbidden in production to avoid stale-binary drift.
+    if _AUX_LOSS_ALLOW_STANDALONE:
+        raise RuntimeError(
+            "NMOE_AUX_LOSS_ALLOW_STANDALONE=1 is forbidden in production. "
+            "Only the loaded nmoe.csrc.rdep extension may provide fused aux-loss kernels."
+        )
 
     errors: list[str] = []
     for path in _candidates:
         if os.path.isfile(path):
             try:
-                lib = ctypes.CDLL(path)
-                # Verify the required symbols exist
-                _ = lib.fused_aux_loss_f32
-                _ = lib.fused_aux_loss_bf16
-                _ = lib.fused_aux_loss_single_f32
+                mode = getattr(os, "RTLD_NOW", 0) | getattr(ctypes, "RTLD_LOCAL", 0)
+                lib = ctypes.CDLL(path, mode=mode) if mode else ctypes.CDLL(path)
+                _init_aux_loss_signatures(lib)
                 _aux_loss_lib = lib
                 return lib
             except (OSError, AttributeError) as exc:
@@ -90,13 +172,20 @@ def _load_aux_loss_lib() -> ctypes.CDLL:
 
 
 # Persistent buffers to avoid allocation overhead on every call.
-# Keyed by (device, E) to support multiple expert counts and devices.
+# Keyed by (device, E, stream_id) to avoid cross-stream races.
 _buffer_cache: dict[tuple, dict] = {}
 
 
-def _get_buffers(device: torch.device, E: int) -> dict:
+def _prune_buffer_cache(device: torch.device, limit: int) -> None:
+    dev_keys = [k for k in _buffer_cache.keys() if isinstance(k, tuple) and len(k) >= 1 and k[0] == device]
+    while len(dev_keys) > limit:
+        _buffer_cache.pop(dev_keys[0], None)
+        dev_keys.pop(0)
+
+
+def _get_buffers(device: torch.device, E: int, stream_id: int) -> dict:
     """Get or create cached buffers for the given device and expert count."""
-    key = (device, E)
+    key = (device, E, int(stream_id))
     if key not in _buffer_cache:
         _buffer_cache[key] = {
             "f_accum": torch.zeros(E, dtype=torch.float32, device=device),
@@ -104,6 +193,8 @@ def _get_buffers(device: torch.device, E: int) -> dict:
             "loss_out": torch.zeros(1, dtype=torch.float32, device=device),
             "block_done": torch.zeros(1, dtype=torch.int32, device=device),
         }
+        _prune_buffer_cache(device, _AUX_LOSS_STREAM_CACHE_LIMIT)
+    # Buffers are stream-affine by key, so we avoid per-call record_stream overhead.
     return _buffer_cache[key]
 
 
@@ -138,97 +229,66 @@ def fused_aux_loss(
         if alpha == 0.0:
             return gates.new_zeros((), dtype=torch.float32)
 
+        if E <= 0:
+            raise RuntimeError(f"E must be > 0 for fused_aux_loss, got E={E}")
+        if not expert_ids.is_cuda or not gates.is_cuda:
+            raise RuntimeError("fused_aux_loss requires CUDA tensors.")
+        if expert_ids.device != gates.device:
+            raise RuntimeError(
+                f"expert_ids and gates must be on the same device (got {expert_ids.device} vs {gates.device})"
+            )
+        if expert_ids.dtype != torch.int32:
+            raise RuntimeError(f"expert_ids must be int32 on production no-fallback path, got {expert_ids.dtype}")
+        if expert_ids.numel() != gates.numel():
+            raise RuntimeError(
+                f"expert_ids/gates element count mismatch: {expert_ids.numel()} vs {gates.numel()}"
+            )
+        if not expert_ids.is_contiguous():
+            raise RuntimeError("expert_ids must be contiguous on production no-fallback path.")
+        if not gates.is_contiguous():
+            raise RuntimeError("gates must be contiguous on production no-fallback path.")
+
         lib = _load_aux_loss_lib()
 
         device = expert_ids.device
         TK = expert_ids.numel()
+        stream_obj = torch.cuda.current_stream(device)
+        stream = int(stream_obj.cuda_stream)
 
-        # Get cached buffers and zero them
-        buffers = _get_buffers(device, E)
+        # Get cached buffers. The CUDA entrypoint resets accumulators internally.
+        buffers = _get_buffers(device, E, stream)
         f_accum = buffers["f_accum"]
         P_accum = buffers["P_accum"]
         loss_out = buffers["loss_out"]
         block_done = buffers["block_done"]
 
-        # Zero the accumulators
-        f_accum.zero_()
-        P_accum.zero_()
-        block_done.zero_()
-
-        # Flatten inputs
-        expert_ids_flat = expert_ids.reshape(-1).contiguous()
-        gates_flat = gates.reshape(-1).contiguous()
-
-        # Get CUDA stream
-        stream = torch.cuda.current_stream(device).cuda_stream
+        # Flatten contiguous inputs without materializing copies.
+        expert_ids_flat = expert_ids.view(-1)
+        gates_flat = gates.view(-1)
 
         # Determine which kernel to use based on gates dtype
         # We use the single-kernel variant for better performance when E is small
         if gates.dtype == torch.float32:
-            lib.fused_aux_loss_single_f32.restype = ctypes.c_int
-            lib.fused_aux_loss_single_f32.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_int, ctypes.c_int, ctypes.c_float,
-                ctypes.c_void_p,
-            ]
-            err = lib.fused_aux_loss_single_f32(
-                ctypes.c_void_p(expert_ids_flat.data_ptr()),
-                ctypes.c_void_p(gates_flat.data_ptr()),
-                ctypes.c_void_p(f_accum.data_ptr()),
-                ctypes.c_void_p(P_accum.data_ptr()),
-                ctypes.c_void_p(loss_out.data_ptr()),
-                ctypes.c_void_p(block_done.data_ptr()),
-                ctypes.c_int(E),
-                ctypes.c_int(TK),
-                ctypes.c_float(alpha),
-                ctypes.c_void_p(stream),
-            )
+            fn = lib.fused_aux_loss_single_f32
         elif gates.dtype == torch.bfloat16:
-            lib.fused_aux_loss_single_bf16.restype = ctypes.c_int
-            lib.fused_aux_loss_single_bf16.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_int, ctypes.c_int, ctypes.c_float,
-                ctypes.c_void_p,
-            ]
-            err = lib.fused_aux_loss_single_bf16(
-                ctypes.c_void_p(expert_ids_flat.data_ptr()),
-                ctypes.c_void_p(gates_flat.data_ptr()),
-                ctypes.c_void_p(f_accum.data_ptr()),
-                ctypes.c_void_p(P_accum.data_ptr()),
-                ctypes.c_void_p(loss_out.data_ptr()),
-                ctypes.c_void_p(block_done.data_ptr()),
-                ctypes.c_int(E),
-                ctypes.c_int(TK),
-                ctypes.c_float(alpha),
-                ctypes.c_void_p(stream),
-            )
+            fn = lib.fused_aux_loss_single_bf16
         elif gates.dtype == torch.float16:
-            lib.fused_aux_loss_single_f16.restype = ctypes.c_int
-            lib.fused_aux_loss_single_f16.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_int, ctypes.c_int, ctypes.c_float,
-                ctypes.c_void_p,
-            ]
-            err = lib.fused_aux_loss_single_f16(
-                ctypes.c_void_p(expert_ids_flat.data_ptr()),
-                ctypes.c_void_p(gates_flat.data_ptr()),
-                ctypes.c_void_p(f_accum.data_ptr()),
-                ctypes.c_void_p(P_accum.data_ptr()),
-                ctypes.c_void_p(loss_out.data_ptr()),
-                ctypes.c_void_p(block_done.data_ptr()),
-                ctypes.c_int(E),
-                ctypes.c_int(TK),
-                ctypes.c_float(alpha),
-                ctypes.c_void_p(stream),
-            )
+            fn = lib.fused_aux_loss_single_f16
         else:
             raise ValueError(f"Unsupported gates dtype: {gates.dtype}")
+
+        err = fn(
+            expert_ids_flat.data_ptr(),
+            gates_flat.data_ptr(),
+            f_accum.data_ptr(),
+            P_accum.data_ptr(),
+            loss_out.data_ptr(),
+            block_done.data_ptr(),
+            E,
+            TK,
+            alpha,
+            stream,
+        )
 
         if err != 0:
             raise RuntimeError(f"fused_aux_loss CUDA kernel returned error {err}")

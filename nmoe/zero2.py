@@ -16,19 +16,30 @@ import torch.distributed as dist
 from nmoe.nccl_watchdog import get_watchdog
 
 _log = logging.getLogger(__name__)
+_NVTX_ENABLED = (
+    os.getenv('NMOE_NVTX', '0') in ('1', 'true', 'True')
+    and torch.cuda.is_available()
+    and hasattr(torch.cuda, 'nvtx')
+    and hasattr(torch.cuda.nvtx, 'range')
+)
+_NULL_NVTX_CTX = nullcontext()
 
 
 def _nvtx(tag: str):
-    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
-        return nullcontext()
-    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+    if _NVTX_ENABLED:
         return torch.cuda.nvtx.range(tag)
-    return nullcontext()
+    return _NULL_NVTX_CTX
 
 
 # Check for multi-tensor copy op (available in PyTorch 2.0+).
 # This allows batching ~100 copy kernels into a single launch.
 _HAS_FOREACH_COPY = hasattr(torch, '_foreach_copy_')
+if not _HAS_FOREACH_COPY:
+  raise ImportError(
+    "ZeRO-2 requires torch._foreach_copy_ for production performance. "
+    "Upgrade PyTorch to a version that provides this API."
+  )
+_TIME_CTX = None
 
 # ---------------------------------------------------------------------------
 # Fused CUDA kernel for dense AdamW (direct import, no fallback)
@@ -39,6 +50,88 @@ _fused_adamw_fns = {
     torch.float32: _C.fused_adamw_step_fp32,
     torch.bfloat16: _C.fused_adamw_step_bf16,
 }
+
+
+def _resolve_time_ctx():
+  global _TIME_CTX
+  if _TIME_CTX is not None:
+    return _TIME_CTX
+  timers_on = os.getenv('NMOE_TIMERS', '1') not in ('0', 'false', 'False')
+  if not timers_on:
+    _TIME_CTX = lambda _tag: nullcontext()
+    return _TIME_CTX
+  try:
+    from nmoe.metrics import cuda_time as _cuda_time  # local import to avoid hard dependency
+    _TIME_CTX = _cuda_time
+  except Exception:
+    _log.debug("cuda_time import failed, CUDA timers disabled for ZeRO-2", exc_info=True)
+    _TIME_CTX = lambda _tag: nullcontext()
+  return _TIME_CTX
+
+
+def _is_dist_ready() -> bool:
+  return dist.is_available() and dist.is_initialized()
+
+
+def _require_dist_initialized_for_zero2(pg: dist.ProcessGroup | None) -> None:
+  """Fail fast when ZeRO-2 would silently downshift to world=1."""
+  if _is_dist_ready():
+    return
+  dist_hint_names = (
+    "WORLD_SIZE",
+    "SLURM_NTASKS",
+    "OMPI_COMM_WORLD_SIZE",
+    "PMI_SIZE",
+    "MV2_COMM_WORLD_SIZE",
+    "RANK",
+    "LOCAL_RANK",
+    "SLURM_PROCID",
+    "OMPI_COMM_WORLD_RANK",
+    "PMI_RANK",
+    "MV2_COMM_WORLD_RANK",
+  )
+  hints: dict[str, int] = {}
+  for name in dist_hint_names:
+    raw = os.getenv(name)
+    if raw is None:
+      continue
+    try:
+      hints[name] = int(raw)
+    except ValueError:
+      raise RuntimeError(f"Invalid {name} value: {raw!r}") from None
+
+  hinted_distributed = False
+  for name, value in hints.items():
+    if "SIZE" in name or "NTASKS" in name:
+      hinted_distributed = hinted_distributed or (value > 1)
+    else:
+      hinted_distributed = hinted_distributed or (value > 0)
+  if pg is not None:
+    raise RuntimeError("ZeRO-2 received a process group but torch.distributed is not initialized.")
+  if hinted_distributed:
+    raise RuntimeError(
+      "ZeRO-2 requires initialized torch.distributed for distributed launch hints: "
+      + ", ".join(f"{k}={v}" for k, v in sorted(hints.items()))
+    )
+
+
+def _group_by_dtype_cached(group: dict, params: list[torch.nn.Parameter]) -> dict[torch.dtype, list[torch.nn.Parameter]]:
+  if not params:
+    return {}
+  token = (len(params), id(params[0]), id(params[-1]))
+  cached = group.get('_zero2_by_dtype')
+  if cached is not None and cached.get('token') == token:
+    return cached['buckets']
+  by_dtype: dict[torch.dtype, list[torch.nn.Parameter]] = {}
+  for p in params:
+    if p.dtype not in by_dtype:
+      by_dtype[p.dtype] = []
+    by_dtype[p.dtype].append(p)
+  group['_zero2_by_dtype'] = {
+    'token': token,
+    'buckets': by_dtype,
+  }
+  return by_dtype
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -176,18 +269,15 @@ def eager_init(
   Re-entrancy safe: if buffers are already initialized, this is a no-op.
   """
   with _nvtx("zero2/eager_init"):
-    world = dist.get_world_size(pg) if (dist.is_available() and dist.is_initialized()) else 1
-    rank = dist.get_rank(pg) if (dist.is_available() and dist.is_initialized()) else 0
+    _require_dist_initialized_for_zero2(pg)
+    world = dist.get_world_size(pg) if _is_dist_ready() else 1
+    rank = dist.get_rank(pg) if _is_dist_ready() else 0
 
     for group in param_groups:
       params = list(group['params'])
       if not params:
         continue
-      by_dtype: dict[torch.dtype, list[torch.nn.Parameter]] = {}
-      for p in params:
-        if p.dtype not in by_dtype:
-          by_dtype[p.dtype] = []
-        by_dtype[p.dtype].append(p)
+      by_dtype = _group_by_dtype_cached(group, params)
       for dtype, group_params in by_dtype.items():
         _get_or_init_flat_group(group, params=group_params, rank=rank, world=world, dtype=dtype)
 
@@ -212,20 +302,11 @@ def step_dense_adamw(
   Single GPU: just runs AdamW on full params (no RS/AG).
   Multi-GPU: full ZeRO-2 with sharding.
   """
-  timers_on = os.getenv('NMOE_TIMERS', '1') not in ('0', 'false', 'False')
-  if timers_on:
-    try:
-      from nmoe.metrics import cuda_time as _cuda_time  # local import to avoid hard dependency
-      time_ctx = _cuda_time
-    except Exception:
-      _log.debug("cuda_time import failed, CUDA timers disabled for ZeRO-2", exc_info=True)
-      time_ctx = lambda _tag: nullcontext()
-  else:
-    time_ctx = lambda _tag: nullcontext()
+  time_ctx = _resolve_time_ctx()
 
-  world = dist.get_world_size(pg) if (dist.is_available() and dist.is_initialized()) else 1
-
-  rank = dist.get_rank(pg) if (dist.is_available() and dist.is_initialized()) else 0
+  _require_dist_initialized_for_zero2(pg)
+  world = dist.get_world_size(pg) if _is_dist_ready() else 1
+  rank = dist.get_rank(pg) if _is_dist_ready() else 0
 
   nccl_wd = get_watchdog()
 
@@ -235,11 +316,7 @@ def step_dense_adamw(
       continue
 
     # Group by dtype
-    by_dtype = {}
-    for p in params:
-      if p.dtype not in by_dtype:
-        by_dtype[p.dtype] = []
-      by_dtype[p.dtype].append(p)
+    by_dtype = _group_by_dtype_cached(group, params)
 
     for dtype, group_params in by_dtype.items():
       flat = _get_or_init_flat_group(group, params=group_params, rank=rank, world=world, dtype=dtype)
@@ -299,19 +376,23 @@ def step_dense_adamw(
       # in-loop drain and the trailing drain after the loop.
       # Uses the fused CUDA kernel (single launch replacing 9 PyTorch kernels).
       _fused_fn = _fused_adamw_fns[dtype]
+      cur_stream = torch.cuda.current_stream()
+      param_elem_size = param_shard.element_size()
+      exp_avg_elem_size = exp_avg.element_size()
+      exp_avg_sq_elem_size = exp_avg_sq.element_size()
 
       def _adamw_chunk(rs_out_buf: torch.Tensor, clen: int, soff: int) -> None:
         with _nvtx("zero2/adamw_kernel"):
           _fused_fn(
-              param_shard.data_ptr() + soff * param_shard.element_size(),
+              param_shard.data_ptr() + soff * param_elem_size,
               rs_out_buf.data_ptr(),
-              exp_avg.data_ptr() + soff * exp_avg.element_size(),
-              exp_avg_sq.data_ptr() + soff * exp_avg_sq.element_size(),
+              exp_avg.data_ptr() + soff * exp_avg_elem_size,
+              exp_avg_sq.data_ptr() + soff * exp_avg_sq_elem_size,
               clen,
               beta1, beta2,
               lr, wd, eps,
               step_size, inv_bc2_sqrt,
-              torch.cuda.current_stream(),
+              cur_stream,
           )
 
       # Precompute flat views of grads (avoid repeated reshape work).
@@ -332,7 +413,7 @@ def step_dense_adamw(
       pending_rs_out = None        # Which rs_out holds the result
       pending_chunk_len = 0
       pending_shard_off = 0
-      chunks = list(range(0, shard_size, shard_chunk))
+      chunks = range(0, shard_size, shard_chunk)
 
       with time_ctx('time_ms/zero2_reduce_scatter'):
         for ci, shard_off in enumerate(chunks):
@@ -384,12 +465,7 @@ def step_dense_adamw(
 
             # Execute all gradient copies in a single batched kernel.
             if dst_slices:
-              if _HAS_FOREACH_COPY:
-                torch._foreach_copy_(dst_slices, src_slices)
-              else:
-                # Fallback for older PyTorch versions (sequential copies).
-                for dst, src in zip(dst_slices, src_slices):
-                  dst.copy_(src)
+              torch._foreach_copy_(dst_slices, src_slices)
 
           # Wait for the PREVIOUS chunk's RS to finish, then apply AdamW.
           if pending_work is not None:

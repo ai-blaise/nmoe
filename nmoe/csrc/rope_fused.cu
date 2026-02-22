@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <climits>
 
 namespace nmoe {
 namespace rope {
@@ -28,6 +29,30 @@ namespace rope {
 // ============================================================================
 
 static constexpr int BLOCK_SIZE = 256;
+
+inline cudaError_t current_device_supports_bf16(bool* supports_out) {
+  if (supports_out == nullptr) return cudaErrorInvalidValue;
+  static thread_local int cached_dev = -2;
+  static thread_local bool cached_support = false;
+  int dev = -1;
+  cudaError_t err = cudaGetDevice(&dev);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  if (dev == cached_dev) {
+    *supports_out = cached_support;
+    return cudaSuccess;
+  }
+  int cc_major = 0;
+  err = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  cached_dev = dev;
+  cached_support = (cc_major >= 8);
+  *supports_out = cached_support;
+  return cudaSuccess;
+}
 
 // ============================================================================
 // Forward kernel — vectorized path (2 elements per thread via bfloat162)
@@ -481,8 +506,8 @@ __global__ void k_fused_rope_backward_partial_scalar(
 // ============================================================================
 //
 // These are the entry points called from Python (via pybind11 in bindings.cpp).
-// They select the vectorized or scalar kernel path based on half_dim alignment
-// and launch with the appropriate grid dimensions.
+// Production path is vectorized-only (bfloat162). Odd half_dim is rejected to
+// avoid silently falling back to scalar kernels on B200 training runs.
 
 extern "C" cudaError_t fused_rope_forward(
     const void* x,           // [total_vecs, head_dim] BF16
@@ -495,33 +520,46 @@ extern "C" cudaError_t fused_rope_forward(
     int head_dim,
     cudaStream_t stream)
 {
-  const int half_dim = head_dim / 2;
-
-  if (total_vecs <= 0 || head_dim <= 0 || half_dim <= 0) {
+  if (total_vecs < 0 || head_dim < 0 || seq_len < 0 || n_heads < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (total_vecs == 0 || head_dim == 0) {
     return cudaSuccess;  // Nothing to do
   }
+  if ((head_dim % 4) != 0 || seq_len <= 0 || n_heads <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (x == nullptr || cos_buf == nullptr || sin_buf == nullptr || out == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  bool supports_bf16 = false;
+  cudaError_t probe = nmoe::rope::current_device_supports_bf16(&supports_bf16);
+  if (probe != cudaSuccess) {
+    return probe;
+  }
+  if (!supports_bf16) {
+    return cudaErrorInvalidDeviceFunction;
+  }
+  const int half_dim = head_dim / 2;
 
   const auto* x_bf16   = static_cast<const __nv_bfloat16*>(x);
   const auto* cos_bf16  = static_cast<const __nv_bfloat16*>(cos_buf);
   const auto* sin_bf16  = static_cast<const __nv_bfloat16*>(sin_buf);
   auto*       out_bf16  = static_cast<__nv_bfloat16*>(out);
 
-  // Use vectorized path if half_dim is even (very common: head_dim is typically
-  // 64, 128, or 192, giving half_dim 32, 64, or 96 — all even).
-  if ((half_dim % 2) == 0) {
-    const int half_dim_pairs = half_dim / 2;
-    const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_forward_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        x_bf16, cos_bf16, sin_bf16, out_bf16,
-        total_vecs, seq_len, n_heads, head_dim, half_dim);
-  } else {
-    const int64_t total_threads = (int64_t)total_vecs * half_dim;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_forward_scalar<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        x_bf16, cos_bf16, sin_bf16, out_bf16,
-        total_vecs, seq_len, n_heads, head_dim, half_dim);
+  const int half_dim_pairs = half_dim / 2;
+  const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
+  if (total_threads <= 0 || total_threads > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
   }
+  const int64_t grid64 = (total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE;
+  if (grid64 <= 0 || grid64 > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
+  }
+  const int grid = static_cast<int>(grid64);
+  nmoe::rope::k_fused_rope_forward_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
+      x_bf16, cos_bf16, sin_bf16, out_bf16,
+      total_vecs, seq_len, n_heads, head_dim, half_dim);
 
   return cudaGetLastError();
 }
@@ -537,31 +575,46 @@ extern "C" cudaError_t fused_rope_backward(
     int head_dim,
     cudaStream_t stream)
 {
-  const int half_dim = head_dim / 2;
-
-  if (total_vecs <= 0 || head_dim <= 0 || half_dim <= 0) {
+  if (total_vecs < 0 || head_dim < 0 || seq_len < 0 || n_heads < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (total_vecs == 0 || head_dim == 0) {
     return cudaSuccess;
   }
+  if ((head_dim % 4) != 0 || seq_len <= 0 || n_heads <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (grad_out == nullptr || cos_buf == nullptr || sin_buf == nullptr || grad_x == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  bool supports_bf16 = false;
+  cudaError_t probe = nmoe::rope::current_device_supports_bf16(&supports_bf16);
+  if (probe != cudaSuccess) {
+    return probe;
+  }
+  if (!supports_bf16) {
+    return cudaErrorInvalidDeviceFunction;
+  }
+  const int half_dim = head_dim / 2;
 
   const auto* go_bf16  = static_cast<const __nv_bfloat16*>(grad_out);
   const auto* cos_bf16 = static_cast<const __nv_bfloat16*>(cos_buf);
   const auto* sin_bf16 = static_cast<const __nv_bfloat16*>(sin_buf);
   auto*       gx_bf16  = static_cast<__nv_bfloat16*>(grad_x);
 
-  if ((half_dim % 2) == 0) {
-    const int half_dim_pairs = half_dim / 2;
-    const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_backward_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        go_bf16, cos_bf16, sin_bf16, gx_bf16,
-        total_vecs, seq_len, n_heads, head_dim, half_dim);
-  } else {
-    const int64_t total_threads = (int64_t)total_vecs * half_dim;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_backward_scalar<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        go_bf16, cos_bf16, sin_bf16, gx_bf16,
-        total_vecs, seq_len, n_heads, head_dim, half_dim);
+  const int half_dim_pairs = half_dim / 2;
+  const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
+  if (total_threads <= 0 || total_threads > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
   }
+  const int64_t grid64 = (total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE;
+  if (grid64 <= 0 || grid64 > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
+  }
+  const int grid = static_cast<int>(grid64);
+  nmoe::rope::k_fused_rope_backward_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
+      go_bf16, cos_bf16, sin_bf16, gx_bf16,
+      total_vecs, seq_len, n_heads, head_dim, half_dim);
 
   return cudaGetLastError();
 }
@@ -588,32 +641,58 @@ extern "C" cudaError_t fused_rope_forward_partial(
     int nope_dim,            // elements [0:nope_dim] are unchanged
     cudaStream_t stream)
 {
-  const int rope_dim = head_dim - nope_dim;
-  const int half_dim = rope_dim / 2;
-
-  if (total_vecs <= 0 || rope_dim <= 0 || half_dim <= 0) {
+  if (total_vecs < 0 || head_dim < 0 || seq_len < 0 || n_heads < 0 || nope_dim < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (nope_dim > head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  if (total_vecs == 0) {
     return cudaSuccess;  // Nothing to do
   }
+  if (head_dim == 0) {
+    return cudaSuccess;
+  }
+  if (seq_len <= 0 || n_heads <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int rope_dim = head_dim - nope_dim;
+  if (rope_dim <= 0) {
+    return cudaSuccess;
+  }
+  if ((rope_dim % 4) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (x == nullptr || cos_buf == nullptr || sin_buf == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  bool supports_bf16 = false;
+  cudaError_t probe = nmoe::rope::current_device_supports_bf16(&supports_bf16);
+  if (probe != cudaSuccess) {
+    return probe;
+  }
+  if (!supports_bf16) {
+    return cudaErrorInvalidDeviceFunction;
+  }
+  const int half_dim = rope_dim / 2;
 
   auto* x_bf16     = static_cast<__nv_bfloat16*>(x);
   const auto* cos_bf16 = static_cast<const __nv_bfloat16*>(cos_buf);
   const auto* sin_bf16 = static_cast<const __nv_bfloat16*>(sin_buf);
 
-  // Use vectorized path if half_dim is even
-  if ((half_dim % 2) == 0) {
-    const int half_dim_pairs = half_dim / 2;
-    const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_forward_partial_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        x_bf16, cos_bf16, sin_bf16,
-        total_vecs, seq_len, n_heads, head_dim, nope_dim);
-  } else {
-    const int64_t total_threads = (int64_t)total_vecs * half_dim;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_forward_partial_scalar<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        x_bf16, cos_bf16, sin_bf16,
-        total_vecs, seq_len, n_heads, head_dim, nope_dim);
+  const int half_dim_pairs = half_dim / 2;
+  const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
+  if (total_threads <= 0 || total_threads > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
   }
+  const int64_t grid64 = (total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE;
+  if (grid64 <= 0 || grid64 > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
+  }
+  const int grid = static_cast<int>(grid64);
+  nmoe::rope::k_fused_rope_forward_partial_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
+      x_bf16, cos_bf16, sin_bf16,
+      total_vecs, seq_len, n_heads, head_dim, nope_dim);
 
   return cudaGetLastError();
 }
@@ -629,31 +708,58 @@ extern "C" cudaError_t fused_rope_backward_partial(
     int nope_dim,            // elements [0:nope_dim] gradients are unchanged
     cudaStream_t stream)
 {
-  const int rope_dim = head_dim - nope_dim;
-  const int half_dim = rope_dim / 2;
-
-  if (total_vecs <= 0 || rope_dim <= 0 || half_dim <= 0) {
+  if (total_vecs < 0 || head_dim < 0 || seq_len < 0 || n_heads < 0 || nope_dim < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (nope_dim > head_dim) {
+    return cudaErrorInvalidValue;
+  }
+  if (total_vecs == 0) {
     return cudaSuccess;
   }
+  if (head_dim == 0) {
+    return cudaSuccess;
+  }
+  if (seq_len <= 0 || n_heads <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int rope_dim = head_dim - nope_dim;
+  if (rope_dim <= 0) {
+    return cudaSuccess;
+  }
+  if ((rope_dim % 4) != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (grad_x == nullptr || cos_buf == nullptr || sin_buf == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  bool supports_bf16 = false;
+  cudaError_t probe = nmoe::rope::current_device_supports_bf16(&supports_bf16);
+  if (probe != cudaSuccess) {
+    return probe;
+  }
+  if (!supports_bf16) {
+    return cudaErrorInvalidDeviceFunction;
+  }
+  const int half_dim = rope_dim / 2;
 
   auto* gx_bf16    = static_cast<__nv_bfloat16*>(grad_x);
   const auto* cos_bf16 = static_cast<const __nv_bfloat16*>(cos_buf);
   const auto* sin_bf16 = static_cast<const __nv_bfloat16*>(sin_buf);
 
-  if ((half_dim % 2) == 0) {
-    const int half_dim_pairs = half_dim / 2;
-    const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_backward_partial_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        gx_bf16, cos_bf16, sin_bf16,
-        total_vecs, seq_len, n_heads, head_dim, nope_dim);
-  } else {
-    const int64_t total_threads = (int64_t)total_vecs * half_dim;
-    const int grid = (int)((total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE);
-    nmoe::rope::k_fused_rope_backward_partial_scalar<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
-        gx_bf16, cos_bf16, sin_bf16,
-        total_vecs, seq_len, n_heads, head_dim, nope_dim);
+  const int half_dim_pairs = half_dim / 2;
+  const int64_t total_threads = (int64_t)total_vecs * half_dim_pairs;
+  if (total_threads <= 0 || total_threads > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
   }
+  const int64_t grid64 = (total_threads + nmoe::rope::BLOCK_SIZE - 1) / nmoe::rope::BLOCK_SIZE;
+  if (grid64 <= 0 || grid64 > static_cast<int64_t>(INT_MAX)) {
+    return cudaErrorInvalidValue;
+  }
+  const int grid = static_cast<int>(grid64);
+  nmoe::rope::k_fused_rope_backward_partial_vec2<<<grid, nmoe::rope::BLOCK_SIZE, 0, stream>>>(
+      gx_bf16, cos_bf16, sin_bf16,
+      total_vecs, seq_len, n_heads, head_dim, nope_dim);
 
   return cudaGetLastError();
 }

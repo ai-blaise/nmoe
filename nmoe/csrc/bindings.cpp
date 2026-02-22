@@ -29,7 +29,6 @@ extern "C" {
   void rdep_nvshmem_finalize();
   void rdep_nvshmem_alloc_bf16(size_t capacity, int H, int n_local);
   void rdep_nvshmem_alloc_blockscaled(size_t capacity, int H, int n_local, int profile);
-  void rdep_nvshmem_barrier();
   void rdep_nvshmem_quiet();
   // NVSHMEM IPC buffer functions (separate cudaMalloc'd buffer for intra-node IPC)
   void rdep_nvshmem_get_ipc_handle_bf16(void* handle_out);
@@ -57,6 +56,7 @@ extern "C" {
   void rdep_gather_meta_sorted_bf16(int64_t* row_id_out, float* gate_out, int M_recv, cudaStream_t stream);
   void rdep_gather_from_pad_bf16(const void* in_pad, void* out_sorted, int M_recv, int H, cudaStream_t stream);
   void rdep_scatter_sorted_to_pad_bf16(const void* in_sorted, void* out_pad, int M_recv, int H, cudaStream_t stream);
+  void rdep_zero_padding_rows_bf16(void* out_pad, const int* offs_pad, int M_recv, int M_pad, int H, cudaStream_t stream);
   int  rdep_dispatch_meta_blockscaled(const void* x, const int* eids, const float* gates,
                                      int T, int K,
                                      int* offs_pad_out, int* M_pad_out,
@@ -73,6 +73,8 @@ extern "C" {
                            int M, int T, int H, int K, cudaStream_t stream);
   void rdep_scatter_gate_bf16(const float* dGate_sorted, const int64_t* row_id,
                               float* dGates_tk, int M, int T, int K, cudaStream_t stream);
+  void rdep_scatter_gate_bf16_out_bf16(const float* dGate_sorted, const int64_t* row_id,
+                                       void* dGates_tk_bf16, int M, int T, int K, cudaStream_t stream);
   // SonicMoE dGate identity: gather dY with gate scaling, defer dGate to ⟨A, dA'⟩
   void rdep_gather_dy_nogate_bf16(const void* dY, const int64_t* row_id,
                                   const float* gate, void* dYe_out,
@@ -88,6 +90,9 @@ extern "C" {
   void rdep_send_dgate_dist_bf16(const int64_t* row_id, const float* dGate_sorted,
                                  float* dGates_tk_out,
                                  int M, int T, int K, cudaStream_t stream);
+  void rdep_send_dgate_dist_bf16_out_bf16(const int64_t* row_id, const float* dGate_sorted,
+                                          void* dGates_tk_out_bf16,
+                                          int M, int T, int K, cudaStream_t stream);
   void rdep_scatter_dx_bf16_internal(const void* dXe_pad, const int64_t* row_id,
                                      void* dX_out, int M, int T, int H, int K, cudaStream_t stream);
 	  void rdep_gather_dy_dist_bf16(const void* dY_local, const int* eids, const void* Ye_pad,
@@ -96,6 +101,8 @@ extern "C" {
 	                                int M, int T, int H, int K, cudaStream_t stream);
   void rdep_scatter_dx_dist_bf16(const void* dXe_sorted, const int64_t* row_id,
                                  void* dX_out, int M, int T, int H, int K, cudaStream_t stream);
+  void rdep_scatter_dx_dist_from_pad_bf16(const void* dXe_pad, const int64_t* row_id,
+                                          void* dX_out, int M, int T, int H, int K, cudaStream_t stream);
 
   // Blockscaled path
   void rdep_alloc_blockscaled(size_t capacity, int H, int n_local, int profile);
@@ -155,12 +162,38 @@ extern "C" {
                                      const int32_t* offs_pad,
                                      int E, int H, int Dff,
                                      cudaStream_t stream);
+  cudaError_t bf16_wgrad_w2_cublaslt_host_offs(const void* A,
+                                               const void* dY,
+                                               void* dW2_out,
+                                               const int32_t* offs_pad_host,
+                                               int E, int H, int Dff,
+                                               cudaStream_t stream);
+  cudaError_t bf16_prepare_offs_pad_host(const int32_t* offs_pad,
+                                         int E,
+                                         cudaStream_t stream,
+                                         const int32_t** offs_pad_host_out);
   cudaError_t bf16_wgrad_w13_cublaslt(const void* X,
                                       const void* dH,
                                       void* dW_out,
                                       const int32_t* offs_pad,
                                       int E, int H, int Dff,
                                       cudaStream_t stream);
+  cudaError_t bf16_wgrad_w13_pair_cublaslt(const void* X,
+                                           const void* dH1,
+                                           const void* dH3,
+                                           void* dW1_out,
+                                           void* dW3_out,
+                                           const int32_t* offs_pad,
+                                           int E, int H, int Dff,
+                                           cudaStream_t stream);
+  cudaError_t bf16_wgrad_w13_pair_cublaslt_host_offs(const void* X,
+                                                     const void* dH1,
+                                                     const void* dH3,
+                                                     void* dW1_out,
+                                                     void* dW3_out,
+                                                     const int32_t* offs_pad_host,
+                                                     int E, int H, int Dff,
+                                                     cudaStream_t stream);
   cudaError_t swiglu_quant_fp8_sf_strided_mma(const void* h13, int ld_h13,
                                               void* out, int ld_out,
                                               void* sf_mma,
@@ -181,6 +214,22 @@ extern "C" {
                                    void* out, int ld_out,
                                    const void* sfa, int ld_sf,
                                    int M, int K, cudaStream_t stream);
+  cudaError_t dequant_fp8_to_bf16(const void* q, int ldq,
+                                  const void* sfa, int ld_sf,
+                                  void* out, int ld_out,
+                                  int M, int K, cudaStream_t stream);
+  cudaError_t dequant_fp8_to_bf16_mma_sf(const void* q, int ldq,
+                                         const void* sfa, int ld_sf,
+                                         void* out, int ld_out,
+                                         int M, int K, cudaStream_t stream);
+  cudaError_t dequant_nvfp4_to_bf16(const void* q, int ldq,
+                                    const void* sfa, int ld_sf,
+                                    void* out, int ld_out,
+                                    int M, int K, cudaStream_t stream);
+  cudaError_t dequant_nvfp4_to_bf16_mma_sf(const void* q, int ldq,
+                                           const void* sfa, int ld_sf,
+                                           void* out, int ld_out,
+                                           int M, int K, cudaStream_t stream);
   cudaError_t swizzle_sf_mkl_to_mma(const void* sf_mkl, void* sf_mma,
                                     int M, int sf_k, cudaStream_t stream);
   cudaError_t expert_adamw_step(
@@ -223,7 +272,32 @@ extern "C" {
       int stochastic_rounding, int error_feedback,
       unsigned int prng_seed0, unsigned int prng_seed1,
       cudaStream_t stream);
+  cudaError_t eco_adam_nvfp4_update_bf16(
+      void* W_packed, void* W_scale, void* W_gs,
+      void* m_data, void* m_scale, void* v_data, void* v_scale,
+      const void* grad,
+      int E, int out_dim, int in_dim, int group_size,
+      float lr, float beta1, float beta2,
+      float weight_decay, float eps,
+      float step_size, float inv_bc2_sqrt,
+      float eco_alpha,
+      int stochastic_rounding, int error_feedback,
+      unsigned int prng_seed0, unsigned int prng_seed1,
+      cudaStream_t stream);
   cudaError_t eco_adam_nvfp4_fv_update(
+      void* W_packed, void* W_scale, void* W_gs,
+      void* m_data, void* m_scale,
+      void* v_row, void* v_col, void* v_rms,
+      const void* grad,
+      int E, int out_dim, int in_dim, int group_size,
+      float lr, float beta1, float beta2,
+      float weight_decay, float eps,
+      float step_size, float inv_bc2_sqrt,
+      float eco_alpha,
+      int stochastic_rounding, int error_feedback,
+      unsigned int prng_seed0, unsigned int prng_seed1,
+      cudaStream_t stream);
+  cudaError_t eco_adam_nvfp4_fv_update_bf16(
       void* W_packed, void* W_scale, void* W_gs,
       void* m_data, void* m_scale,
       void* v_row, void* v_col, void* v_rms,
@@ -243,7 +317,21 @@ extern "C" {
       int E, int in_dim, int out_dim,
       float beta1_frac, float beta2_frac,
       cudaStream_t stream);
+  cudaError_t eco_mv_accumulate_bf16(
+      void* m_data, void* m_scale,
+      void* v_data, void* v_scale,
+      const void* grad,
+      int E, int in_dim, int out_dim,
+      float beta1_frac, float beta2_frac,
+      cudaStream_t stream);
   cudaError_t eco_mv_accumulate_fv(
+      void* m_data, void* m_scale,
+      void* v_row, void* v_col, void* v_rms,
+      const void* grad,
+      int E, int in_dim, int out_dim,
+      float beta1_frac, float beta2_frac,
+      cudaStream_t stream);
+  cudaError_t eco_mv_accumulate_fv_bf16(
       void* m_data, void* m_scale,
       void* v_row, void* v_col, void* v_rms,
       const void* grad,
@@ -293,12 +381,29 @@ extern "C" {
 
 static inline cudaStream_t to_stream(py::object s) {
   if (s.is_none()) return nullptr;
+  if (!py::hasattr(s, "cuda_stream")) {
+    throw py::type_error("stream must be torch.cuda.Stream or None");
+  }
   auto uptr = s.attr("cuda_stream").cast<uintptr_t>();
   return reinterpret_cast<cudaStream_t>(uptr);
 }
 
+constexpr int NMOE_RDEP_ABI_VERSION = 1;
 // IPC handle size is 64 bytes
 constexpr int IPC_HANDLE_SIZE = 64;
+
+static inline void validate_ipc_handles(const py::array_t<uint8_t>& handles, int n_ranks, const char* fn_name) {
+  auto info = handles.request();
+  if (info.ndim != 1 || info.strides[0] != 1) {
+    throw py::value_error(std::string(fn_name) + ": handles must be contiguous 1-D uint8");
+  }
+  const ssize_t expected = static_cast<ssize_t>(n_ranks) * IPC_HANDLE_SIZE;
+  if (info.size != expected) {
+    throw py::value_error(
+      std::string(fn_name) + ": expected " + std::to_string(expected) + " bytes, got " + std::to_string(info.size)
+    );
+  }
+}
 
 #ifdef BUILD_MUON
 // Muon module (built separately)
@@ -324,6 +429,8 @@ PYBIND11_MODULE(muon, m2) {
 #ifdef BUILD_RDEP
 PYBIND11_MODULE(rdep, m) {
   m.doc() = "RDEP: Expert-parallel dispatch/return for MoE";
+  m.def("abi_version", []() { return NMOE_RDEP_ABI_VERSION; });
+  m.def("ipc_handle_size", []() { return IPC_HANDLE_SIZE; });
 
   // ========== Init ==========
   m.def("init", [](int rank, int world, int local_world) {
@@ -350,11 +457,13 @@ PYBIND11_MODULE(rdep, m) {
   }, "Get local IPC handle for blockscaled buffer");
 
   m.def("open_ipc_handles_bf16", [](py::array_t<uint8_t> handles, int world) {
+    validate_ipc_handles(handles, world, "open_ipc_handles_bf16");
     rdep_open_ipc_handles_bf16(handles.data(), world);
   }, py::arg("handles"), py::arg("world"),
      "Open remote IPC handles for BF16 path");
 
   m.def("open_ipc_handles_blockscaled", [](py::array_t<uint8_t> handles, int world) {
+    validate_ipc_handles(handles, world, "open_ipc_handles_blockscaled");
     rdep_open_ipc_handles_blockscaled(handles.data(), world);
   }, py::arg("handles"), py::arg("world"),
      "Open remote IPC handles for blockscaled path");
@@ -429,6 +538,17 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("stream") = py::none(),
      "Scatter BF16 rows from sorted layout into padded layout (requires prior dispatch_meta_bf16)");
 
+  m.def("zero_padding_rows_bf16", [](uintptr_t out_pad_ptr, uintptr_t offs_pad_ptr,
+                                     int M_recv, int M_pad, int H, py::object stream) {
+    rdep_zero_padding_rows_bf16(
+        reinterpret_cast<void*>(out_pad_ptr),
+        reinterpret_cast<const int*>(offs_pad_ptr),
+        M_recv, M_pad, H,
+        to_stream(stream));
+  }, py::arg("out_pad"), py::arg("offs_pad"), py::arg("M_recv"), py::arg("M_pad"), py::arg("H"),
+     py::arg("stream") = py::none(),
+     "Zero only per-expert padded rows in BF16 padded layout using dispatch offsets.");
+
   m.def("return_scatter_from_pad_bf16", [](uintptr_t Ye_pad_ptr, uintptr_t out_ptr,
                                           int M_recv, int T, int K,
                                           py::object stream) {
@@ -456,6 +576,21 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("M"), py::arg("T"), py::arg("K"),
      py::arg("stream") = py::none(),
      "Scatter dGate[M] back to [T,K] (BF16 path)");
+
+  m.def("scatter_gate_bf16_out_bf16", [](uintptr_t dGate_sorted_ptr, uintptr_t row_id_ptr,
+                                         uintptr_t dGates_tk_ptr,
+                                         int M, int T, int K,
+                                         py::object stream) {
+    rdep_scatter_gate_bf16_out_bf16(
+        reinterpret_cast<const float*>(dGate_sorted_ptr),
+        reinterpret_cast<const int64_t*>(row_id_ptr),
+        reinterpret_cast<void*>(dGates_tk_ptr),
+        M, T, K,
+        to_stream(stream));
+  }, py::arg("dGate_sorted"), py::arg("row_id"), py::arg("dGates_tk"),
+     py::arg("M"), py::arg("T"), py::arg("K"),
+     py::arg("stream") = py::none(),
+     "Scatter dGate[M] back to [T,K] directly as BF16.");
 
   // SonicMoE dGate identity: gather dY with gate scaling, defer dGate
   m.def("gather_dy_nogate_bf16", [](uintptr_t dY_ptr, uintptr_t row_id_ptr,
@@ -525,6 +660,21 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("stream") = py::none(),
      "SonicMoE distributed: send dGate to source ranks via IPC");
 
+  m.def("send_dgate_dist_bf16_out_bf16", [](uintptr_t row_id_ptr, uintptr_t dGate_sorted_ptr,
+                                            uintptr_t dGates_tk_ptr,
+                                            int M, int T, int K,
+                                            py::object stream) {
+    rdep_send_dgate_dist_bf16_out_bf16(
+        reinterpret_cast<const int64_t*>(row_id_ptr),
+        reinterpret_cast<const float*>(dGate_sorted_ptr),
+        reinterpret_cast<void*>(dGates_tk_ptr),
+        M, T, K,
+        to_stream(stream));
+  }, py::arg("row_id"), py::arg("dGate_sorted"), py::arg("dGates_tk"),
+     py::arg("M"), py::arg("T"), py::arg("K"),
+     py::arg("stream") = py::none(),
+     "SonicMoE distributed: send dGate and collect [T,K] directly as BF16.");
+
   m.def("scatter_dx_bf16_internal", [](uintptr_t dXe_pad_ptr, uintptr_t row_id_ptr,
                                       uintptr_t dX_out_ptr,
                                       int M, int T, int H, int K,
@@ -577,6 +727,21 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("M"), py::arg("T"), py::arg("H"), py::arg("K"),
      py::arg("stream") = py::none(),
      "Distributed backward scatter (IPC+hybrid): sends dXe rows to sources and reduces into dX[T,H]");
+
+  m.def("scatter_dx_dist_from_pad_bf16", [](uintptr_t dXe_pad_ptr, uintptr_t row_id_ptr,
+                                            uintptr_t dX_out_ptr,
+                                            int M, int T, int H, int K,
+                                            py::object stream) {
+    rdep_scatter_dx_dist_from_pad_bf16(
+        reinterpret_cast<const void*>(dXe_pad_ptr),
+        reinterpret_cast<const int64_t*>(row_id_ptr),
+        reinterpret_cast<void*>(dX_out_ptr),
+        M, T, H, K,
+        to_stream(stream));
+  }, py::arg("dXe_pad"), py::arg("row_id"), py::arg("dX_out"),
+     py::arg("M"), py::arg("T"), py::arg("H"), py::arg("K"),
+     py::arg("stream") = py::none(),
+     "Distributed backward scatter (IPC-only fast path): sends dXe directly from padded layout and reduces into dX[T,H].");
 
   // ========== Blockscaled Path ==========
   m.def("alloc_blockscaled", [](size_t capacity, int H, int n_local, int profile) {
@@ -811,6 +976,57 @@ PYBIND11_MODULE(rdep, m) {
       "Fused ECO AdamW update for NVFP4 primary weights with FP8 optimizer states. "
       "Zero FP32 global memory materialization — all computation in registers/shared.");
 
+  m.def(
+      "eco_adam_nvfp4_update_bf16",
+      [](uintptr_t W_packed_ptr, uintptr_t W_scale_ptr, uintptr_t W_gs_ptr,
+         uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_data_ptr, uintptr_t v_scale_ptr,
+         uintptr_t grad_ptr,
+         int E, int out_dim, int in_dim, int group_size,
+         float lr, float beta1, float beta2,
+         float weight_decay, float eps,
+         float step_size, float inv_bc2_sqrt,
+         float eco_alpha,
+         int stochastic_rounding, int error_feedback,
+         unsigned int prng_seed0, unsigned int prng_seed1,
+         py::object stream) {
+        if (E <= 0 || out_dim <= 0 || in_dim <= 0 || group_size <= 0)
+            throw std::invalid_argument("eco_adam_bf16: E, out_dim, in_dim, group_size must be positive");
+        if ((out_dim & 31) != 0 || (in_dim & 31) != 0)
+            throw std::invalid_argument("eco_adam_bf16: out_dim and in_dim must be multiples of 32");
+        if (in_dim % group_size != 0)
+            throw std::invalid_argument("eco_adam_bf16: in_dim must be divisible by group_size");
+        auto err = eco_adam_nvfp4_update_bf16(
+            reinterpret_cast<void*>(W_packed_ptr),
+            reinterpret_cast<void*>(W_scale_ptr),
+            reinterpret_cast<void*>(W_gs_ptr),
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_data_ptr),
+            reinterpret_cast<void*>(v_scale_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps,
+            step_size, inv_bc2_sqrt, eco_alpha,
+            stochastic_rounding, error_feedback,
+            prng_seed0, prng_seed1,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_adam_nvfp4_update_bf16 failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("W_packed"), py::arg("W_scale"), py::arg("W_gs"),
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_data"), py::arg("v_scale"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("out_dim"), py::arg("in_dim"), py::arg("group_size"),
+      py::arg("lr"), py::arg("beta1"), py::arg("beta2"),
+      py::arg("weight_decay"), py::arg("eps"),
+      py::arg("step_size"), py::arg("inv_bc2_sqrt"),
+      py::arg("eco_alpha"),
+      py::arg("stochastic_rounding"), py::arg("error_feedback"),
+      py::arg("prng_seed0"), py::arg("prng_seed1"),
+      py::arg("stream") = py::none(),
+      "Fused ECO AdamW update for NVFP4 primary weights accepting BF16 gradients.");
+
   // ========== ECO Adam NVFP4 Factored-V Update (factored second moment) ==========
   m.def(
       "eco_adam_nvfp4_fv_update",
@@ -865,6 +1081,58 @@ PYBIND11_MODULE(rdep, m) {
       "Fused ECO AdamW update with Adafactor-style factored second moment (v_row/v_col). "
       "Runs factored-v reduction kernels + modified main kernel in a single call.");
 
+  m.def(
+      "eco_adam_nvfp4_fv_update_bf16",
+      [](uintptr_t W_packed_ptr, uintptr_t W_scale_ptr, uintptr_t W_gs_ptr,
+         uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_row_ptr, uintptr_t v_col_ptr, uintptr_t v_rms_ptr,
+         uintptr_t grad_ptr,
+         int E, int out_dim, int in_dim, int group_size,
+         float lr, float beta1, float beta2,
+         float weight_decay, float eps,
+         float step_size, float inv_bc2_sqrt,
+         float eco_alpha,
+         int stochastic_rounding, int error_feedback,
+         unsigned int prng_seed0, unsigned int prng_seed1,
+         py::object stream) {
+        if (E <= 0 || out_dim <= 0 || in_dim <= 0 || group_size <= 0)
+            throw std::invalid_argument("eco_adam_fv_bf16: E, out_dim, in_dim, group_size must be positive");
+        if ((out_dim & 31) != 0 || (in_dim & 31) != 0)
+            throw std::invalid_argument("eco_adam_fv_bf16: out_dim and in_dim must be multiples of 32");
+        if (in_dim % group_size != 0)
+            throw std::invalid_argument("eco_adam_fv_bf16: in_dim must be divisible by group_size");
+        auto err = eco_adam_nvfp4_fv_update_bf16(
+            reinterpret_cast<void*>(W_packed_ptr),
+            reinterpret_cast<void*>(W_scale_ptr),
+            reinterpret_cast<void*>(W_gs_ptr),
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_row_ptr),
+            reinterpret_cast<void*>(v_col_ptr),
+            reinterpret_cast<void*>(v_rms_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps,
+            step_size, inv_bc2_sqrt, eco_alpha,
+            stochastic_rounding, error_feedback,
+            prng_seed0, prng_seed1,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_adam_nvfp4_fv_update_bf16 failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("W_packed"), py::arg("W_scale"), py::arg("W_gs"),
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_row"), py::arg("v_col"), py::arg("v_rms"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("out_dim"), py::arg("in_dim"), py::arg("group_size"),
+      py::arg("lr"), py::arg("beta1"), py::arg("beta2"),
+      py::arg("weight_decay"), py::arg("eps"),
+      py::arg("step_size"), py::arg("inv_bc2_sqrt"),
+      py::arg("eco_alpha"),
+      py::arg("stochastic_rounding"), py::arg("error_feedback"),
+      py::arg("prng_seed0"), py::arg("prng_seed1"),
+      py::arg("stream") = py::none(),
+      "Fused ECO AdamW factored-v update accepting BF16 gradients.");
+
   // ========== AdamA m/v Accumulation (replaces gradient accumulation buffers) ==========
   m.def(
       "eco_mv_accumulate",
@@ -897,6 +1165,35 @@ PYBIND11_MODULE(rdep, m) {
       "Zero additional memory — eliminates ~5.85 GiB gradient accumulation buffers.");
 
   m.def(
+      "eco_mv_accumulate_bf16",
+      [](uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_data_ptr, uintptr_t v_scale_ptr,
+         uintptr_t grad_ptr,
+         int E, int in_dim, int out_dim,
+         float beta1_frac, float beta2_frac,
+         py::object stream) {
+        if (E <= 0 || in_dim <= 0 || out_dim <= 0)
+            throw std::invalid_argument("eco_mv_accumulate_bf16: E, in_dim, out_dim must be positive");
+        auto err = eco_mv_accumulate_bf16(
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_data_ptr),
+            reinterpret_cast<void*>(v_scale_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, in_dim, out_dim,
+            beta1_frac, beta2_frac,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_mv_accumulate_bf16 failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_data"), py::arg("v_scale"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("in_dim"), py::arg("out_dim"),
+      py::arg("beta1_frac"), py::arg("beta2_frac"),
+      py::arg("stream") = py::none(),
+      "AdamA m/v accumulation accepting BF16 gradients.");
+
+  m.def(
       "eco_mv_accumulate_fv",
       [](uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
          uintptr_t v_row_ptr, uintptr_t v_col_ptr, uintptr_t v_rms_ptr,
@@ -926,6 +1223,36 @@ PYBIND11_MODULE(rdep, m) {
       py::arg("stream") = py::none(),
       "AdamA m/v accumulation with factored second moment: update FP8 m (E5M2) + "
       "factored v_row/v_col with fractional betas. Zero additional memory.");
+
+  m.def(
+      "eco_mv_accumulate_fv_bf16",
+      [](uintptr_t m_data_ptr, uintptr_t m_scale_ptr,
+         uintptr_t v_row_ptr, uintptr_t v_col_ptr, uintptr_t v_rms_ptr,
+         uintptr_t grad_ptr,
+         int E, int in_dim, int out_dim,
+         float beta1_frac, float beta2_frac,
+         py::object stream) {
+        if (E <= 0 || in_dim <= 0 || out_dim <= 0)
+            throw std::invalid_argument("eco_mv_accumulate_fv_bf16: E, in_dim, out_dim must be positive");
+        auto err = eco_mv_accumulate_fv_bf16(
+            reinterpret_cast<void*>(m_data_ptr),
+            reinterpret_cast<void*>(m_scale_ptr),
+            reinterpret_cast<void*>(v_row_ptr),
+            reinterpret_cast<void*>(v_col_ptr),
+            reinterpret_cast<void*>(v_rms_ptr),
+            reinterpret_cast<const void*>(grad_ptr),
+            E, in_dim, out_dim,
+            beta1_frac, beta2_frac,
+            to_stream(stream));
+        if (err != cudaSuccess) throw std::runtime_error("eco_mv_accumulate_fv_bf16 failed: " + std::string(cudaGetErrorString(err)));
+      },
+      py::arg("m_data"), py::arg("m_scale"),
+      py::arg("v_row"), py::arg("v_col"), py::arg("v_rms"),
+      py::arg("grad"),
+      py::arg("E"), py::arg("in_dim"), py::arg("out_dim"),
+      py::arg("beta1_frac"), py::arg("beta2_frac"),
+      py::arg("stream") = py::none(),
+      "AdamA m/factored-v accumulation accepting BF16 gradients.");
 
   // ========== Quantization + Swizzle (dense / weight cache only) ==========
   m.def("quant_fp8", [](uintptr_t x_ptr, int ldx,
@@ -1066,6 +1393,8 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("gs_stride") = 0, py::arg("expert_rows") = 0, py::arg("transpose") = 0,
      py::arg("stream") = py::none(),
      "Direct compressed_tensors NVFP4 -> BF16 on GPU (no CPU dequant)");
+  // 0=normal, 1=legacy [K,M], 2=expert-major [E,K,M]
+  m.attr("ct_nvfp4_to_bf16_max_transpose_mode") = py::int_(2);
 
   m.def("swiglu_bwd_bf16", [](uintptr_t h1_ptr, int ld_h1,
                               uintptr_t h3_ptr, int ld_h3,
@@ -1092,6 +1421,24 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("stream") = py::none(),
      "SwiGLU backward (BF16): (h1, h3, dA) -> (A, dH1, dH3)");
 
+  m.attr("bf16_wgrad_device_offs_supported") = py::bool_(true);
+  m.attr("bf16_prepare_offs_pad_host_supported") = py::bool_(true);
+  m.attr("bf16_wgrad_host_offs_supported") = py::bool_(true);
+
+  m.def("bf16_prepare_offs_pad_host", [](uintptr_t offs_pad_ptr, int E, py::object stream) -> uintptr_t {
+    const int32_t* host_ptr = nullptr;
+    auto err = bf16_prepare_offs_pad_host(
+        reinterpret_cast<const int32_t*>(offs_pad_ptr),
+        E,
+        to_stream(stream),
+        &host_ptr);
+    if (err != cudaSuccess) throw std::runtime_error("bf16_prepare_offs_pad_host failed");
+    return reinterpret_cast<uintptr_t>(host_ptr);
+  }, py::arg("offs_pad"),
+     py::arg("E"),
+     py::arg("stream") = py::none(),
+     "Prepare and return host-visible offs_pad pointer (pinned scratch) for grouped BF16 wgrad launch metadata.");
+
   m.def("bf16_wgrad_w2_cublaslt", [](uintptr_t A_ptr,
                                      uintptr_t dY_ptr,
                                      uintptr_t dW2_out_ptr,
@@ -1111,7 +1458,28 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("offs_pad"),
      py::arg("E"), py::arg("H"), py::arg("Dff"),
      py::arg("stream") = py::none(),
-     "Grouped BF16 wgrad for W2 via cuBLASLt: dW2 = A^T @ dY (FP32 accum)");
+     "Grouped BF16 wgrad for W2 via cuBLAS grouped batched GEMM: dW2 = A^T @ dY (FP32 accum). offs_pad accepts device or host int32 pointer.");
+
+  m.def("bf16_wgrad_w2_cublaslt_host_offs", [](uintptr_t A_ptr,
+                                               uintptr_t dY_ptr,
+                                               uintptr_t dW2_out_ptr,
+                                               uintptr_t offs_pad_host_ptr,
+                                               int E, int H, int Dff,
+                                               py::object stream) {
+    auto err = bf16_wgrad_w2_cublaslt_host_offs(reinterpret_cast<const void*>(A_ptr),
+                                                reinterpret_cast<const void*>(dY_ptr),
+                                                reinterpret_cast<void*>(dW2_out_ptr),
+                                                reinterpret_cast<const int32_t*>(offs_pad_host_ptr),
+                                                E, H, Dff,
+                                                to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("bf16_wgrad_w2_cublaslt_host_offs failed");
+  }, py::arg("A"),
+     py::arg("dY"),
+     py::arg("dW2_out"),
+     py::arg("offs_pad_host"),
+     py::arg("E"), py::arg("H"), py::arg("Dff"),
+     py::arg("stream") = py::none(),
+     "Grouped BF16 wgrad for W2 using pre-staged host offs_pad pointer (no pointer introspection on launch path).");
 
   m.def("bf16_wgrad_w13_cublaslt", [](uintptr_t X_ptr,
                                       uintptr_t dH_ptr,
@@ -1132,7 +1500,61 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("offs_pad"),
      py::arg("E"), py::arg("H"), py::arg("Dff"),
      py::arg("stream") = py::none(),
-     "Grouped BF16 wgrad via cuBLASLt: dW = X^T @ dH (FP32 accum)");
+     "Grouped BF16 wgrad via cuBLAS grouped batched GEMM: dW = X^T @ dH (FP32 accum). offs_pad accepts device or host int32 pointer.");
+
+  m.def("bf16_wgrad_w13_pair_cublaslt", [](uintptr_t X_ptr,
+                                           uintptr_t dH1_ptr,
+                                           uintptr_t dH3_ptr,
+                                           uintptr_t dW1_out_ptr,
+                                           uintptr_t dW3_out_ptr,
+                                           uintptr_t offs_pad_ptr,
+                                           int E, int H, int Dff,
+                                           py::object stream) {
+    auto err = bf16_wgrad_w13_pair_cublaslt(reinterpret_cast<const void*>(X_ptr),
+                                            reinterpret_cast<const void*>(dH1_ptr),
+                                            reinterpret_cast<const void*>(dH3_ptr),
+                                            reinterpret_cast<void*>(dW1_out_ptr),
+                                            reinterpret_cast<void*>(dW3_out_ptr),
+                                            reinterpret_cast<const int32_t*>(offs_pad_ptr),
+                                            E, H, Dff,
+                                            to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("bf16_wgrad_w13_pair_cublaslt failed");
+  }, py::arg("X"),
+     py::arg("dH1"),
+     py::arg("dH3"),
+     py::arg("dW1_out"),
+     py::arg("dW3_out"),
+     py::arg("offs_pad"),
+     py::arg("E"), py::arg("H"), py::arg("Dff"),
+     py::arg("stream") = py::none(),
+     "Grouped BF16 paired wgrad via cuBLAS grouped batched GEMM: (dW1,dW3) = X^T @ (dH1,dH3) (FP32 accum). offs_pad accepts device or host int32 pointer.");
+
+  m.def("bf16_wgrad_w13_pair_cublaslt_host_offs", [](uintptr_t X_ptr,
+                                                     uintptr_t dH1_ptr,
+                                                     uintptr_t dH3_ptr,
+                                                     uintptr_t dW1_out_ptr,
+                                                     uintptr_t dW3_out_ptr,
+                                                     uintptr_t offs_pad_host_ptr,
+                                                     int E, int H, int Dff,
+                                                     py::object stream) {
+    auto err = bf16_wgrad_w13_pair_cublaslt_host_offs(reinterpret_cast<const void*>(X_ptr),
+                                                      reinterpret_cast<const void*>(dH1_ptr),
+                                                      reinterpret_cast<const void*>(dH3_ptr),
+                                                      reinterpret_cast<void*>(dW1_out_ptr),
+                                                      reinterpret_cast<void*>(dW3_out_ptr),
+                                                      reinterpret_cast<const int32_t*>(offs_pad_host_ptr),
+                                                      E, H, Dff,
+                                                      to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("bf16_wgrad_w13_pair_cublaslt_host_offs failed");
+  }, py::arg("X"),
+     py::arg("dH1"),
+     py::arg("dH3"),
+     py::arg("dW1_out"),
+     py::arg("dW3_out"),
+     py::arg("offs_pad_host"),
+     py::arg("E"), py::arg("H"), py::arg("Dff"),
+     py::arg("stream") = py::none(),
+     "Grouped BF16 paired wgrad using pre-staged host offs_pad pointer (no pointer introspection on launch path).");
 
   m.def("swiglu_quant_fp8_sf_strided_mma", [](uintptr_t h13_ptr, int ld_h13,
                                               uintptr_t out_ptr, int ld_out,
@@ -1203,6 +1625,70 @@ PYBIND11_MODULE(rdep, m) {
      py::arg("sfa"), py::arg("ld_sf"), py::arg("M"), py::arg("K"),
      py::arg("stream") = py::none(),
      "BF16 -> NVFP4 using provided SFA (rowwise, sf_vec=32)");
+
+  m.def("dequant_fp8_to_bf16", [](uintptr_t q_ptr, int ldq,
+                                   uintptr_t sfa_ptr, int ld_sf,
+                                   uintptr_t out_ptr, int ld_out,
+                                   int M, int K, py::object stream) {
+    auto err = dequant_fp8_to_bf16(reinterpret_cast<const void*>(q_ptr), ldq,
+                                   reinterpret_cast<const void*>(sfa_ptr), ld_sf,
+                                   reinterpret_cast<void*>(out_ptr), ld_out,
+                                   M, K, to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("dequant_fp8_to_bf16 failed");
+  }, py::arg("q"), py::arg("ldq"),
+     py::arg("sfa"), py::arg("ld_sf"),
+     py::arg("out"), py::arg("ld_out"),
+     py::arg("M"), py::arg("K"),
+     py::arg("stream") = py::none(),
+     "FP8(blockscaled) -> BF16 dequantization using provided rowwise SFA");
+
+  m.def("dequant_fp8_to_bf16_mma_sf", [](uintptr_t q_ptr, int ldq,
+                                          uintptr_t sfa_ptr, int ld_sf,
+                                          uintptr_t out_ptr, int ld_out,
+                                          int M, int K, py::object stream) {
+    auto err = dequant_fp8_to_bf16_mma_sf(reinterpret_cast<const void*>(q_ptr), ldq,
+                                          reinterpret_cast<const void*>(sfa_ptr), ld_sf,
+                                          reinterpret_cast<void*>(out_ptr), ld_out,
+                                          M, K, to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("dequant_fp8_to_bf16_mma_sf failed");
+  }, py::arg("q"), py::arg("ldq"),
+     py::arg("sfa"), py::arg("ld_sf"),
+     py::arg("out"), py::arg("ld_out"),
+     py::arg("M"), py::arg("K"),
+     py::arg("stream") = py::none(),
+     "FP8(blockscaled) -> BF16 dequantization using CUTLASS MMA-swizzled SFA");
+
+  m.def("dequant_nvfp4_to_bf16", [](uintptr_t q_ptr, int ldq,
+                                     uintptr_t sfa_ptr, int ld_sf,
+                                     uintptr_t out_ptr, int ld_out,
+                                     int M, int K, py::object stream) {
+    auto err = dequant_nvfp4_to_bf16(reinterpret_cast<const void*>(q_ptr), ldq,
+                                     reinterpret_cast<const void*>(sfa_ptr), ld_sf,
+                                     reinterpret_cast<void*>(out_ptr), ld_out,
+                                     M, K, to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("dequant_nvfp4_to_bf16 failed");
+  }, py::arg("q"), py::arg("ldq"),
+     py::arg("sfa"), py::arg("ld_sf"),
+     py::arg("out"), py::arg("ld_out"),
+     py::arg("M"), py::arg("K"),
+     py::arg("stream") = py::none(),
+     "NVFP4(blockscaled) -> BF16 dequantization using provided rowwise SFA");
+
+  m.def("dequant_nvfp4_to_bf16_mma_sf", [](uintptr_t q_ptr, int ldq,
+                                            uintptr_t sfa_ptr, int ld_sf,
+                                            uintptr_t out_ptr, int ld_out,
+                                            int M, int K, py::object stream) {
+    auto err = dequant_nvfp4_to_bf16_mma_sf(reinterpret_cast<const void*>(q_ptr), ldq,
+                                            reinterpret_cast<const void*>(sfa_ptr), ld_sf,
+                                            reinterpret_cast<void*>(out_ptr), ld_out,
+                                            M, K, to_stream(stream));
+    if (err != cudaSuccess) throw std::runtime_error("dequant_nvfp4_to_bf16_mma_sf failed");
+  }, py::arg("q"), py::arg("ldq"),
+     py::arg("sfa"), py::arg("ld_sf"),
+     py::arg("out"), py::arg("ld_out"),
+     py::arg("M"), py::arg("K"),
+     py::arg("stream") = py::none(),
+     "NVFP4(blockscaled) -> BF16 dequantization using CUTLASS MMA-swizzled SFA");
 
   m.def("swizzle_sf_mkl_to_mma", [](uintptr_t sf_mkl_ptr, uintptr_t sf_mma_ptr,
                                      int M, int sf_k, py::object stream) {
@@ -1375,6 +1861,10 @@ PYBIND11_MODULE(rdep, m) {
     rdep_nvshmem_alloc_bf16(capacity, H, n_local);
   }, py::arg("capacity"), py::arg("H"), py::arg("n_local"),
      "Allocate NVSHMEM symmetric buffers for BF16 path");
+  m.def("nvshmem_alloc_blockscaled", [](size_t capacity, int H, int n_local, int profile) {
+    rdep_nvshmem_alloc_blockscaled(capacity, H, n_local, profile);
+  }, py::arg("capacity"), py::arg("H"), py::arg("n_local"), py::arg("profile"),
+     "Allocate NVSHMEM symmetric buffers for blockscaled path");
 
   // NVSHMEM IPC buffer functions (separate cudaMalloc'd buffer)
   // These are different from rdep get_ipc_handle_bf16 - they get handles
@@ -1386,12 +1876,28 @@ PYBIND11_MODULE(rdep, m) {
   }, "Get IPC handle for NVSHMEM's separate IPC buffer (BF16)");
 
   m.def("nvshmem_open_ipc_handles_bf16", [](py::array_t<uint8_t> handles, int local_world) {
+    validate_ipc_handles(handles, local_world, "nvshmem_open_ipc_handles_bf16");
     rdep_nvshmem_open_ipc_handles_bf16(handles.data(), local_world);
   }, py::arg("handles"), py::arg("local_world"),
      "Open remote IPC handles for NVSHMEM's IPC buffer (BF16)");
 
   m.def("nvshmem_sync_ipc_buffer_ptrs_bf16", &rdep_nvshmem_sync_ipc_buffer_ptrs_bf16,
         "Sync NVSHMEM IPC buffer pointers to device");
+
+  m.def("nvshmem_get_ipc_handle_blockscaled", []() {
+    py::array_t<uint8_t> handle(IPC_HANDLE_SIZE);
+    rdep_nvshmem_get_ipc_handle_blockscaled(handle.mutable_data());
+    return handle;
+  }, "Get IPC handle for NVSHMEM's separate IPC buffer (blockscaled)");
+
+  m.def("nvshmem_open_ipc_handles_blockscaled", [](py::array_t<uint8_t> handles, int local_world) {
+    validate_ipc_handles(handles, local_world, "nvshmem_open_ipc_handles_blockscaled");
+    rdep_nvshmem_open_ipc_handles_blockscaled(handles.data(), local_world);
+  }, py::arg("handles"), py::arg("local_world"),
+     "Open remote IPC handles for NVSHMEM's IPC buffer (blockscaled)");
+
+  m.def("nvshmem_sync_ipc_buffer_ptrs_blockscaled", &rdep_nvshmem_sync_ipc_buffer_ptrs_blockscaled,
+        "Sync NVSHMEM blockscaled IPC buffer pointers to device");
 
 #endif
 }

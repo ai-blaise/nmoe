@@ -1,5 +1,6 @@
 import logging
 import os
+import socket
 from contextlib import nullcontext
 from datetime import timedelta
 from typing import Dict, Optional
@@ -23,17 +24,33 @@ from .cuda_errors import (
 from .nccl_watchdog import get_watchdog
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) in ("1", "true", "True")
+
+
+_NVTX_ENABLED = (
+    _env_flag("NMOE_NVTX", "0")
+    and torch.cuda.is_available()
+    and hasattr(torch.cuda, "nvtx")
+    and hasattr(torch.cuda.nvtx, "range")
+)
+
+
 def _nvtx(tag: str):
-    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
-        return nullcontext()
-    if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+    if _NVTX_ENABLED:
         return torch.cuda.nvtx.range(tag)
     return nullcontext()
 
 
 def _get_local_world_size() -> int:
     """Get local world size (GPUs on this node)."""
-    return int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1")))
+    local = os.environ.get("LOCAL_WORLD_SIZE")
+    if local is not None:
+        return int(local)
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world > 1:
+        raise RuntimeError("LOCAL_WORLD_SIZE must be set when WORLD_SIZE > 1.")
+    return 1
 
 
 def _get_group_world_size(group: Optional[ProcessGroup] = None) -> int:
@@ -95,7 +112,7 @@ class Rdep:
         dim: int,
         n_local: int,
         topk: int,
-        profile: str = 'bf16',  # P3.7: Default to bf16 for hardware compatibility
+        profile: str = 'nvfp4',
         capacity: int = 65536,
         ep_group: Optional[ProcessGroup] = None,
     ):
@@ -106,7 +123,7 @@ class Rdep:
             n_local: Number of local experts per rank.
             topk: Number of experts activated per token.
             profile: Quantization profile - 'bf16', 'fp8', or 'nvfp4'.
-                    Defaults to 'bf16' for maximum hardware compatibility.
+                    Defaults to 'nvfp4' for production B200 training.
             capacity: Maximum tokens per RDEP buffer.
             ep_group: Optional expert-parallel process group. If None, uses the
                 default process group. This allows integration with custom EP
@@ -115,6 +132,12 @@ class Rdep:
         # P3.12: Use proper exception instead of assert for validation
         if profile not in self.PROFILES:
             raise TypeError(f"profile must be one of {list(self.PROFILES.keys())}, got {profile!r}")
+        if profile == "bf16":
+            raise ValueError(
+                "RDEP bf16 profile is not supported in production. Use profile='fp8' or 'nvfp4'."
+            )
+        if n_local <= 0:
+            raise ValueError(f"n_local must be > 0, got {n_local}")
 
         self.dim = dim
         self.n_local = n_local
@@ -125,6 +148,15 @@ class Rdep:
         self.world = _get_group_world_size(ep_group)
         self.rank = _get_group_rank(ep_group)
         self.local_world = _get_local_world_size()
+        self._device = torch.device("cuda", torch.cuda.current_device())
+        local_rank_env = os.environ.get("LOCAL_RANK")
+        if local_rank_env is not None:
+            local_rank = int(local_rank_env)
+            if local_rank != self._device.index:
+                raise RuntimeError(
+                    f"[RDEP] LOCAL_RANK={local_rank} does not match current CUDA device {self._device.index}. "
+                    "Set CUDA device by local rank before constructing Rdep."
+                )
 
         # P3.14: Pre-allocate pinned memory for D2H transfers
         # These are reused across forward/backward calls to avoid allocation overhead
@@ -142,13 +174,25 @@ class Rdep:
                 operation="init",
             ) from e
 
-        self._mode = {0: 'single', 1: 'ipc', 2: 'hybrid'}[mode_int]
+        mode_map = {0: 'single', 1: 'ipc', 2: 'hybrid'}
+        self._mode = mode_map.get(mode_int)
+        if self._mode is None:
+            raise RdepError(
+                f"[RDEP] unsupported mode from extension: {mode_int}",
+                operation="init",
+            )
+        if self._mode in {"ipc", "hybrid"} and dist.is_initialized():
+            global_world = dist.get_world_size()
+            global_rank = dist.get_rank()
+            if self.world != global_world or self.rank != global_rank:
+                raise RuntimeError(
+                    "[RDEP] Multi-rank IPC/hybrid mode currently requires EP group == global WORLD group."
+                )
         if self._mode == 'hybrid' and not _C.has_nvshmem():
             raise RuntimeError(
                 f"Multi-node configuration (world={self.world} > local_world={self.local_world}) "
                 "requires NVSHMEM support. Rebuild rdep with NVSHMEM or use single-node."
             )
-
         try:
             if self._mode == 'hybrid':
                 with _nvtx("rdep/init_hybrid"):
@@ -177,14 +221,27 @@ class Rdep:
                 operation="buffer_allocation",
             ) from e
 
+        self._dispatch_impl = (
+            self._dispatch_bf16_impl
+            if self.profile == 'bf16'
+            else self._dispatch_blockscaled_impl
+        )
+
     def _setup_hybrid(self):
         """Set up NVSHMEM for multi-node hybrid mode with CUDA error checking."""
+        global_world = dist.get_world_size() if dist.is_initialized() else self.world
+        global_rank = dist.get_rank() if dist.is_initialized() else self.rank
+        if self.world != global_world or self.rank != global_rank:
+            raise RuntimeError(
+                "[RDEP] Hybrid mode currently requires EP group == global WORLD group."
+            )
         cpu_pg = _cpu_pg()
         if cpu_pg is None:
             raise RuntimeError("[RDEP] internal error: expected dist to be initialized for hybrid bootstrap")
 
         try:
             uid_size = _C.nvshmem_get_uid_size()
+            use_bf16_hybrid = (self.profile == "bf16")
             with _nvtx("rdep/hybrid_bootstrap"):
                 if self.rank == 0:
                     _rdep_logger.info("rank=%d: Getting UID (size=%d)...", self.rank, uid_size)
@@ -209,26 +266,64 @@ class Rdep:
                 if self.rank == 0:
                     _rdep_logger.info("rank=%d: NVSHMEM initialized!", self.rank)
 
-                with cuda_error_context("nvshmem_alloc_bf16"):
-                    _C.nvshmem_alloc_bf16(self.capacity, self.dim, self.n_local)
+                if use_bf16_hybrid:
+                    with cuda_error_context("nvshmem_alloc_bf16"):
+                        _C.nvshmem_alloc_bf16(self.capacity, self.dim, self.n_local)
+                else:
+                    with cuda_error_context("nvshmem_alloc_blockscaled"):
+                        _C.nvshmem_alloc_blockscaled(
+                            self.capacity, self.dim, self.n_local, self.PROFILES[self.profile]
+                        )
 
-            node_id = self.rank // self.local_world
-            with cuda_error_context("nvshmem_get_ipc_handle_bf16"):
-                local_handle_bf16 = _C.nvshmem_get_ipc_handle_bf16()
+            my_host = socket.gethostname()
 
             with _nvtx("rdep/hybrid_allgather"):
-                all_handles_bf16 = [None] * self.world
-                dist.all_gather_object(all_handles_bf16, local_handle_bf16, group=cpu_pg)
-                local_handles_bf16 = []
+                all_hosts = [None] * self.world
+                dist.all_gather_object(all_hosts, my_host, group=cpu_pg)
+                local_rank_env = os.environ.get("LOCAL_RANK")
+                if local_rank_env is None:
+                    raise RuntimeError("[RDEP] LOCAL_RANK must be set for hybrid IPC-handle mapping.")
+                all_local_ranks = [None] * self.world
+                dist.all_gather_object(all_local_ranks, int(local_rank_env), group=cpu_pg)
+
+                local_entries = []
                 for r in range(self.world):
-                    if r // self.local_world == node_id:
-                        local_handles_bf16.append(all_handles_bf16[r])
-                local_handles_bf16_np = np.concatenate(local_handles_bf16)
+                    if all_hosts[r] == my_host:
+                        local_entries.append((int(all_local_ranks[r]), r))
+                if len(local_entries) != self.local_world:
+                    raise RuntimeError(
+                        f"[RDEP] expected {self.local_world} local IPC handles on host {my_host}, "
+                        f"got {len(local_entries)}."
+                    )
+                seen_local_ranks = set()
+                for lr, _ in local_entries:
+                    if lr < 0 or lr >= self.local_world or lr in seen_local_ranks:
+                        raise RuntimeError(
+                            f"[RDEP] invalid/duplicate LOCAL_RANK mapping for host {my_host}: {lr}."
+                        )
+                    seen_local_ranks.add(lr)
+                local_entries.sort(key=lambda x: x[0])
+                local_peer_ranks = [r for _, r in local_entries]
 
             with _nvtx("rdep/hybrid_open"):
-                with cuda_error_context("nvshmem_open_ipc_handles_bf16"):
-                    _C.nvshmem_open_ipc_handles_bf16(local_handles_bf16_np, self.local_world)
-                    _C.nvshmem_sync_ipc_buffer_ptrs_bf16()
+                if use_bf16_hybrid:
+                    all_handles_bf16 = [None] * self.world
+                    with cuda_error_context("nvshmem_get_ipc_handle_bf16"):
+                        local_handle_bf16 = _C.nvshmem_get_ipc_handle_bf16()
+                    dist.all_gather_object(all_handles_bf16, local_handle_bf16, group=cpu_pg)
+                    local_handles_bf16_np = np.concatenate([all_handles_bf16[r] for r in local_peer_ranks])
+                    with cuda_error_context("nvshmem_open_ipc_handles_bf16"):
+                        _C.nvshmem_open_ipc_handles_bf16(local_handles_bf16_np, self.local_world)
+                        _C.nvshmem_sync_ipc_buffer_ptrs_bf16()
+                else:
+                    all_handles_block = [None] * self.world
+                    with cuda_error_context("nvshmem_get_ipc_handle_blockscaled"):
+                        local_handle_block = _C.nvshmem_get_ipc_handle_blockscaled()
+                    dist.all_gather_object(all_handles_block, local_handle_block, group=cpu_pg)
+                    local_handles_block_np = np.concatenate([all_handles_block[r] for r in local_peer_ranks])
+                    with cuda_error_context("nvshmem_open_ipc_handles_blockscaled"):
+                        _C.nvshmem_open_ipc_handles_blockscaled(local_handles_block_np, self.local_world)
+                        _C.nvshmem_sync_ipc_buffer_ptrs_blockscaled()
 
             dist.barrier(group=cpu_pg)
 
@@ -239,7 +334,10 @@ class Rdep:
             ) from e
 
     @staticmethod
-    def _ipc_handle_to_int32(handle_np: np.ndarray) -> torch.Tensor:
+    def _ipc_handle_to_int32(
+        handle_np: np.ndarray,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
         """Convert an int8 IPC handle (numpy) to a CUDA int32 tensor for NCCL all_gather.
 
         NCCL's Tree algorithm does not support ncclInt8, but it does support
@@ -261,7 +359,9 @@ class Rdep:
         # reinterpret bytes as int32 on the numpy side, then move to CUDA
         # Use .view(np.uint8) first to normalise, then reinterpret as int32
         handle_i32_np = handle_np.view(np.uint8).view(np.int32)
-        return torch.from_numpy(handle_i32_np.copy()).cuda()
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        return torch.from_numpy(handle_i32_np.copy()).to(device=device, non_blocking=True)
 
     @staticmethod
     def _int32_handles_to_numpy(handle_tensors: list) -> np.ndarray:
@@ -305,7 +405,7 @@ class Rdep:
                 with cuda_error_context("get_ipc_handle_bf16"):
                     local_handle_bf16 = _C.get_ipc_handle_bf16()
             with _nvtx("rdep/ipc_to_int32_bf16"):
-                handle_tensor_bf16 = self._ipc_handle_to_int32(local_handle_bf16)
+                handle_tensor_bf16 = self._ipc_handle_to_int32(local_handle_bf16, device=self._device)
 
             with _nvtx("rdep/ipc_allgather_bf16"):
                 all_handles_bf16 = [torch.zeros_like(handle_tensor_bf16) for _ in range(self.world)]
@@ -323,7 +423,7 @@ class Rdep:
                 with _nvtx("rdep/ipc_get_handle_block"):
                     with cuda_error_context("get_ipc_handle_blockscaled"):
                         local_handle_block = _C.get_ipc_handle_blockscaled()
-                handle_tensor_block = self._ipc_handle_to_int32(local_handle_block)
+                handle_tensor_block = self._ipc_handle_to_int32(local_handle_block, device=self._device)
 
                 with _nvtx("rdep/ipc_allgather_block"):
                     all_handles_block = [torch.zeros_like(handle_tensor_block) for _ in range(self.world)]
@@ -358,6 +458,38 @@ class Rdep:
             if self.profile == 'bf16':
                 raise RuntimeError("moe_blockscaled() requires profile in {'fp8','nvfp4'}")
             return _MoEBlockscaledFused.apply(self, x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
+
+    def _dispatch_bf16_impl(
+        self,
+        x: torch.Tensor,
+        eid: torch.Tensor,
+        gates: torch.Tensor,
+        W1: torch.Tensor,
+        W3: torch.Tensor,
+        W2: torch.Tensor,
+        W_cache=None,
+        fused_eco=None,
+        moe_ref=None,
+    ) -> torch.Tensor:
+        return self.moe_bf16(x, eid, gates, W1, W3, W2)
+
+    def _dispatch_blockscaled_impl(
+        self,
+        x: torch.Tensor,
+        eid: torch.Tensor,
+        gates: torch.Tensor,
+        W1: torch.Tensor,
+        W3: torch.Tensor,
+        W2: torch.Tensor,
+        W_cache=None,
+        fused_eco=None,
+        moe_ref=None,
+    ) -> torch.Tensor:
+        if W_cache is None:
+            raise ValueError(
+                f"Blockscaled profile '{self.profile}' requires W_cache argument"
+            )
+        return self.moe_blockscaled(x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
 
     def dispatch(self, x: torch.Tensor, eid: torch.Tensor, gates: torch.Tensor,
                  W1: torch.Tensor, W3: torch.Tensor, W2: torch.Tensor,
@@ -394,16 +526,22 @@ class Rdep:
                 f"Token count exceeds RDEP capacity: T={T} * K={K} * world={world} = {required:,} > capacity={self.capacity:,}. "
                 f"Increase capacity via compute_rdep_capacity() or reduce batch size."
             )
+        expected_device = self._device
+        for name, tensor in (("x", x), ("eid", eid), ("gates", gates), ("W1", W1), ("W3", W3), ("W2", W2)):
+            if tensor.device != expected_device:
+                raise ValueError(
+                    f"{name} must be on {expected_device}, got {tensor.device}"
+                )
+        if W_cache is not None and W_cache.device != expected_device:
+            raise ValueError(
+                f"W_cache must be on {expected_device}, got {W_cache.device}"
+            )
 
         with _nvtx("rdep/dispatch"):
-            if self.profile == 'bf16':
-                return self.moe_bf16(x, eid, gates, W1, W3, W2)
-            else:
-                if W_cache is None:
-                    raise ValueError(
-                        f"Blockscaled profile '{self.profile}' requires W_cache argument"
-                    )
-                return self.moe_blockscaled(x, eid, gates, W1, W3, W2, W_cache, fused_eco, moe_ref)
+            return self._dispatch_impl(
+                x, eid, gates, W1, W3, W2,
+                W_cache=W_cache, fused_eco=fused_eco, moe_ref=moe_ref
+            )
 
 
 class CudaGraphDispatch:
@@ -413,7 +551,7 @@ class CudaGraphDispatch:
     replay during decode phase, eliminating kernel launch overhead.
 
     Usage:
-        rdep = Rdep(dim=256, n_local=8, topk=2, profile="bf16")
+        rdep = Rdep(dim=256, n_local=8, topk=2, profile="nvfp4")
         graph_dispatch = CudaGraphDispatch(rdep)
 
         # Capture with representative inputs
@@ -492,35 +630,40 @@ class CudaGraphDispatch:
 
         if w1 is None or w3 is None or w2 is None:
             raise ValueError("W1, W3, W2 must be provided for CUDA graph capture")
+        device = x.device
+        for name, tensor in (("eid", eid), ("gates", gates), ("W1", w1), ("W3", w3), ("W2", w2)):
+            if tensor.device != device:
+                raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+        if self._w_cache is not None and self._w_cache.device != device:
+            raise ValueError(f"W_cache must be on {device}, got {self._w_cache.device}")
 
         # Warmup: run several iterations on a side stream to ensure kernels are compiled
-        # P3.5: Use context manager pattern to ensure stream cleanup
-        warmup_stream = torch.cuda.Stream()
-        warmup_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(self._warmup_iterations):
-                self.rdep.dispatch(
+        with torch.cuda.device(device):
+            warmup_stream = torch.cuda.Stream(device=device)
+            current_stream = torch.cuda.current_stream(device=device)
+            warmup_stream.wait_stream(current_stream)
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(self._warmup_iterations):
+                    self.rdep.dispatch(
+                        self.static_inputs['x'],
+                        self.static_inputs['eid'],
+                        self.static_inputs['gates'],
+                        w1, w3, w2,
+                        self._w_cache,
+                    )
+            # Stream dependency is sufficient here; no host-side synchronize needed.
+            current_stream.wait_stream(warmup_stream)
+
+            # Capture the graph
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.static_outputs['result'] = self.rdep.dispatch(
                     self.static_inputs['x'],
                     self.static_inputs['eid'],
                     self.static_inputs['gates'],
                     w1, w3, w2,
                     self._w_cache,
                 )
-        torch.cuda.current_stream().wait_stream(warmup_stream)
-        # P3.5: Explicitly synchronize and delete stream to release resources
-        warmup_stream.synchronize()
-        del warmup_stream
-
-        # Capture the graph
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.static_outputs['result'] = self.rdep.dispatch(
-                self.static_inputs['x'],
-                self.static_inputs['eid'],
-                self.static_inputs['gates'],
-                w1, w3, w2,
-                self._w_cache,
-            )
 
     def replay(
         self,
@@ -543,14 +686,42 @@ class CudaGraphDispatch:
         """
         if self.graph is None:
             raise RuntimeError("Graph not captured. Call capture() first.")
+        if x.device != self.static_inputs['x'].device:
+            raise ValueError(
+                f"x must be on {self.static_inputs['x'].device}, got {x.device}"
+            )
+        if x.dtype != self.static_inputs['x'].dtype or x.shape != self.static_inputs['x'].shape:
+            raise ValueError(
+                f"x must match captured shape/dtype {tuple(self.static_inputs['x'].shape)}/{self.static_inputs['x'].dtype}, "
+                f"got {tuple(x.shape)}/{x.dtype}"
+            )
+        if eid.device != self.static_inputs['eid'].device:
+            raise ValueError(
+                f"eid must be on {self.static_inputs['eid'].device}, got {eid.device}"
+            )
+        if eid.dtype != self.static_inputs['eid'].dtype or eid.shape != self.static_inputs['eid'].shape:
+            raise ValueError(
+                f"eid must match captured shape/dtype {tuple(self.static_inputs['eid'].shape)}/{self.static_inputs['eid'].dtype}, "
+                f"got {tuple(eid.shape)}/{eid.dtype}"
+            )
+        if gates.device != self.static_inputs['gates'].device:
+            raise ValueError(
+                f"gates must be on {self.static_inputs['gates'].device}, got {gates.device}"
+            )
+        if gates.dtype != self.static_inputs['gates'].dtype or gates.shape != self.static_inputs['gates'].shape:
+            raise ValueError(
+                f"gates must match captured shape/dtype {tuple(self.static_inputs['gates'].shape)}/{self.static_inputs['gates'].dtype}, "
+                f"got {tuple(gates.shape)}/{gates.dtype}"
+            )
 
         # Copy new inputs to static buffers
         self.static_inputs['x'].copy_(x)
         self.static_inputs['eid'].copy_(eid)
         self.static_inputs['gates'].copy_(gates)
 
-        # Replay the captured graph
-        self.graph.replay()
+        # Replay the captured graph on the captured device context.
+        with torch.cuda.device(self.static_inputs['x'].device):
+            self.graph.replay()
 
         return self.static_outputs['result']
 

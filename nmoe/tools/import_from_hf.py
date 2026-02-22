@@ -409,8 +409,8 @@ def import_nvfp4_to_nmoe(
     decompression or re-quantization. Expert weights are sharded across EP ranks
     with all 3 triplet components going to the same rank.
 
-    The checkpoint stores NVFP4 format metadata so the load path knows to
-    dequantize triplets into BF16 parameters before training begins.
+    The checkpoint stores NVFP4 format metadata so training can load expert
+    triplets directly into NVFP4 primary buffers (no expert dequant/re-quant).
 
     Args:
         model_dir: Path to HF NVFP4 model directory with safetensors.

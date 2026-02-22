@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 
@@ -50,6 +51,8 @@ constexpr int BLOCK_SIZE_ACCUM = 256;
 
 // Threads per block for reduction kernel
 constexpr int BLOCK_SIZE_REDUCE = 256;
+constexpr int MAX_BLOCKS_FUSED = 256;
+constexpr size_t DEFAULT_DYNAMIC_SMEM_LIMIT_BYTES = 48 * 1024;
 
 // ============================================================================
 // Kernel 1: Accumulate f[] and P[] counts
@@ -191,8 +194,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE_ACCUM)
 k_aux_loss_fused(
     const int32_t* __restrict__ expert_ids,  // [T*K]
     const float*   __restrict__ gates,       // [T*K] FP32
-    float*         __restrict__ f_global,    // [E] global accumulator (zeroed)
-    float*         __restrict__ P_global,    // [E] global accumulator (zeroed)
+    float*         __restrict__ f_global,    // [E] global accumulator (zero-initialized once)
+    float*         __restrict__ P_global,    // [E] global accumulator (zero-initialized once)
     float*         __restrict__ loss_out,    // [1] scalar output
     int*           __restrict__ block_done,  // [1] counter for grid sync
     int E,
@@ -271,6 +274,15 @@ k_aux_loss_fused(
 
         if (tid == 0) {
             loss_out[0] = alpha * (float)E * smem[0];
+        }
+
+        // Keep scratch state reset for the next launch on this stream.
+        for (int e = tid; e < E; e += BLOCK_SIZE_ACCUM) {
+            f_global[e] = 0.0f;
+            P_global[e] = 0.0f;
+        }
+        if (tid == 0) {
+            block_done[0] = 0;
         }
     }
 }
@@ -355,6 +367,14 @@ k_aux_loss_fused_bf16(
         if (tid == 0) {
             loss_out[0] = alpha * (float)E * smem[0];
         }
+
+        for (int e = tid; e < E; e += BLOCK_SIZE_ACCUM) {
+            f_global[e] = 0.0f;
+            P_global[e] = 0.0f;
+        }
+        if (tid == 0) {
+            block_done[0] = 0;
+        }
     }
 }
 
@@ -438,6 +458,14 @@ k_aux_loss_fused_f16(
         if (tid == 0) {
             loss_out[0] = alpha * (float)E * smem[0];
         }
+
+        for (int e = tid; e < E; e += BLOCK_SIZE_ACCUM) {
+            f_global[e] = 0.0f;
+            P_global[e] = 0.0f;
+        }
+        if (tid == 0) {
+            block_done[0] = 0;
+        }
     }
 }
 
@@ -447,6 +475,70 @@ k_aux_loss_fused_f16(
 // ============================================================================
 // C API -- called from Python via ctypes
 // ============================================================================
+
+template <typename KernelT>
+static inline cudaError_t configure_dynamic_smem_if_needed(
+    KernelT kernel,
+    size_t smem_bytes,
+    const char* fn_name)
+{
+    if (smem_bytes <= nmoe::aux_loss::DEFAULT_DYNAMIC_SMEM_LIMIT_BYTES) {
+        return cudaSuccess;
+    }
+
+    int device = -1;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) return err;
+
+    // Template-local cache (one cache per kernel symbol/type).
+    thread_local int cached_device = -1;
+    thread_local int cached_max_optin_smem = -1;
+    thread_local int configured_device = -1;
+    thread_local size_t configured_smem = 0;
+
+    if (device != cached_device || cached_max_optin_smem <= 0) {
+        int max_optin_smem = 0;
+        err = cudaDeviceGetAttribute(&max_optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        if (err != cudaSuccess) return err;
+        if (max_optin_smem <= 0) {
+            max_optin_smem = static_cast<int>(nmoe::aux_loss::DEFAULT_DYNAMIC_SMEM_LIMIT_BYTES);
+        }
+        cached_device = device;
+        cached_max_optin_smem = max_optin_smem;
+        configured_device = -1;
+        configured_smem = 0;
+    }
+    const int max_optin_smem = cached_max_optin_smem;
+
+    if (smem_bytes > static_cast<size_t>(max_optin_smem)) {
+        fprintf(
+            stderr,
+            "%s: requested dynamic shared memory %zu bytes exceeds device opt-in limit %d bytes\n",
+            fn_name,
+            smem_bytes,
+            max_optin_smem);
+        return cudaErrorInvalidValue;
+    }
+
+    if (configured_device != device || configured_smem != smem_bytes) {
+        err = cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes));
+        if (err != cudaSuccess) {
+            fprintf(
+                stderr,
+                "%s: cudaFuncSetAttribute(max_dynamic_smem=%zu) failed: %s\n",
+                fn_name,
+                smem_bytes,
+                cudaGetErrorString(err));
+            return err;
+        }
+        configured_device = device;
+        configured_smem = smem_bytes;
+    }
+    return cudaSuccess;
+}
 
 extern "C" {
 
@@ -589,14 +681,14 @@ cudaError_t fused_aux_loss_f16(
 
 /// Single-kernel fused variant (FP32 gates).
 /// More efficient when E is small enough for shared memory.
-/// Requires: smem_bytes = 2 * E * sizeof(float) <= 48KB
+/// Requires: smem_bytes = 2 * E * sizeof(float) <= device dynamic-smem limit.
 cudaError_t fused_aux_loss_single_f32(
     const void* expert_ids,    // [TK] int32
     const void* gates,         // [TK] FP32
-    void*       f_global,      // [E] FP32 (zeroed)
-    void*       P_global,      // [E] FP32 (zeroed)
+    void*       f_global,      // [E] FP32 accumulator scratch (zero-init once; reset internally per launch)
+    void*       P_global,      // [E] FP32 accumulator scratch (zero-init once; reset internally per launch)
     void*       loss_out,      // [1] FP32
-    void*       block_done,    // [1] int32 (zeroed)
+    void*       block_done,    // [1] int32 scratch (reset internally)
     int E,
     int TK,
     float alpha,
@@ -604,23 +696,22 @@ cudaError_t fused_aux_loss_single_f32(
 {
     using namespace nmoe::aux_loss;
 
-    if (TK <= 0) {
+    if (TK <= 0 || E <= 0) {
         cudaMemsetAsync(loss_out, 0, sizeof(float), stream);
         return cudaSuccess;
     }
 
     // Shared memory: 2 * E floats for f_local and P_local
-    size_t smem_bytes = 2 * E * sizeof(float);
+    size_t smem_bytes = 2ull * static_cast<size_t>(E) * sizeof(float);
 
-    // Check shared memory limit (48KB default, can be increased)
-    if (smem_bytes > 48 * 1024) {
-        // Fall back to two-kernel variant
-        return fused_aux_loss_f32(expert_ids, gates, f_global, P_global,
-                                  loss_out, E, TK, alpha, stream);
-    }
+    cudaError_t err = configure_dynamic_smem_if_needed(
+        k_aux_loss_fused, smem_bytes, "fused_aux_loss_single_f32");
+    if (err != cudaSuccess) return err;
 
     int blocks = ceil_div(TK, BLOCK_SIZE_ACCUM);
-    blocks = min(blocks, 256);  // Limit blocks for grid sync efficiency
+    if (blocks > MAX_BLOCKS_FUSED) {
+        blocks = MAX_BLOCKS_FUSED;  // Limit blocks for grid-sync counter efficiency.
+    }
 
     k_aux_loss_fused<<<blocks, BLOCK_SIZE_ACCUM, smem_bytes, stream>>>(
         reinterpret_cast<const int32_t*>(expert_ids),
@@ -638,10 +729,10 @@ cudaError_t fused_aux_loss_single_f32(
 cudaError_t fused_aux_loss_single_bf16(
     const void* expert_ids,    // [TK] int32
     const void* gates,         // [TK] BF16
-    void*       f_global,      // [E] FP32 (zeroed)
-    void*       P_global,      // [E] FP32 (zeroed)
+    void*       f_global,      // [E] FP32 accumulator scratch (zero-init once; reset internally per launch)
+    void*       P_global,      // [E] FP32 accumulator scratch (zero-init once; reset internally per launch)
     void*       loss_out,      // [1] FP32
-    void*       block_done,    // [1] int32 (zeroed)
+    void*       block_done,    // [1] int32 scratch (reset internally)
     int E,
     int TK,
     float alpha,
@@ -649,20 +740,21 @@ cudaError_t fused_aux_loss_single_bf16(
 {
     using namespace nmoe::aux_loss;
 
-    if (TK <= 0) {
+    if (TK <= 0 || E <= 0) {
         cudaMemsetAsync(loss_out, 0, sizeof(float), stream);
         return cudaSuccess;
     }
 
-    size_t smem_bytes = 2 * E * sizeof(float);
+    size_t smem_bytes = 2ull * static_cast<size_t>(E) * sizeof(float);
 
-    if (smem_bytes > 48 * 1024) {
-        return fused_aux_loss_bf16(expert_ids, gates, f_global, P_global,
-                                   loss_out, E, TK, alpha, stream);
-    }
+    cudaError_t err = configure_dynamic_smem_if_needed(
+        k_aux_loss_fused_bf16, smem_bytes, "fused_aux_loss_single_bf16");
+    if (err != cudaSuccess) return err;
 
     int blocks = ceil_div(TK, BLOCK_SIZE_ACCUM);
-    blocks = min(blocks, 256);
+    if (blocks > MAX_BLOCKS_FUSED) {
+        blocks = MAX_BLOCKS_FUSED;
+    }
 
     k_aux_loss_fused_bf16<<<blocks, BLOCK_SIZE_ACCUM, smem_bytes, stream>>>(
         reinterpret_cast<const int32_t*>(expert_ids),
@@ -680,10 +772,10 @@ cudaError_t fused_aux_loss_single_bf16(
 cudaError_t fused_aux_loss_single_f16(
     const void* expert_ids,    // [TK] int32
     const void* gates,         // [TK] FP16
-    void*       f_global,      // [E] FP32 (zeroed)
-    void*       P_global,      // [E] FP32 (zeroed)
+    void*       f_global,      // [E] FP32 accumulator scratch (zero-init once; reset internally per launch)
+    void*       P_global,      // [E] FP32 accumulator scratch (zero-init once; reset internally per launch)
     void*       loss_out,      // [1] FP32
-    void*       block_done,    // [1] int32 (zeroed)
+    void*       block_done,    // [1] int32 scratch (reset internally)
     int E,
     int TK,
     float alpha,
@@ -691,20 +783,21 @@ cudaError_t fused_aux_loss_single_f16(
 {
     using namespace nmoe::aux_loss;
 
-    if (TK <= 0) {
+    if (TK <= 0 || E <= 0) {
         cudaMemsetAsync(loss_out, 0, sizeof(float), stream);
         return cudaSuccess;
     }
 
-    size_t smem_bytes = 2 * E * sizeof(float);
+    size_t smem_bytes = 2ull * static_cast<size_t>(E) * sizeof(float);
 
-    if (smem_bytes > 48 * 1024) {
-        return fused_aux_loss_f16(expert_ids, gates, f_global, P_global,
-                                  loss_out, E, TK, alpha, stream);
-    }
+    cudaError_t err = configure_dynamic_smem_if_needed(
+        k_aux_loss_fused_f16, smem_bytes, "fused_aux_loss_single_f16");
+    if (err != cudaSuccess) return err;
 
     int blocks = ceil_div(TK, BLOCK_SIZE_ACCUM);
-    blocks = min(blocks, 256);
+    if (blocks > MAX_BLOCKS_FUSED) {
+        blocks = MAX_BLOCKS_FUSED;
+    }
 
     k_aux_loss_fused_f16<<<blocks, BLOCK_SIZE_ACCUM, smem_bytes, stream>>>(
         reinterpret_cast<const int32_t*>(expert_ids),
@@ -716,6 +809,13 @@ cudaError_t fused_aux_loss_single_f16(
         E, TK, alpha, blocks);
 
     return cudaGetLastError();
+}
+
+/// Aux-loss single-kernel capability flags for Python runtime contract checks.
+int fused_aux_loss_single_caps() {
+    constexpr int kHasInternalReset = 1 << 0;
+    constexpr int kNoTwoKernelFallback = 1 << 1;
+    return kHasInternalReset | kNoTwoKernelFallback;
 }
 
 } // extern "C"

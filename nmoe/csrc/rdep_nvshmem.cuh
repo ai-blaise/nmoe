@@ -102,11 +102,10 @@ struct NvshmemState {
     int*      local_eid;       // [capacity] extracted local expert IDs
     int*      order;           // [capacity] sort permutation
     int*      offsets;         // [n_local+1] expert offsets
+    int*      offs_pad;        // [n_local] last dispatch offs_pad_out device pointer
     int*      dest;            // [capacity] dest mapping for gather
     int*      M_pad_dev;       // [1] padded row count
     Meta*     meta_copy;       // [capacity] snapshot of dispatch meta for return
-    // Blockscaled-only workspace
-    uint8_t*  sfa_gather_tmp;  // [max_pad * Hsf] gathered rowwise SFA (row-major)
     void*     sort_temp;       // CUB sort temp storage
     size_t    sort_temp_bytes;
 
@@ -238,6 +237,15 @@ void gather_xe_hybrid_blockscaled(
     int M_pad,
     cudaStream_t stream);
 
+// Zero only per-expert padding rows in BF16 padded buffers for hybrid path.
+void zero_bf16_padding_rows_hybrid(
+    void* out,                 // [M_pad, H] BF16
+    const int* offs_pad,       // [n_local] padded expert offsets
+    int M_recv,
+    int M_pad,
+    int H,
+    cudaStream_t stream);
+
 // ============================================================================
 // Hybrid Return Scatter
 // ============================================================================
@@ -301,9 +309,43 @@ void gather_dy_hybrid_bf16(
     int M, int T, int H, int K,
     cudaStream_t stream);
 
+// Backward gather (split dGate): stages dY via IPC+NVSHMEM and computes only local dYe.
+void gather_dy_nogate_hybrid_bf16(
+    const __nv_bfloat16* dY_local,   // [T, H]
+    const int* eids,                 // [T, K] global expert ids
+    const int64_t* row_id,           // [M]
+    const float* gate_sorted,        // [M]
+    __nv_bfloat16* dYe_out,          // [M, H]
+    int M, int T, int H, int K,
+    cudaStream_t stream);
+
+// Backward dGate send/collect (split dGate): sends sorted dGate to token owners and collects [T,K].
+void send_dgate_hybrid_bf16(
+    const int64_t* row_id,           // [M]
+    const float* dGate_sorted,       // [M]
+    float* dGates_tk_out,            // [T, K] float32
+    int M, int T, int K,
+    cudaStream_t stream);
+
+// Same as send_dgate_hybrid_bf16 but outputs BF16 [T,K].
+void send_dgate_hybrid_bf16_out_bf16(
+    const int64_t* row_id,           // [M]
+    const float* dGate_sorted,       // [M]
+    __nv_bfloat16* dGates_tk_out,    // [T, K] bf16
+    int M, int T, int K,
+    cudaStream_t stream);
+
 // Backward scatter: sends dXe rows back to token owners via fixed tok-slot writes + local reduction.
 void scatter_dx_hybrid_bf16(
     const __nv_bfloat16* dXe_sorted,  // [M, H]
+    const int64_t* row_id,            // [M]
+    float* dX_out,                    // [T, H] (float32 accum)
+    int M, int T, int H, int K,
+    cudaStream_t stream);
+
+// Backward scatter from padded layout: uses g_nvshmem.dest to avoid pad->sorted gather.
+void scatter_dx_hybrid_bf16_from_pad(
+    const __nv_bfloat16* dXe_pad,     // [M_pad, H]
     const int64_t* row_id,            // [M]
     float* dX_out,                    // [T, H] (float32 accum)
     int M, int T, int H, int K,

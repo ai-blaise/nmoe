@@ -48,6 +48,52 @@ constexpr int ELEMS_PER_THREAD = TILE_IN / THREADS_Y;  // 4
 
 __host__ __device__ __forceinline__ int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
+// Choose a bounded grid for grid-stride kernels to reduce launch overhead.
+inline cudaError_t choose_stride_grid_x(int64_t total, int threads, uint32_t* grid_x_out) {
+    if (grid_x_out == nullptr || threads <= 0) return cudaErrorInvalidValue;
+    if (total <= 0) {
+        *grid_x_out = 0;
+        return cudaSuccess;
+    }
+
+    int dev = -1;
+    cudaError_t err = cudaGetDevice(&dev);
+    if (err != cudaSuccess) return err;
+
+    static thread_local int cached_dev = -2;
+    static thread_local int cached_sm_count = 0;
+    if (dev != cached_dev) {
+        int sm_count = 0;
+        err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev);
+        if (err != cudaSuccess) return err;
+        cached_dev = dev;
+        cached_sm_count = sm_count;
+    }
+
+    constexpr int64_t kBlocksPerSm = 8;
+    const int64_t blocks64 = (total + threads - 1) / threads;
+    const int64_t cap64 = static_cast<int64_t>(cached_sm_count) * kBlocksPerSm;
+    int64_t grid64 = blocks64;
+    if (cap64 > 0 && grid64 > cap64) grid64 = cap64;
+    if (grid64 > 2147483647LL) grid64 = 2147483647LL;
+    if (grid64 < 1) grid64 = 1;
+    *grid_x_out = static_cast<uint32_t>(grid64);
+    return cudaSuccess;
+}
+
+template <typename GradT>
+__device__ __forceinline__ float load_grad_elem(const GradT* grad, int64_t idx);
+
+template <>
+__device__ __forceinline__ float load_grad_elem<float>(const float* grad, int64_t idx) {
+    return grad[idx];
+}
+
+template <>
+__device__ __forceinline__ float load_grad_elem<__nv_bfloat16>(const __nv_bfloat16* grad, int64_t idx) {
+    return __bfloat162float(grad[idx]);
+}
+
 // ============================================================================
 // Factored-v reduction kernels (Kernel A).
 //
@@ -63,8 +109,9 @@ __host__ __device__ __forceinline__ int ceil_div(int a, int b) { return (a + b -
 // ============================================================================
 
 // One BLOCK per (expert, row) pair. Threads collaboratively reduce across out_dim.
+template <typename GradT>
 __global__ void k_factored_v_row(
-    const float* __restrict__ grad,    // [E, in_dim, out_dim] nmoe layout
+    const GradT* __restrict__ grad,    // [E, in_dim, out_dim] nmoe layout
     float* __restrict__ v_row,         // [E, in_dim]
     float* __restrict__ v_rms,         // [E] (output: mean of v_row per expert)
     int E,
@@ -87,7 +134,7 @@ __global__ void k_factored_v_row(
                            + static_cast<int64_t>(i) * out_dim;
     float thread_sum = 0.0f;
     for (int j = threadIdx.x; j < out_dim; j += blockDim.x) {
-        float g = grad[row_base + j];
+        float g = load_grad_elem<GradT>(grad, row_base + j);
         thread_sum += g * g;
     }
 
@@ -108,26 +155,22 @@ __global__ void k_factored_v_row(
         for (int offset = 16; offset > 0; offset >>= 1)
             val += __shfl_down_sync(0xFFFFFFFF, val, offset);
         if (lane == 0) {
-            float grad_sq_row_mean = val / static_cast<float>(out_dim);
+            const float grad_sq_row_mean = val / static_cast<float>(out_dim);
+            const float inv_in_dim = 1.0f / static_cast<float>(in_dim);
             const int64_t vr_idx = static_cast<int64_t>(e) * in_dim + i;
             float vr = beta2 * v_row[vr_idx] + one_minus_b2 * grad_sq_row_mean;
             v_row[vr_idx] = vr;
-            // Warp-level reduction to minimize atomic contention
-            float warp_sum = vr;
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
-            }
-            // Only lane 0 of each warp does the atomic
-            if ((threadIdx.x & 31) == 0) {
-                atomicAdd(&v_rms[e], warp_sum);
-            }
+            // One atomic per (expert,row) block. This avoids extra warp-level
+            // atomics and removes unnecessary shuffle work in the hot path.
+            atomicAdd(&v_rms[e], vr * inv_in_dim);
         }
     }
 }
 
 // One BLOCK per (expert, col) pair. Threads collaboratively reduce across in_dim.
+template <typename GradT>
 __global__ void k_factored_v_col(
-    const float* __restrict__ grad,    // [E, in_dim, out_dim] nmoe layout
+    const GradT* __restrict__ grad,    // [E, in_dim, out_dim] nmoe layout
     float* __restrict__ v_col,         // [E, out_dim]
     int E,
     int in_dim,
@@ -148,7 +191,7 @@ __global__ void k_factored_v_col(
     const int64_t expert_base = static_cast<int64_t>(e) * in_dim * out_dim;
     float thread_sum = 0.0f;
     for (int i = threadIdx.x; i < in_dim; i += blockDim.x) {
-        float g = grad[expert_base + static_cast<int64_t>(i) * out_dim + j];
+        float g = load_grad_elem<GradT>(grad, expert_base + static_cast<int64_t>(i) * out_dim + j);
         thread_sum += g * g;
     }
 
@@ -176,25 +219,18 @@ __global__ void k_factored_v_col(
     }
 }
 
-// Finalize v_rms: divide accumulated sum by in_dim to get mean
-__global__ void k_factored_v_rms_finalize(
-    float* __restrict__ v_rms,  // [E]
-    int E,
-    int in_dim)
-{
-    const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= E) return;
-    v_rms[e] = fmaxf(v_rms[e] / static_cast<float>(in_dim), 1e-30f);
-}
-
 // Launch wrapper for all factored-v reduction sub-kernels.
+template <typename GradT>
 inline cudaError_t launch_factored_v_update(
-    const float* grad,
+    const GradT* grad,
     float* v_row, float* v_col, float* v_rms,
     int E, int in_dim, int out_dim,
     float beta2,
     cudaStream_t stream)
 {
+    if (E < 0 || in_dim < 0 || out_dim < 0) return cudaErrorInvalidValue;
+    if (E == 0 || in_dim == 0 || out_dim == 0) return cudaSuccess;
+
     // Zero v_rms before atomicAdd accumulation
     auto err = cudaMemsetAsync(v_rms, 0, E * sizeof(float), stream);
     if (err != cudaSuccess) return err;
@@ -204,9 +240,10 @@ inline cudaError_t launch_factored_v_update(
     // Sub-kernel 1: row means + v_row update + v_rms accumulation
     // One block per (expert, row) pair; threads reduce across out_dim in parallel
     {
-        const int total = E * in_dim;
-        const dim3 grid(total);
-        k_factored_v_row<<<grid, THREADS, 0, stream>>>(
+        const int64_t total64 = static_cast<int64_t>(E) * in_dim;
+        if (total64 > 2147483647LL) return cudaErrorInvalidValue;
+        const dim3 grid(static_cast<uint32_t>(total64));
+        k_factored_v_row<GradT><<<grid, THREADS, 0, stream>>>(
             grad, v_row, v_rms, E, in_dim, out_dim, beta2);
         err = cudaGetLastError();
         if (err != cudaSuccess) return err;
@@ -215,19 +252,11 @@ inline cudaError_t launch_factored_v_update(
     // Sub-kernel 2: column means + v_col update
     // One block per (expert, col) pair; threads reduce across in_dim in parallel
     {
-        const int total = E * out_dim;
-        const dim3 grid(total);
-        k_factored_v_col<<<grid, THREADS, 0, stream>>>(
+        const int64_t total64 = static_cast<int64_t>(E) * out_dim;
+        if (total64 > 2147483647LL) return cudaErrorInvalidValue;
+        const dim3 grid(static_cast<uint32_t>(total64));
+        k_factored_v_col<GradT><<<grid, THREADS, 0, stream>>>(
             grad, v_col, E, in_dim, out_dim, beta2);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) return err;
-    }
-
-    // Sub-kernel 3: finalize v_rms (divide by in_dim)
-    {
-        const dim3 grid(ceil_div(E, THREADS));
-        k_factored_v_rms_finalize<<<grid, THREADS, 0, stream>>>(
-            v_rms, E, in_dim);
         err = cudaGetLastError();
         if (err != cudaSuccess) return err;
     }
@@ -256,7 +285,7 @@ inline cudaError_t launch_factored_v_update(
 // Gradient:                 [E, in_dim, out_dim]   (nmoe layout, FP32)
 // ============================================================================
 
-template <bool kStochasticRounding, bool kErrorFeedback, bool kFactoredV = false>
+template <bool kStochasticRounding, bool kErrorFeedback, bool kFactoredV = false, typename GradT = float>
 __global__ void k_eco_adam_nvfp4_update(
     // NVFP4 weight triplet (HF layout)
     uint8_t* __restrict__ W_packed,       // [E, out_dim, in_dim/2]
@@ -274,8 +303,8 @@ __global__ void k_eco_adam_nvfp4_update(
     const float* __restrict__ v_col,      // [E, out_dim] (pre-updated by Kernel A)
     const float* __restrict__ v_rms,      // [E] mean(v_row) per expert
 
-    // Gradient (nmoe layout, FP32)
-    const float* __restrict__ grad,       // [E, in_dim, out_dim]
+    // Gradient (nmoe layout)
+    const GradT* __restrict__ grad,       // [E, in_dim, out_dim]
 
     // Dimensions
     int E,
@@ -306,12 +335,14 @@ __global__ void k_eco_adam_nvfp4_update(
     const int out_local = static_cast<int>(threadIdx.x);  // [0, 31]
     const int in_iter = static_cast<int>(threadIdx.y);     // [0, 7]
     const int out_row = out0 + out_local;
+    const int group_shift = __ffs(group_size) - 1;
+    const int groups_per_row = in_dim >> group_shift;
 
     // Strides for layout indexing
     const int64_t hf_stride_e = static_cast<int64_t>(out_dim) * in_dim;       // per expert in HF
     const int64_t nmoe_stride_e = static_cast<int64_t>(in_dim) * out_dim;     // per expert in nmoe
     const int64_t hf_packed_stride_e = static_cast<int64_t>(out_dim) * (in_dim / 2);
-    const int64_t hf_scale_stride_e = static_cast<int64_t>(out_dim) * (in_dim / group_size);
+    const int64_t hf_scale_stride_e = static_cast<int64_t>(out_dim) * groups_per_row;
 
     const float one_minus_b1 = 1.0f - beta1;
     const float one_minus_b2 = 1.0f - beta2;
@@ -357,8 +388,8 @@ __global__ void k_eco_adam_nvfp4_update(
 
         // Per-group scale
         const int64_t wscale_idx = static_cast<int64_t>(e) * hf_scale_stride_e
-                                 + static_cast<int64_t>(out_row) * (in_dim / group_size)
-                                 + (in_col / group_size);
+                                 + static_cast<int64_t>(out_row) * groups_per_row
+                                 + (in_col >> group_shift);
         float group_sc = ptx::e4m3_byte_to_f32(W_scale[wscale_idx]);
         float w = w_raw * group_sc * inv_gs;
 
@@ -366,7 +397,7 @@ __global__ void k_eco_adam_nvfp4_update(
         const int64_t grad_idx = static_cast<int64_t>(e) * nmoe_stride_e
                                + static_cast<int64_t>(in_col) * out_dim
                                + out_row;
-        float g = grad[grad_idx];
+        float g = load_grad_elem<GradT>(grad, grad_idx);
 
         // --- Load FP8 m (nmoe layout: [e, in_col, out_row]) ---
         const int64_t mv_idx = grad_idx;  // same layout as gradient
@@ -405,7 +436,7 @@ __global__ void k_eco_adam_nvfp4_update(
             //   v = v_row[e, in_col] * v_col[e, out_row] / v_rms[e]
             float vr = v_row[static_cast<int64_t>(e) * in_dim + in_col];
             float vc = v_col[static_cast<int64_t>(e) * out_dim + out_row];
-            float vrms = v_rms[e];  // already clamped to >= 1e-30
+            float vrms = fmaxf(v_rms[e], 1e-30f);
             v_val = (vr * vc) / vrms;
             denom = sqrtf(v_val) * inv_bc2_sqrt + effective_eps;
         } else {
@@ -425,27 +456,55 @@ __global__ void k_eco_adam_nvfp4_update(
     __syncthreads();
 
     // ============================================================
-    // Phase 2: Compute E8M0 block scale for NVFP4 requantization
+    // Phase 2: Compute true per-group NVFP4 scales (no extra kernel pass)
     // ============================================================
-    // Each row of 32 elements in the in_dim direction = one SF_VEC block.
-    // threadIdx.y == 0 computes amax.
-    __shared__ uint8_t sh_e8m0[TILE_OUT];
-    __shared__ float sh_block_scale[TILE_OUT];
+    // Previous versions quantized with one scale per 32-wide tile, then ran a
+    // second kernel to tighten scales to group_size. We now compute per-group
+    // scales directly in this kernel so the external recompute pass is not
+    // needed on the hot path.
+    const int groups_per_tile = TILE_IN >> group_shift;
+    __shared__ float sh_group_amax[TILE_OUT][THREADS_Y];
+    __shared__ float sh_group_scale[TILE_OUT][TILE_IN];
 
-    if (in_iter == 0) {
-        float amax = 0.0f;
+    for (int g = 0; g < groups_per_tile; ++g) {
+        const int group_start = g * group_size;
+        const int group_end = group_start + group_size;
+        float thread_amax = 0.0f;
+
         #pragma unroll
-        for (int k = 0; k < TILE_IN; ++k) {
-            amax = fmaxf(amax, fabsf(sh_w[out_local][k]));
+        for (int t = 0; t < ELEMS_PER_THREAD; ++t) {
+            const int in_local = t * THREADS_Y + in_iter;
+            if (in_local >= group_start && in_local < group_end) {
+                thread_amax = fmaxf(thread_amax, fabsf(sh_w[out_local][in_local]));
+            }
         }
-        float scale_f = amax / NVFP4_MAX;
-        if (!(scale_f > 0.0f)) scale_f = 1.17549435e-38f;
-        uint8_t scale_byte = ptx::e8m0_encode_from_pos_f32(scale_f);
-        sh_e8m0[out_local] = scale_byte;
-        sh_block_scale[out_local] = ptx::e8m0_decode_to_f32(scale_byte);
-    }
 
-    __syncthreads();
+        sh_group_amax[out_local][in_iter] = thread_amax;
+        __syncthreads();
+
+        if (in_iter == 0) {
+            float group_amax = 0.0f;
+            #pragma unroll
+            for (int y = 0; y < THREADS_Y; ++y) {
+                group_amax = fmaxf(group_amax, sh_group_amax[out_local][y]);
+            }
+
+            float scale_f = group_amax / NVFP4_MAX;
+            if (!(scale_f > 0.0f)) scale_f = 1e-12f;
+            const uint8_t e4m3_scale = ptx::f32_to_e4m3_byte(scale_f);
+            const float decoded_scale = ptx::e4m3_byte_to_f32(e4m3_scale);
+            sh_group_scale[out_local][g] = decoded_scale;
+
+            const int in_col_group_start = in0 + group_start;
+            if (in_col_group_start < in_dim) {
+                const int64_t wscale_idx = static_cast<int64_t>(e) * hf_scale_stride_e
+                                         + static_cast<int64_t>(out_row) * groups_per_row
+                                         + (in_col_group_start >> group_shift);
+                W_scale[wscale_idx] = e4m3_scale;
+            }
+        }
+        __syncthreads();
+    }
 
     // ============================================================
     // Phase 3: Requant weight to E2M1 + ECO error injection + write back
@@ -468,8 +527,9 @@ __global__ void k_eco_adam_nvfp4_update(
         const int in_col = in0 + in_local;
 
         float w = sh_w[out_local][in_local];
-        float block_scale = sh_block_scale[out_local];
-        float inv_scale = ptx::e8m0_inv_decode_to_f32(sh_e8m0[out_local]);
+        const int group_idx = in_local >> group_shift;
+        const float group_scale = sh_group_scale[out_local][group_idx];
+        const float inv_scale = (group_scale > 0.0f) ? (1.0f / group_scale) : 1.0f;
 
         // Stochastic-round to E2M1
         float w_scaled = w * inv_scale;
@@ -502,7 +562,7 @@ __global__ void k_eco_adam_nvfp4_update(
         }
 
         // Dequant w_hat for ECO error
-        float w_hat = ptx::e2m1_nibble_to_f32(nibble) * block_scale;
+        float w_hat = ptx::e2m1_nibble_to_f32(nibble) * group_scale;
 
         // ECO error injection into momentum
         float m_val = m_reg[t];
@@ -515,16 +575,6 @@ __global__ void k_eco_adam_nvfp4_update(
 
         // Store nibble to shared memory for race-free packed write
         sh_nibble[out_local][in_local] = nibble;
-
-        // --- Write NVFP4 per-group scale ---
-        // Each group of group_size consecutive elements shares one E4M3 scale.
-        // The block scale is the E8M0 scale converted to E4M3 for storage.
-        if ((in_col % group_size) == 0) {
-            const int64_t wscale_idx = static_cast<int64_t>(e) * hf_scale_stride_e
-                                     + static_cast<int64_t>(out_row) * (in_dim / group_size)
-                                     + (in_col / group_size);
-            W_scale[wscale_idx] = ptx::f32_to_e4m3_byte(block_scale);
-        }
 
         // --- Write FP8 m (always) and v (only when !kFactoredV) ---
         const int64_t mv_idx = static_cast<int64_t>(e) * nmoe_stride_e
@@ -685,10 +735,173 @@ __global__ void k_fp8_recompute_row_scale(
 #endif
 }
 
+// Combined m/v row-scale recompute for non-factored FP8 optimizer states.
+// This fuses two post-passes into one launch:
+// - m_data (E5M2) + m_scale
+// - v_data (E4M3) + v_scale
+// and reuses the row traversal for both tensors.
+__global__ void k_fp8_recompute_row_scale_pair(
+    uint8_t* __restrict__ m_data,       // [E, in_dim, out_dim] E5M2
+    float* __restrict__ m_scale,        // [E, in_dim]
+    uint8_t* __restrict__ v_data,       // [E, in_dim, out_dim] E4M3
+    float* __restrict__ v_scale,        // [E, in_dim]
+    int E,
+    int in_dim,
+    int out_dim)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int row = blockIdx.x;
+    const int total_rows = E * in_dim;
+    if (row >= total_rows) return;
+
+    constexpr float E5M2_MAX = 57344.0f;
+    constexpr float E4M3_MAX = 448.0f;
+
+    const float old_m_scale = m_scale[row];
+    const float old_v_scale = v_scale[row];
+    const int64_t row_base = static_cast<int64_t>(row) * out_dim;
+
+    float thread_amax_m = 0.0f;
+    float thread_amax_v = 0.0f;
+    for (int j = threadIdx.x; j < out_dim; j += blockDim.x) {
+        const uint8_t m_byte = m_data[row_base + j];
+        const uint8_t v_byte = v_data[row_base + j];
+        const float m_val = ptx::e5m2_byte_to_f32(m_byte) * old_m_scale;
+        const float v_val = ptx::e4m3_byte_to_f32(v_byte) * old_v_scale;
+        thread_amax_m = fmaxf(thread_amax_m, fabsf(m_val));
+        thread_amax_v = fmaxf(thread_amax_v, fabsf(v_val));
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_amax_m = fmaxf(thread_amax_m, __shfl_down_sync(0xFFFFFFFF, thread_amax_m, offset));
+        thread_amax_v = fmaxf(thread_amax_v, __shfl_down_sync(0xFFFFFFFF, thread_amax_v, offset));
+    }
+
+    __shared__ float sdata_m[8];
+    __shared__ float sdata_v[8];
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+    if (lane == 0) {
+        sdata_m[warp_id] = thread_amax_m;
+        sdata_v[warp_id] = thread_amax_v;
+    }
+    __syncthreads();
+
+    __shared__ float sh_ratio_m;
+    __shared__ float sh_ratio_v;
+    if (warp_id == 0) {
+        float max_m = (lane < (blockDim.x >> 5)) ? sdata_m[lane] : 0.0f;
+        float max_v = (lane < (blockDim.x >> 5)) ? sdata_v[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            max_m = fmaxf(max_m, __shfl_down_sync(0xFFFFFFFF, max_m, offset));
+            max_v = fmaxf(max_v, __shfl_down_sync(0xFFFFFFFF, max_v, offset));
+        }
+        if (lane == 0) {
+            const float new_m_scale = fmaxf(max_m / E5M2_MAX, 1e-30f);
+            const float new_v_scale = fmaxf(max_v / E4M3_MAX, 1e-30f);
+            m_scale[row] = new_m_scale;
+            v_scale[row] = new_v_scale;
+            sh_ratio_m = old_m_scale / new_m_scale;
+            sh_ratio_v = old_v_scale / new_v_scale;
+        }
+    }
+    __syncthreads();
+
+    const float ratio_m = sh_ratio_m;
+    const float ratio_v = sh_ratio_v;
+    for (int j = threadIdx.x; j < out_dim; j += blockDim.x) {
+        const int64_t idx = row_base + j;
+        const float m_val = ptx::e5m2_byte_to_f32(m_data[idx]) * ratio_m;
+        const float v_val = ptx::e4m3_byte_to_f32(v_data[idx]) * ratio_v;
+        m_data[idx] = ptx::f32_to_e5m2_byte(m_val);
+        v_data[idx] = ptx::f32_to_e4m3_byte(v_val);
+    }
+#else
+    (void)m_data; (void)m_scale; (void)v_data; (void)v_scale;
+    (void)E; (void)in_dim; (void)out_dim;
+    __trap();
+#endif
+}
+
 
 // ============================================================================
 // Launch wrapper (non-factored-v — backward compatible)
 // ============================================================================
+
+template <typename GradT>
+inline cudaError_t launch_eco_adam_nvfp4_update_t(
+    uint8_t* W_packed, uint8_t* W_scale, float* W_gs,
+    uint8_t* m_data, float* m_scale_f32,
+    uint8_t* v_data, float* v_scale_f32,
+    const GradT* grad,
+    int E, int out_dim, int in_dim, int group_size,
+    float lr, float beta1, float beta2,
+    float weight_decay, float eps,
+    float step_size, float inv_bc2_sqrt, float eco_alpha,
+    bool stochastic_rounding, bool error_feedback,
+    uint32_t prng_seed0, uint32_t prng_seed1,
+    cudaStream_t stream)
+{
+    if (E < 0 || out_dim < 0 || in_dim < 0) return cudaErrorInvalidValue;
+    if (E == 0 || out_dim == 0 || in_dim == 0) return cudaSuccess;
+    if ((out_dim & 31) != 0) return cudaErrorInvalidValue;
+    if ((in_dim & 31) != 0) return cudaErrorInvalidValue;
+    if (group_size <= 0 || group_size > TILE_IN || (TILE_IN % group_size) != 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    // Main ECO Adam kernel (kFactoredV=false)
+    const dim3 block(THREADS_X, THREADS_Y, 1);
+    const dim3 grid(ceil_div(out_dim, TILE_OUT), ceil_div(in_dim, TILE_IN), E);
+
+    // v_row/v_col/v_rms are nullptr for the non-factored path
+    const float* v_row_null = nullptr;
+    const float* v_col_null = nullptr;
+    const float* v_rms_null = nullptr;
+
+    if (stochastic_rounding && error_feedback) {
+        k_eco_adam_nvfp4_update<true, true, false, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
+            v_row_null, v_col_null, v_rms_null,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    } else if (stochastic_rounding) {
+        k_eco_adam_nvfp4_update<true, false, false, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
+            v_row_null, v_col_null, v_rms_null,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    } else if (error_feedback) {
+        k_eco_adam_nvfp4_update<false, true, false, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
+            v_row_null, v_col_null, v_rms_null,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    } else {
+        k_eco_adam_nvfp4_update<false, false, false, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
+            v_row_null, v_col_null, v_rms_null,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    }
+
+    auto err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // FP8 scale recomputation pass for m and v (fused pair kernel).
+    const int64_t total_rows64 = static_cast<int64_t>(E) * in_dim;
+    if (total_rows64 > 2147483647LL) return cudaErrorInvalidValue;
+    const int total_rows = static_cast<int>(total_rows64);
+    constexpr int RECOMP_THREADS = 256;
+
+    k_fp8_recompute_row_scale_pair<<<total_rows, RECOMP_THREADS, 0, stream>>>(
+        m_data, m_scale_f32, v_data, v_scale_f32, E, in_dim, out_dim);
+    return cudaGetLastError();
+}
 
 inline cudaError_t launch_eco_adam_nvfp4_update(
     uint8_t* W_packed, uint8_t* W_scale, float* W_gs,
@@ -703,68 +916,115 @@ inline cudaError_t launch_eco_adam_nvfp4_update(
     uint32_t prng_seed0, uint32_t prng_seed1,
     cudaStream_t stream)
 {
-    if ((out_dim & 31) != 0) return cudaErrorInvalidValue;
-    if ((in_dim & 31) != 0) return cudaErrorInvalidValue;
+    return launch_eco_adam_nvfp4_update_t<float>(
+        W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32, grad,
+        E, out_dim, in_dim, group_size,
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+        stochastic_rounding, error_feedback, prng_seed0, prng_seed1, stream);
+}
 
-    // Main ECO Adam kernel (kFactoredV=false)
-    const dim3 block(THREADS_X, THREADS_Y, 1);
-    const dim3 grid(ceil_div(out_dim, TILE_OUT), ceil_div(in_dim, TILE_IN), E);
-
-    // v_row/v_col/v_rms are nullptr for the non-factored path
-    const float* v_row_null = nullptr;
-    const float* v_col_null = nullptr;
-    const float* v_rms_null = nullptr;
-
-    if (stochastic_rounding && error_feedback) {
-        k_eco_adam_nvfp4_update<true, true, false><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
-            v_row_null, v_col_null, v_rms_null,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    } else if (stochastic_rounding) {
-        k_eco_adam_nvfp4_update<true, false, false><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
-            v_row_null, v_col_null, v_rms_null,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    } else if (error_feedback) {
-        k_eco_adam_nvfp4_update<false, true, false><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
-            v_row_null, v_col_null, v_rms_null,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    } else {
-        k_eco_adam_nvfp4_update<false, false, false><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32,
-            v_row_null, v_col_null, v_rms_null,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    }
-
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    // FP8 scale recomputation pass for m and v (one block per row, parallel reduction)
-    const int total_rows = E * in_dim;
-    constexpr int RECOMP_THREADS = 256;
-
-    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
-        m_data, m_scale_f32, E, in_dim, out_dim);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    k_fp8_recompute_row_scale<false><<<total_rows, RECOMP_THREADS, 0, stream>>>(
-        v_data, v_scale_f32, E, in_dim, out_dim);
-    return cudaGetLastError();
+inline cudaError_t launch_eco_adam_nvfp4_update_bf16(
+    uint8_t* W_packed, uint8_t* W_scale, float* W_gs,
+    uint8_t* m_data, float* m_scale_f32,
+    uint8_t* v_data, float* v_scale_f32,
+    const __nv_bfloat16* grad,
+    int E, int out_dim, int in_dim, int group_size,
+    float lr, float beta1, float beta2,
+    float weight_decay, float eps,
+    float step_size, float inv_bc2_sqrt, float eco_alpha,
+    bool stochastic_rounding, bool error_feedback,
+    uint32_t prng_seed0, uint32_t prng_seed1,
+    cudaStream_t stream)
+{
+    return launch_eco_adam_nvfp4_update_t<__nv_bfloat16>(
+        W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data, v_scale_f32, grad,
+        E, out_dim, in_dim, group_size,
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+        stochastic_rounding, error_feedback, prng_seed0, prng_seed1, stream);
 }
 
 // ============================================================================
 // Launch wrapper (factored-v path)
 // ============================================================================
+
+template <typename GradT>
+inline cudaError_t launch_eco_adam_nvfp4_fv_update_t(
+    uint8_t* W_packed, uint8_t* W_scale, float* W_gs,
+    uint8_t* m_data, float* m_scale_f32,
+    float* v_row, float* v_col, float* v_rms,
+    const GradT* grad,
+    int E, int out_dim, int in_dim, int group_size,
+    float lr, float beta1, float beta2,
+    float weight_decay, float eps,
+    float step_size, float inv_bc2_sqrt, float eco_alpha,
+    bool stochastic_rounding, bool error_feedback,
+    uint32_t prng_seed0, uint32_t prng_seed1,
+    cudaStream_t stream)
+{
+    if (E < 0 || out_dim < 0 || in_dim < 0) return cudaErrorInvalidValue;
+    if (E == 0 || out_dim == 0 || in_dim == 0) return cudaSuccess;
+    if ((out_dim & 31) != 0) return cudaErrorInvalidValue;
+    if ((in_dim & 31) != 0) return cudaErrorInvalidValue;
+    if (group_size <= 0 || group_size > TILE_IN || (TILE_IN % group_size) != 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    // Step 1: Run factored-v reduction kernels (updates v_row, v_col, v_rms)
+    auto err = launch_factored_v_update<GradT>(
+        grad, v_row, v_col, v_rms, E, in_dim, out_dim, beta2, stream);
+    if (err != cudaSuccess) return err;
+
+    // Step 2: Main ECO Adam kernel (kFactoredV=true)
+    const dim3 block(THREADS_X, THREADS_Y, 1);
+    const dim3 grid(ceil_div(out_dim, TILE_OUT), ceil_div(in_dim, TILE_IN), E);
+
+    // v_data/v_scale are nullptr for the factored path
+    uint8_t* v_data_null = nullptr;
+    float* v_scale_null = nullptr;
+
+    if (stochastic_rounding && error_feedback) {
+        k_eco_adam_nvfp4_update<true, true, true, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
+            v_row, v_col, v_rms,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    } else if (stochastic_rounding) {
+        k_eco_adam_nvfp4_update<true, false, true, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
+            v_row, v_col, v_rms,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    } else if (error_feedback) {
+        k_eco_adam_nvfp4_update<false, true, true, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
+            v_row, v_col, v_rms,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    } else {
+        k_eco_adam_nvfp4_update<false, false, true, GradT><<<grid, block, 0, stream>>>(
+            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
+            v_row, v_col, v_rms,
+            grad, E, out_dim, in_dim, group_size,
+            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+            prng_seed0, prng_seed1);
+    }
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // FP8 scale recomputation pass for m only (one block per row, parallel reduction)
+    const int64_t total_rows64 = static_cast<int64_t>(E) * in_dim;
+    if (total_rows64 > 2147483647LL) return cudaErrorInvalidValue;
+    const int total_rows = static_cast<int>(total_rows64);
+    constexpr int RECOMP_THREADS = 256;
+
+    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
+        m_data, m_scale_f32, E, in_dim, out_dim);
+    return cudaGetLastError();
+}
 
 inline cudaError_t launch_eco_adam_nvfp4_fv_update(
     uint8_t* W_packed, uint8_t* W_scale, float* W_gs,
@@ -779,62 +1039,31 @@ inline cudaError_t launch_eco_adam_nvfp4_fv_update(
     uint32_t prng_seed0, uint32_t prng_seed1,
     cudaStream_t stream)
 {
-    if ((out_dim & 31) != 0) return cudaErrorInvalidValue;
-    if ((in_dim & 31) != 0) return cudaErrorInvalidValue;
+    return launch_eco_adam_nvfp4_fv_update_t<float>(
+        W_packed, W_scale, W_gs, m_data, m_scale_f32, v_row, v_col, v_rms, grad,
+        E, out_dim, in_dim, group_size,
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+        stochastic_rounding, error_feedback, prng_seed0, prng_seed1, stream);
+}
 
-    // Step 1: Run factored-v reduction kernels (updates v_row, v_col, v_rms)
-    auto err = launch_factored_v_update(grad, v_row, v_col, v_rms,
-                                        E, in_dim, out_dim, beta2, stream);
-    if (err != cudaSuccess) return err;
-
-    // Step 2: Main ECO Adam kernel (kFactoredV=true)
-    const dim3 block(THREADS_X, THREADS_Y, 1);
-    const dim3 grid(ceil_div(out_dim, TILE_OUT), ceil_div(in_dim, TILE_IN), E);
-
-    // v_data/v_scale are nullptr for the factored path
-    uint8_t* v_data_null = nullptr;
-    float* v_scale_null = nullptr;
-
-    if (stochastic_rounding && error_feedback) {
-        k_eco_adam_nvfp4_update<true, true, true><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
-            v_row, v_col, v_rms,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    } else if (stochastic_rounding) {
-        k_eco_adam_nvfp4_update<true, false, true><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
-            v_row, v_col, v_rms,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    } else if (error_feedback) {
-        k_eco_adam_nvfp4_update<false, true, true><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
-            v_row, v_col, v_rms,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    } else {
-        k_eco_adam_nvfp4_update<false, false, true><<<grid, block, 0, stream>>>(
-            W_packed, W_scale, W_gs, m_data, m_scale_f32, v_data_null, v_scale_null,
-            v_row, v_col, v_rms,
-            grad, E, out_dim, in_dim, group_size,
-            lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
-            prng_seed0, prng_seed1);
-    }
-
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    // FP8 scale recomputation pass for m only (one block per row, parallel reduction)
-    const int total_rows = E * in_dim;
-    constexpr int RECOMP_THREADS = 256;
-
-    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
-        m_data, m_scale_f32, E, in_dim, out_dim);
-    return cudaGetLastError();
+inline cudaError_t launch_eco_adam_nvfp4_fv_update_bf16(
+    uint8_t* W_packed, uint8_t* W_scale, float* W_gs,
+    uint8_t* m_data, float* m_scale_f32,
+    float* v_row, float* v_col, float* v_rms,
+    const __nv_bfloat16* grad,
+    int E, int out_dim, int in_dim, int group_size,
+    float lr, float beta1, float beta2,
+    float weight_decay, float eps,
+    float step_size, float inv_bc2_sqrt, float eco_alpha,
+    bool stochastic_rounding, bool error_feedback,
+    uint32_t prng_seed0, uint32_t prng_seed1,
+    cudaStream_t stream)
+{
+    return launch_eco_adam_nvfp4_fv_update_t<__nv_bfloat16>(
+        W_packed, W_scale, W_gs, m_data, m_scale_f32, v_row, v_col, v_rms, grad,
+        E, out_dim, in_dim, group_size,
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+        stochastic_rounding, error_feedback, prng_seed0, prng_seed1, stream);
 }
 
 // ============================================================================
@@ -862,7 +1091,7 @@ inline cudaError_t launch_eco_adam_nvfp4_fv_update(
 
 // Per-element m/v EMA update with fractional betas.
 // One thread per element in the (E, in_dim, out_dim) tensor.
-template <bool kFactoredV>
+template <bool kFactoredV, typename GradT = float>
 __global__ void k_eco_mv_accumulate(
     // FP8 optimizer states (nmoe layout: [E, in_dim, out_dim])
     uint8_t* __restrict__ m_data,         // [E, in_dim, out_dim] E5M2
@@ -870,8 +1099,8 @@ __global__ void k_eco_mv_accumulate(
     uint8_t* __restrict__ v_data,         // [E, in_dim, out_dim] E4M3 (kFactoredV=false only)
     float* __restrict__ v_scale,          // [E * in_dim] per-row (kFactoredV=false only)
 
-    // Gradient (nmoe layout, FP32)
-    const float* __restrict__ grad,       // [E, in_dim, out_dim]
+    // Gradient (nmoe layout)
+    const GradT* __restrict__ grad,       // [E, in_dim, out_dim]
 
     // Dimensions
     int E,
@@ -883,35 +1112,36 @@ __global__ void k_eco_mv_accumulate(
     float beta2_frac)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
-    if (idx >= total) return;
-
-    // Compute row index for per-row scale: row = idx / out_dim
-    const int row = idx / out_dim;
-
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
     const float one_minus_b1 = 1.0f - beta1_frac;
     const float one_minus_b2 = 1.0f - beta2_frac;
 
-    // Load gradient
-    float g = grad[idx];
+    for (int64_t idx = tid; idx < total; idx += stride) {
+        // Compute row index for per-row scale: row = idx / out_dim
+        const int64_t row = idx / out_dim;
 
-    // --- Update m ---
-    float m_sc = m_scale[row];
-    float m_val = ptx::e5m2_byte_to_f32(m_data[idx]) * m_sc;
-    m_val = beta1_frac * m_val + one_minus_b1 * g;
+        // Load gradient
+        float g = load_grad_elem<GradT>(grad, idx);
 
-    // Write m back with old scale (scale recompute pass follows)
-    float m_inv_sc = (m_sc > 0.0f) ? (1.0f / m_sc) : 1.0f;
-    m_data[idx] = ptx::f32_to_e5m2_byte(m_val * m_inv_sc);
+        // --- Update m ---
+        float m_sc = m_scale[row];
+        float m_val = ptx::e5m2_byte_to_f32(m_data[idx]) * m_sc;
+        m_val = beta1_frac * m_val + one_minus_b1 * g;
 
-    // --- Update v (full FP8 path only; factored-v handled separately) ---
-    if constexpr (!kFactoredV) {
-        float v_sc = v_scale[row];
-        float v_val = ptx::e4m3_byte_to_f32(v_data[idx]) * v_sc;
-        v_val = beta2_frac * v_val + one_minus_b2 * g * g;
-        float v_inv_sc = (v_sc > 0.0f) ? (1.0f / v_sc) : 1.0f;
-        v_data[idx] = ptx::f32_to_e4m3_byte(v_val * v_inv_sc);
+        // Write m back with old scale (scale recompute pass follows)
+        float m_inv_sc = (m_sc > 0.0f) ? (1.0f / m_sc) : 1.0f;
+        m_data[idx] = ptx::f32_to_e5m2_byte(m_val * m_inv_sc);
+
+        // --- Update v (full FP8 path only; factored-v handled separately) ---
+        if constexpr (!kFactoredV) {
+            float v_sc = v_scale[row];
+            float v_val = ptx::e4m3_byte_to_f32(v_data[idx]) * v_sc;
+            v_val = beta2_frac * v_val + one_minus_b2 * g * g;
+            float v_inv_sc = (v_sc > 0.0f) ? (1.0f / v_sc) : 1.0f;
+            v_data[idx] = ptx::f32_to_e4m3_byte(v_val * v_inv_sc);
+        }
     }
 #else
     (void)m_data; (void)m_scale; (void)v_data; (void)v_scale;
@@ -923,6 +1153,43 @@ __global__ void k_eco_mv_accumulate(
 
 
 // Launch wrapper for AdamA m/v accumulation (non-factored v)
+template <typename GradT>
+inline cudaError_t launch_eco_mv_accumulate_t(
+    uint8_t* m_data, float* m_scale,
+    uint8_t* v_data, float* v_scale,
+    const GradT* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    if (E < 0 || in_dim < 0 || out_dim < 0) return cudaErrorInvalidValue;
+    const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
+    constexpr int THREADS = 256;
+    if (total <= 0) return cudaSuccess;
+
+    uint32_t grid_x = 0;
+    auto err = choose_stride_grid_x(total, THREADS, &grid_x);
+    if (err != cudaSuccess) return err;
+    const dim3 grid(grid_x);
+    const dim3 block(THREADS);
+
+    k_eco_mv_accumulate<false, GradT><<<grid, block, 0, stream>>>(
+        m_data, m_scale, v_data, v_scale, grad,
+        E, in_dim, out_dim, beta1_frac, beta2_frac);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // FP8 scale recomputation for m and v (fused pair kernel).
+    const int64_t total_rows64 = static_cast<int64_t>(E) * in_dim;
+    if (total_rows64 > 2147483647LL) return cudaErrorInvalidValue;
+    const int total_rows = static_cast<int>(total_rows64);
+    constexpr int RECOMP_THREADS = 256;
+
+    k_fp8_recompute_row_scale_pair<<<total_rows, RECOMP_THREADS, 0, stream>>>(
+        m_data, m_scale, v_data, v_scale, E, in_dim, out_dim);
+    return cudaGetLastError();
+}
+
 inline cudaError_t launch_eco_mv_accumulate(
     uint8_t* m_data, float* m_scale,
     uint8_t* v_data, float* v_scale,
@@ -931,33 +1198,70 @@ inline cudaError_t launch_eco_mv_accumulate(
     float beta1_frac, float beta2_frac,
     cudaStream_t stream)
 {
-    const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
-    constexpr int THREADS = 256;
-    const dim3 grid(ceil_div(static_cast<int>(total), THREADS));
-    const dim3 block(THREADS);
-
-    k_eco_mv_accumulate<false><<<grid, block, 0, stream>>>(
+    return launch_eco_mv_accumulate_t<float>(
         m_data, m_scale, v_data, v_scale, grad,
-        E, in_dim, out_dim, beta1_frac, beta2_frac);
-    auto err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
+        E, in_dim, out_dim, beta1_frac, beta2_frac, stream);
+}
 
-    // FP8 scale recomputation for m and v (one block per row, parallel reduction)
-    const int total_rows = E * in_dim;
-    constexpr int RECOMP_THREADS = 256;
-
-    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
-        m_data, m_scale, E, in_dim, out_dim);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    k_fp8_recompute_row_scale<false><<<total_rows, RECOMP_THREADS, 0, stream>>>(
-        v_data, v_scale, E, in_dim, out_dim);
-    return cudaGetLastError();
+inline cudaError_t launch_eco_mv_accumulate_bf16(
+    uint8_t* m_data, float* m_scale,
+    uint8_t* v_data, float* v_scale,
+    const __nv_bfloat16* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    return launch_eco_mv_accumulate_t<__nv_bfloat16>(
+        m_data, m_scale, v_data, v_scale, grad,
+        E, in_dim, out_dim, beta1_frac, beta2_frac, stream);
 }
 
 
 // Launch wrapper for AdamA m/v accumulation (factored-v)
+template <typename GradT>
+inline cudaError_t launch_eco_mv_accumulate_fv_t(
+    uint8_t* m_data, float* m_scale,
+    float* v_row, float* v_col, float* v_rms,
+    const GradT* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    if (E < 0 || in_dim < 0 || out_dim < 0) return cudaErrorInvalidValue;
+    if (E == 0 || in_dim == 0 || out_dim == 0) return cudaSuccess;
+
+    // Step 1: Run factored-v reduction kernels to update v_row, v_col, v_rms
+    // (these use beta2_frac instead of beta2)
+    auto err = launch_factored_v_update<GradT>(
+        grad, v_row, v_col, v_rms, E, in_dim, out_dim, beta2_frac, stream);
+    if (err != cudaSuccess) return err;
+
+    // Step 2: Update m only (kFactoredV=true skips v_data update)
+    const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
+    constexpr int THREADS = 256;
+    uint32_t grid_x = 0;
+    err = choose_stride_grid_x(total, THREADS, &grid_x);
+    if (err != cudaSuccess) return err;
+    const dim3 grid(grid_x);
+    const dim3 block(THREADS);
+
+    k_eco_mv_accumulate<true, GradT><<<grid, block, 0, stream>>>(
+        m_data, m_scale, nullptr, nullptr, grad,
+        E, in_dim, out_dim, beta1_frac, beta2_frac);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+
+    // FP8 scale recomputation for m only (one block per row, parallel reduction)
+    const int64_t total_rows64 = static_cast<int64_t>(E) * in_dim;
+    if (total_rows64 > 2147483647LL) return cudaErrorInvalidValue;
+    const int total_rows = static_cast<int>(total_rows64);
+    constexpr int RECOMP_THREADS = 256;
+
+    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
+        m_data, m_scale, E, in_dim, out_dim);
+    return cudaGetLastError();
+}
+
 inline cudaError_t launch_eco_mv_accumulate_fv(
     uint8_t* m_data, float* m_scale,
     float* v_row, float* v_col, float* v_rms,
@@ -966,30 +1270,22 @@ inline cudaError_t launch_eco_mv_accumulate_fv(
     float beta1_frac, float beta2_frac,
     cudaStream_t stream)
 {
-    // Step 1: Run factored-v reduction kernels to update v_row, v_col, v_rms
-    // (these use beta2_frac instead of beta2)
-    auto err = launch_factored_v_update(grad, v_row, v_col, v_rms,
-                                        E, in_dim, out_dim, beta2_frac, stream);
-    if (err != cudaSuccess) return err;
+    return launch_eco_mv_accumulate_fv_t<float>(
+        m_data, m_scale, v_row, v_col, v_rms, grad,
+        E, in_dim, out_dim, beta1_frac, beta2_frac, stream);
+}
 
-    // Step 2: Update m only (kFactoredV=true skips v_data update)
-    const int64_t total = static_cast<int64_t>(E) * in_dim * out_dim;
-    constexpr int THREADS = 256;
-    const dim3 grid(ceil_div(static_cast<int>(total), THREADS));
-
-    k_eco_mv_accumulate<true><<<grid, THREADS, 0, stream>>>(
-        m_data, m_scale, nullptr, nullptr, grad,
-        E, in_dim, out_dim, beta1_frac, beta2_frac);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-
-    // FP8 scale recomputation for m only (one block per row, parallel reduction)
-    const int total_rows = E * in_dim;
-    constexpr int RECOMP_THREADS = 256;
-
-    k_fp8_recompute_row_scale<true><<<total_rows, RECOMP_THREADS, 0, stream>>>(
-        m_data, m_scale, E, in_dim, out_dim);
-    return cudaGetLastError();
+inline cudaError_t launch_eco_mv_accumulate_fv_bf16(
+    uint8_t* m_data, float* m_scale,
+    float* v_row, float* v_col, float* v_rms,
+    const __nv_bfloat16* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    return launch_eco_mv_accumulate_fv_t<__nv_bfloat16>(
+        m_data, m_scale, v_row, v_col, v_rms, grad,
+        E, in_dim, out_dim, beta1_frac, beta2_frac, stream);
 }
 
 
@@ -1250,25 +1546,16 @@ inline cudaError_t launch_nvfp4_recompute_group_scales(
     int E, int out_dim, int in_dim, int group_size,
     cudaStream_t stream)
 {
+    if (E < 0 || out_dim < 0 || in_dim < 0) return cudaErrorInvalidValue;
+    if (E == 0 || out_dim == 0 || in_dim == 0) return cudaSuccess;
+    if (group_size <= 0 || group_size > TILE_IN || (TILE_IN % group_size) != 0 || (in_dim % group_size) != 0) {
+        return cudaErrorInvalidValue;
+    }
     const dim3 block(THREADS_X, THREADS_Y, 1);
     const dim3 grid(ceil_div(out_dim, TILE_OUT), ceil_div(in_dim, TILE_IN), E);
 
-    // Dispatch on group_size template parameter for compile-time optimization
-    switch (group_size) {
-        case 16:
-            k_nvfp4_recompute_group_scales<16><<<grid, block, 0, stream>>>(
-                W_packed, W_scale, W_gs, E, out_dim, in_dim, group_size);
-            break;
-        case 32:
-            k_nvfp4_recompute_group_scales<32><<<grid, block, 0, stream>>>(
-                W_packed, W_scale, W_gs, E, out_dim, in_dim, group_size);
-            break;
-        default:
-            // Fallback: use runtime group_size with default template
-            k_nvfp4_recompute_group_scales<16><<<grid, block, 0, stream>>>(
-                W_packed, W_scale, W_gs, E, out_dim, in_dim, group_size);
-            break;
-    }
+    k_nvfp4_recompute_group_scales<16><<<grid, block, 0, stream>>>(
+        W_packed, W_scale, W_gs, E, out_dim, in_dim, group_size);
 
     return cudaGetLastError();
 }
@@ -1312,6 +1599,35 @@ extern "C" cudaError_t eco_adam_nvfp4_update(
         stream);
 }
 
+extern "C" cudaError_t eco_adam_nvfp4_update_bf16(
+    void* W_packed, void* W_scale, void* W_gs,
+    void* m_data, void* m_scale, void* v_data, void* v_scale,
+    const void* grad,
+    int E, int out_dim, int in_dim, int group_size,
+    float lr, float beta1, float beta2,
+    float weight_decay, float eps,
+    float step_size, float inv_bc2_sqrt,
+    float eco_alpha,
+    int stochastic_rounding, int error_feedback,
+    unsigned int prng_seed0, unsigned int prng_seed1,
+    cudaStream_t stream)
+{
+    return nmoe::eco_adam::launch_eco_adam_nvfp4_update_bf16(
+        reinterpret_cast<uint8_t*>(W_packed),
+        reinterpret_cast<uint8_t*>(W_scale),
+        reinterpret_cast<float*>(W_gs),
+        reinterpret_cast<uint8_t*>(m_data),
+        reinterpret_cast<float*>(m_scale),
+        reinterpret_cast<uint8_t*>(v_data),
+        reinterpret_cast<float*>(v_scale),
+        reinterpret_cast<const __nv_bfloat16*>(grad),
+        E, out_dim, in_dim, group_size,
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+        stochastic_rounding != 0, error_feedback != 0,
+        prng_seed0, prng_seed1,
+        stream);
+}
+
 // Factored-v entry point (new)
 extern "C" cudaError_t eco_adam_nvfp4_fv_update(
     void* W_packed, void* W_scale, void* W_gs,
@@ -1344,6 +1660,37 @@ extern "C" cudaError_t eco_adam_nvfp4_fv_update(
         stream);
 }
 
+extern "C" cudaError_t eco_adam_nvfp4_fv_update_bf16(
+    void* W_packed, void* W_scale, void* W_gs,
+    void* m_data, void* m_scale,
+    void* v_row, void* v_col, void* v_rms,
+    const void* grad,
+    int E, int out_dim, int in_dim, int group_size,
+    float lr, float beta1, float beta2,
+    float weight_decay, float eps,
+    float step_size, float inv_bc2_sqrt,
+    float eco_alpha,
+    int stochastic_rounding, int error_feedback,
+    unsigned int prng_seed0, unsigned int prng_seed1,
+    cudaStream_t stream)
+{
+    return nmoe::eco_adam::launch_eco_adam_nvfp4_fv_update_bf16(
+        reinterpret_cast<uint8_t*>(W_packed),
+        reinterpret_cast<uint8_t*>(W_scale),
+        reinterpret_cast<float*>(W_gs),
+        reinterpret_cast<uint8_t*>(m_data),
+        reinterpret_cast<float*>(m_scale),
+        reinterpret_cast<float*>(v_row),
+        reinterpret_cast<float*>(v_col),
+        reinterpret_cast<float*>(v_rms),
+        reinterpret_cast<const __nv_bfloat16*>(grad),
+        E, out_dim, in_dim, group_size,
+        lr, beta1, beta2, weight_decay, eps, step_size, inv_bc2_sqrt, eco_alpha,
+        stochastic_rounding != 0, error_feedback != 0,
+        prng_seed0, prng_seed1,
+        stream);
+}
+
 // AdamA m/v accumulation: update FP8 m/v with fractional betas (non-factored v)
 extern "C" cudaError_t eco_mv_accumulate(
     void* m_data, void* m_scale,
@@ -1359,6 +1706,24 @@ extern "C" cudaError_t eco_mv_accumulate(
         reinterpret_cast<uint8_t*>(v_data),
         reinterpret_cast<float*>(v_scale),
         reinterpret_cast<const float*>(grad),
+        E, in_dim, out_dim,
+        beta1_frac, beta2_frac, stream);
+}
+
+extern "C" cudaError_t eco_mv_accumulate_bf16(
+    void* m_data, void* m_scale,
+    void* v_data, void* v_scale,
+    const void* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    return nmoe::eco_adam::launch_eco_mv_accumulate_bf16(
+        reinterpret_cast<uint8_t*>(m_data),
+        reinterpret_cast<float*>(m_scale),
+        reinterpret_cast<uint8_t*>(v_data),
+        reinterpret_cast<float*>(v_scale),
+        reinterpret_cast<const __nv_bfloat16*>(grad),
         E, in_dim, out_dim,
         beta1_frac, beta2_frac, stream);
 }
@@ -1379,6 +1744,25 @@ extern "C" cudaError_t eco_mv_accumulate_fv(
         reinterpret_cast<float*>(v_col),
         reinterpret_cast<float*>(v_rms),
         reinterpret_cast<const float*>(grad),
+        E, in_dim, out_dim,
+        beta1_frac, beta2_frac, stream);
+}
+
+extern "C" cudaError_t eco_mv_accumulate_fv_bf16(
+    void* m_data, void* m_scale,
+    void* v_row, void* v_col, void* v_rms,
+    const void* grad,
+    int E, int in_dim, int out_dim,
+    float beta1_frac, float beta2_frac,
+    cudaStream_t stream)
+{
+    return nmoe::eco_adam::launch_eco_mv_accumulate_fv_bf16(
+        reinterpret_cast<uint8_t*>(m_data),
+        reinterpret_cast<float*>(m_scale),
+        reinterpret_cast<float*>(v_row),
+        reinterpret_cast<float*>(v_col),
+        reinterpret_cast<float*>(v_rms),
+        reinterpret_cast<const __nv_bfloat16*>(grad),
         E, in_dim, out_dim,
         beta1_frac, beta2_frac, stream);
 }

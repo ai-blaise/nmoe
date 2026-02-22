@@ -36,6 +36,13 @@ export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
+# ── nmoe no-fallback production contract ─────────────────────────────────────
+export NMOE_USE_FA4=1
+export NMOE_REQUIRE_FLASHMLA=1
+export NMOE_PACKED_ATTN_BACKEND=flashmla
+export NMOE_ROUTER_BWD_ALLOW_STANDALONE=0
+export NMOE_AUX_LOSS_ALLOW_STANDALONE=0
+
 # ── Activate venv ────────────────────────────────────────────────────────────
 source "${NMOE_DIR}/.venv/bin/activate"
 

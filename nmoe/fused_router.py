@@ -12,7 +12,7 @@ Architecture:
 - Phase 1: Compute router scores via tiled matmul (hidden @ router_weight)
 - Phase 2: Apply sigmoid activation for routing probabilities
 - Phase 3: TopK selection using iterative argmax with masking
-- Phase 4: Atomic dispatch index computation per expert
+- Phase 4: Atomic per-expert token counting for dispatch metadata
 
 Backward:
 - Fused CUDA kernel (router_bwd.cu) replaces ~18 PyTorch kernel launches
@@ -32,29 +32,36 @@ Fused Bias Update (Performance Optimization):
 
 import os
 import ctypes
-from contextlib import contextmanager, nullcontext
+import stat
+from contextlib import nullcontext
 import torch
 import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
 
-@contextmanager
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) in ("1", "true", "True")
+
+
+_NVTX_ENABLED = (
+    _env_flag("NMOE_NVTX", "0")
+    and torch.cuda.is_available()
+    and hasattr(torch.cuda, "nvtx")
+    and hasattr(torch.cuda.nvtx, "range_push")
+)
+_ROUTER_BWD_ALLOW_STANDALONE = _env_flag("NMOE_ROUTER_BWD_ALLOW_STANDALONE", "0")
+_ROUTER_STREAM_CACHE_LIMIT = max(1, int(os.getenv("NMOE_ROUTER_STREAM_CACHE_LIMIT", "8")))
+_EXPECTED_RDEP_ABI = 1
+_FUSED_ROUTER_MAX_K = 16
+_NULL_NVTX_CTX = nullcontext()
+
+
 def _nvtx(name: str):
     """Emit an NVTX range visible in Nsight Systems / nvprof."""
-    if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
-        with nullcontext():
-            yield
-        return
-    if not (torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range_push')):
-        with nullcontext():
-            yield
-        return
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+    if _NVTX_ENABLED:
+        return torch.cuda.nvtx.range(name)
+    return _NULL_NVTX_CTX
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +147,7 @@ def _update_bias_fused_kernel(
     mask = tid < E
 
     # Step 1: Load counts and normalize to get load fraction
-    counts = tl.load(counts_ptr + tid, mask=mask, other=0.0)
+    counts = tl.load(counts_ptr + tid, mask=mask, other=0).to(tl.float32)
     load_frac = counts / TK
 
     # Step 2: Expected load per expert (uniform distribution)
@@ -222,6 +229,8 @@ def _update_bias_normalized_kernel(
     # Step 6: Clamp
     new_bias = tl.minimum(tl.maximum(new_bias, -16.0), 16.0)
     tl.store(bias_ptr + tid, new_bias, mask=mask)
+    # Reset counts in-place for next launch (eliminate separate counts.zero_ pass).
+    tl.store(counts_ptr + tid, 0.0, mask=mask)
 
 
 def fused_update_bias_from_expert_ids(
@@ -254,18 +263,26 @@ def fused_update_bias_from_expert_ids(
         - expert_ids must be int32 and contiguous
     """
     with _nvtx("fused_router/update_bias_from_expert_ids"):
-        assert expert_ids.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
-        assert bias.dtype == torch.float32, "Bias must be float32"
-        assert expert_ids.dtype == torch.int32, "expert_ids must be int32"
+        if not (expert_ids.is_cuda and bias.is_cuda):
+            raise RuntimeError("fused_update_bias_from_expert_ids requires CUDA tensors")
+        if bias.dtype != torch.float32:
+            raise RuntimeError(f"Bias must be float32, got {bias.dtype}")
+        if expert_ids.dtype != torch.int32:
+            raise RuntimeError(f"expert_ids must be int32, got {expert_ids.dtype}")
 
-        expert_ids = expert_ids.contiguous()
-        bias = bias.contiguous()
+        if not expert_ids.is_contiguous():
+            raise RuntimeError("expert_ids must be contiguous on production no-fallback path.")
+        if not bias.is_contiguous():
+            raise RuntimeError("bias must be contiguous on production no-fallback path.")
 
         E = bias.shape[0]
         TK = expert_ids.numel()
+        if TK == 0:
+            return
 
-        # Allocate temporary counts buffer (zeroed)
-        counts = torch.zeros(E, dtype=torch.float32, device=bias.device)
+        # Reuse temporary counts scratch; fused update kernel resets it in-place.
+        stream_id = int(torch.cuda.current_stream(bias.device).cuda_stream)
+        counts = _get_bias_counts_scratch(bias.device, E, stream_id)
 
         # Kernel 1: Parallel bincount
         BLOCK = 1024
@@ -278,9 +295,7 @@ def fused_update_bias_from_expert_ids(
         )
 
         # Kernel 2: Fused bias update (single block)
-        BLOCK_E = triton.next_power_of_2(E)
-        BLOCK_E = max(BLOCK_E, 32)
-        BLOCK_E = min(BLOCK_E, 1024)
+        BLOCK_E = _get_block_e(E, max_block=1024)
 
         _update_bias_fused_kernel[(1,)](
             counts,
@@ -318,43 +333,34 @@ def fused_update_bias_from_counts(
         Transformer.forward() normalizes loads across EP ranks.
     """
     with _nvtx("fused_router/update_bias_from_counts"):
-        assert expert_counts.is_cuda and bias.is_cuda, "Tensors must be on CUDA"
-        assert bias.dtype == torch.float32, "Bias must be float32"
+        if not (expert_counts.is_cuda and bias.is_cuda):
+            raise RuntimeError("fused_update_bias_from_counts requires CUDA tensors")
+        if bias.dtype != torch.float32:
+            raise RuntimeError(f"Bias must be float32, got {bias.dtype}")
 
-        expert_counts = expert_counts.contiguous()
-        bias = bias.contiguous()
+        if not expert_counts.is_contiguous():
+            raise RuntimeError("expert_counts must be contiguous on production no-fallback path.")
+        if not bias.is_contiguous():
+            raise RuntimeError("bias must be contiguous on production no-fallback path.")
 
         E = bias.shape[0]
 
-        # Convert counts to float32 if needed
-        if expert_counts.dtype != torch.float32:
-            counts = expert_counts.float()
-        else:
-            counts = expert_counts
+        BLOCK_E = _get_block_e(E, max_block=1024)
 
-        BLOCK_E = triton.next_power_of_2(E)
-        BLOCK_E = max(BLOCK_E, 32)
-        BLOCK_E = min(BLOCK_E, 1024)
-
-        if total is not None:
-            # Unnormalized counts with known total - use standard kernel
-            _update_bias_fused_kernel[(1,)](
-                counts,
-                bias,
-                float(total),
-                E,
-                gamma,
-                BLOCK_E=BLOCK_E,
+        if total is None:
+            raise RuntimeError(
+                "fused_update_bias_from_counts requires explicit `total` on production no-fallback path."
             )
-        else:
-            # Pre-normalized loads (sum to 1.0) - use normalized kernel
-            _update_bias_normalized_kernel[(1,)](
-                counts,
-                bias,
-                E,
-                gamma,
-                BLOCK_E=BLOCK_E,
-            )
+        counts = expert_counts
+        # Unnormalized counts with known total - use standard kernel
+        _update_bias_fused_kernel[(1,)](
+            counts,
+            bias,
+            float(total),
+            E,
+            gamma,
+            BLOCK_E=BLOCK_E,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -367,29 +373,187 @@ def fused_update_bias_from_counts(
 
 _router_bwd_lib: Optional[ctypes.CDLL] = None
 _router_bwd_sig_initialized: bool = False
+_router_bwd_has_bf16_fused: bool = False
+_router_bwd_has_bf16_hidden_only: bool = False
+_router_bwd_scratch_fp32: dict[tuple[int, int, int, int], torch.Tensor] = {}
+_bias_counts_scratch: dict[tuple[int, int, int], torch.Tensor] = {}
+_expert_counts_dummy_i32: dict[tuple[int, int], torch.Tensor] = {}
+_router_launch_config_cache: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+_router_block_e_cache: dict[tuple[int, int], int] = {}
+_router_static_contract_cache: set[tuple[int, int]] = set()
+
+
+def _validate_router_contract_once(E: int, K: int) -> None:
+    """Validate static fused-router limits once per (E, K) pair."""
+    key = (int(E), int(K))
+    if key in _router_static_contract_cache:
+        return
+    if K <= 0:
+        raise RuntimeError(f"topk must be >= 1, got K={K}.")
+    if K > E:
+        raise RuntimeError(f"topk must be <= n_experts, got K={K}, E={E}.")
+    if K > _FUSED_ROUTER_MAX_K:
+        raise RuntimeError(
+            f"Fused router backward supports topk <= {_FUSED_ROUTER_MAX_K}, got K={K}. "
+            "Adjust n_activated_experts or rebuild CUDA kernel constants."
+        )
+    if E > 256:
+        raise RuntimeError(
+            f"Fused router forward currently supports n_experts <= 256 in one kernel launch, got E={E}."
+        )
+    _router_static_contract_cache.add(key)
+
+
+def _get_block_e(E: int, *, max_block: int) -> int:
+    """Return cached BLOCK_E selection for Triton single-block reductions."""
+    key = (int(E), int(max_block))
+    block = _router_block_e_cache.get(key)
+    if block is None:
+        block = triton.next_power_of_2(int(E))
+        block = max(block, 32)
+        block = min(block, int(max_block))
+        _router_block_e_cache[key] = int(block)
+    return int(block)
+
+
+def _get_router_launch_config(E: int, D: int) -> tuple[int, int, int, int]:
+    """Return cached Triton launch config for fused router forward."""
+    key = (int(E), int(D))
+    cached = _router_launch_config_cache.get(key)
+    if cached is not None:
+        return cached
+
+    block_e = triton.next_power_of_2(int(E))
+    block_e = max(block_e, 32)
+    block_e = min(block_e, 256)
+
+    if D >= 8192:
+        block_d = 128
+    elif D >= 4096:
+        block_d = 64
+    else:
+        block_d = 32
+
+    num_warps = 4 if block_e <= 64 else 8
+    if D >= 4096:
+        num_warps = max(num_warps, 8)
+    num_stages = 3 if D >= 4096 else 2
+
+    config = (int(block_e), int(block_d), int(num_warps), int(num_stages))
+    _router_launch_config_cache[key] = config
+    return config
+
+
+def _prune_stream_cache(cache: dict, dev_idx: int, limit: int) -> None:
+    dev_keys = [k for k in cache.keys() if isinstance(k, tuple) and len(k) >= 1 and k[0] == dev_idx]
+    while len(dev_keys) > limit:
+        cache.pop(dev_keys[0], None)
+        dev_keys.pop(0)
+
+
+def _get_router_bwd_scratch_fp32(
+    device: torch.device,
+    E: int,
+    D: int,
+    stream_id: int,
+) -> torch.Tensor:
+    """Get reusable FP32 accumulation scratch [E, D] for router backward."""
+    dev_idx = device.index if device.index is not None else -1
+    key = (dev_idx, int(E), int(D), int(stream_id))
+    buf = _router_bwd_scratch_fp32.get(key)
+    if buf is None or buf.device != device or buf.shape != (E, D):
+        buf = torch.empty(E, D, dtype=torch.float32, device=device)
+        _router_bwd_scratch_fp32[key] = buf
+        _prune_stream_cache(_router_bwd_scratch_fp32, dev_idx, _ROUTER_STREAM_CACHE_LIMIT)
+    buf.record_stream(torch.cuda.current_stream(device))
+    return buf
+
+
+def _get_bias_counts_scratch(
+    device: torch.device,
+    E: int,
+    stream_id: int,
+) -> torch.Tensor:
+    """Get reusable FP32 counts scratch [E] for fused bias update."""
+    dev_idx = device.index if device.index is not None else -1
+    key = (dev_idx, int(E), int(stream_id))
+    buf = _bias_counts_scratch.get(key)
+    if buf is None or buf.device != device or int(buf.numel()) != int(E):
+        # Initialize once; fused update kernel clears counts after each use.
+        buf = torch.zeros(E, dtype=torch.float32, device=device)
+        _bias_counts_scratch[key] = buf
+        _prune_stream_cache(_bias_counts_scratch, dev_idx, _ROUTER_STREAM_CACHE_LIMIT)
+    buf.record_stream(torch.cuda.current_stream(device))
+    return buf
+
+
+def _get_expert_counts_dummy_i32(device: torch.device, E: int) -> torch.Tensor:
+    """Get reusable dummy int32 counts buffer [E] for COMPUTE_COUNTS=False launches."""
+    dev_idx = device.index if device.index is not None else -1
+    key = (dev_idx, int(E))
+    buf = _expert_counts_dummy_i32.get(key)
+    if buf is None or buf.device != device or int(buf.numel()) != int(E):
+        buf = torch.empty(E, dtype=torch.int32, device=device)
+        _expert_counts_dummy_i32[key] = buf
+    buf.record_stream(torch.cuda.current_stream(device))
+    return buf
+
+
+def _resolve_primary_rdep_path() -> str:
+    from nmoe.csrc import rdep as _rdep_mod  # type: ignore
+
+    path = getattr(_rdep_mod, "__file__", None)
+    if not (isinstance(path, str) and path):
+        raise RuntimeError("nmoe.csrc.rdep did not expose a valid extension path.")
+    abi_fn = getattr(_rdep_mod, "abi_version", None)
+    if not callable(abi_fn):
+        raise RuntimeError("nmoe.csrc.rdep missing abi_version(); rebuild extension.")
+    abi = int(abi_fn())
+    if abi != _EXPECTED_RDEP_ABI:
+        raise RuntimeError(
+            f"nmoe.csrc.rdep ABI mismatch: expected {_EXPECTED_RDEP_ABI}, got {abi}. Rebuild extension."
+        )
+    real = os.path.realpath(path)
+    mode = os.stat(real).st_mode
+    if (mode & stat.S_IWGRP) or (mode & stat.S_IWOTH):
+        raise RuntimeError(f"Refusing writable extension path: {real}")
+    return real
 
 
 def _init_router_bwd_signatures(lib: ctypes.CDLL) -> None:
     """Initialize ctypes signatures once to avoid per-call Python overhead."""
-    global _router_bwd_sig_initialized
+    global _router_bwd_has_bf16_fused, _router_bwd_has_bf16_hidden_only, _router_bwd_sig_initialized
     if _router_bwd_sig_initialized:
         return
 
-    lib.fused_router_backward.restype = ctypes.c_int
-    lib.fused_router_backward.argtypes = [
+    _router_bwd_has_bf16_fused = hasattr(lib, "fused_router_backward_bf16_fused")
+    if not _router_bwd_has_bf16_fused:
+        raise AttributeError(
+            "fused_router_backward_bf16_fused not found in loaded rdep extension "
+            "(router backward compatibility fallback is disabled)."
+        )
+    lib.fused_router_backward_bf16_fused.restype = ctypes.c_int
+    lib.fused_router_backward_bf16_fused.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p,
         ctypes.c_float,
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         ctypes.c_void_p,
     ]
-    lib.fused_router_bwd_transpose.restype = ctypes.c_int
-    lib.fused_router_bwd_transpose.argtypes = [
-        ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int,
-        ctypes.c_void_p,
-    ]
+    _router_bwd_has_bf16_hidden_only = hasattr(lib, "fused_router_backward_bf16_hidden_only")
+    if _router_bwd_has_bf16_hidden_only:
+        lib.fused_router_backward_bf16_hidden_only.restype = ctypes.c_int
+        lib.fused_router_backward_bf16_hidden_only.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
+        ]
     _router_bwd_sig_initialized = True
 
 
@@ -404,21 +568,24 @@ def _load_router_bwd() -> ctypes.CDLL:
     if _router_bwd_lib is not None:
         return _router_bwd_lib
 
-    _this_dir = os.path.dirname(os.path.abspath(__file__))
-    _candidates = [
-        os.path.join(_this_dir, "csrc", "rdep.cpython-313-x86_64-linux-gnu.so"),
-        os.path.join(_this_dir, "csrc", "rdep.cpython-314-x86_64-linux-gnu.so"),
-        os.path.join(_this_dir, "csrc", "router_bwd.so"),
-        os.path.join(_this_dir, "csrc", "librouter_bwd.so"),
-    ]
-
+    _candidates: list[str] = []
+    try:
+        _candidates.append(_resolve_primary_rdep_path())
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to resolve primary nmoe.csrc.rdep extension for fused router backward."
+        ) from e
+    if _ROUTER_BWD_ALLOW_STANDALONE:
+        raise RuntimeError(
+            "NMOE_ROUTER_BWD_ALLOW_STANDALONE=1 is forbidden in production. "
+            "Only the loaded nmoe.csrc.rdep extension may provide fused router backward kernels."
+        )
     errors: list[str] = []
     for path in _candidates:
         if os.path.isfile(path):
             try:
-                lib = ctypes.CDLL(path)
-                _ = lib.fused_router_backward
-                _ = lib.fused_router_bwd_transpose
+                mode = getattr(os, "RTLD_NOW", 0) | getattr(ctypes, "RTLD_LOCAL", 0)
+                lib = ctypes.CDLL(path, mode=mode) if mode else ctypes.CDLL(path)
                 _init_router_bwd_signatures(lib)
                 _router_bwd_lib = lib
                 return lib
@@ -440,14 +607,25 @@ def _call_fused_router_backward(
     hidden: torch.Tensor,           # [T, D] BF16
     router_weight: torch.Tensor,    # [D, E] BF16
     expert_ids: torch.Tensor,       # [T, K] int32
-    gates_f32: torch.Tensor,        # [T, K] FP32
-    grad_gates_f32: torch.Tensor,   # [T, K] FP32
+    pre_probs: torch.Tensor,        # [T, K] BF16/FP32
+    gates: torch.Tensor,            # [T, K] BF16/FP32
+    grad_gates: torch.Tensor,       # [T, K] BF16/FP32
     route_scale: float,
-) -> torch.Tensor:
-    """Call the fused CUDA backward kernel; returns grad_router_weight [D, E] BF16."""
+    need_hidden_grad: bool = False,
+    need_wgrad: bool = True,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Call fused CUDA backward kernel; returns (grad_router_weight, grad_hidden?)."""
     with _nvtx("fused_router/call_fused_router_backward"):
         return _call_fused_router_backward_impl(
-            hidden, router_weight, expert_ids, gates_f32, grad_gates_f32, route_scale
+            hidden,
+            router_weight,
+            expert_ids,
+            pre_probs,
+            gates,
+            grad_gates,
+            route_scale,
+            need_hidden_grad,
+            need_wgrad,
         )
 
 
@@ -455,52 +633,86 @@ def _call_fused_router_backward_impl(
     hidden: torch.Tensor,
     router_weight: torch.Tensor,
     expert_ids: torch.Tensor,
-    gates_f32: torch.Tensor,
-    grad_gates_f32: torch.Tensor,
+    pre_probs: torch.Tensor,
+    gates: torch.Tensor,
+    grad_gates: torch.Tensor,
     route_scale: float,
-) -> torch.Tensor:
+    need_hidden_grad: bool,
+    need_wgrad: bool,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Inner implementation of fused CUDA backward kernel call."""
     lib = _load_router_bwd()
 
     T, D = hidden.shape
     E = router_weight.shape[1]
     K = expert_ids.shape[1]
-
-    # Allocate FP32 accumulation buffer [E, D] -- must be zeroed.
-    grad_rw_fp32 = torch.zeros(E, D, dtype=torch.float32, device=hidden.device)
-
-    # Allocate output [D, E] BF16 for transposed result.
-    grad_rw_bf16 = torch.empty(D, E, dtype=torch.bfloat16, device=hidden.device)
-
-    # Get raw data pointers.
     stream = torch.cuda.current_stream(hidden.device).cuda_stream
 
-    err = lib.fused_router_backward(
+    grad_rw_fp32: Optional[torch.Tensor] = None
+    grad_rw_bf16: Optional[torch.Tensor] = None
+    if need_wgrad:
+        # Reuse FP32 accumulation scratch [E, D].
+        grad_rw_fp32 = _get_router_bwd_scratch_fp32(hidden.device, E, D, int(stream))
+        # Allocate output [D, E] BF16 for transposed result.
+        grad_rw_bf16 = torch.empty(D, E, dtype=torch.bfloat16, device=hidden.device)
+    grad_hidden = torch.empty_like(hidden) if need_hidden_grad else None
+
+    if (
+        pre_probs.dtype != torch.bfloat16
+        or gates.dtype != torch.bfloat16
+        or grad_gates.dtype != torch.bfloat16
+    ):
+        raise RuntimeError(
+            "Router backward BF16 fast-path is required (FP32 fallback disabled). "
+            f"Got pre_probs.dtype={pre_probs.dtype}, gates.dtype={gates.dtype}, "
+            f"grad_gates.dtype={grad_gates.dtype}."
+        )
+    if need_hidden_grad and not need_wgrad:
+        if not _router_bwd_has_bf16_hidden_only:
+            raise RuntimeError(
+                "Router backward hidden-only BF16 entrypoint is required when router weight grad is disabled. "
+                "Rebuild nmoe/csrc extension with fused_router_backward_bf16_hidden_only."
+            )
+        err = lib.fused_router_backward_bf16_hidden_only(
+            ctypes.c_void_p(hidden.data_ptr()),
+            ctypes.c_void_p(router_weight.data_ptr()),
+            ctypes.c_void_p(expert_ids.data_ptr()),
+            ctypes.c_void_p(pre_probs.data_ptr()),
+            ctypes.c_void_p(gates.data_ptr()),
+            ctypes.c_void_p(grad_gates.data_ptr()),
+            ctypes.c_void_p(grad_hidden.data_ptr()),
+            ctypes.c_float(route_scale),
+            ctypes.c_int(T), ctypes.c_int(E), ctypes.c_int(K), ctypes.c_int(D),
+            ctypes.c_void_p(stream),
+        )
+        if err != 0:
+            raise RuntimeError(f"fused_router_backward_bf16_hidden_only returned CUDA error {err}")
+        return None, grad_hidden
+
+    if not _router_bwd_has_bf16_fused:
+        raise RuntimeError(
+            "Router backward fused BF16 entrypoint is required. "
+            "Rebuild nmoe/csrc extension with fused_router_backward_bf16_fused."
+        )
+
+    err = lib.fused_router_backward_bf16_fused(
         ctypes.c_void_p(hidden.data_ptr()),
         ctypes.c_void_p(router_weight.data_ptr()),
         ctypes.c_void_p(expert_ids.data_ptr()),
-        ctypes.c_void_p(gates_f32.data_ptr()),
-        ctypes.c_void_p(grad_gates_f32.data_ptr()),
-        ctypes.c_void_p(grad_rw_fp32.data_ptr()),
-        ctypes.c_void_p(0),  # grad_hidden = NULL (not needed)
+        ctypes.c_void_p(pre_probs.data_ptr()),
+        ctypes.c_void_p(gates.data_ptr()),
+        ctypes.c_void_p(grad_gates.data_ptr()),
+        ctypes.c_void_p(grad_rw_fp32.data_ptr()) if grad_rw_fp32 is not None else ctypes.c_void_p(0),
+        ctypes.c_void_p(grad_rw_bf16.data_ptr()) if grad_rw_bf16 is not None else ctypes.c_void_p(0),
+        ctypes.c_void_p(grad_hidden.data_ptr()) if grad_hidden is not None else ctypes.c_void_p(0),
         ctypes.c_float(route_scale),
         ctypes.c_int(T), ctypes.c_int(E), ctypes.c_int(K), ctypes.c_int(D),
         ctypes.c_void_p(stream),
     )
     if err != 0:
-        raise RuntimeError(f"fused_router_backward returned CUDA error {err}")
+        raise RuntimeError(f"fused_router_backward_bf16_fused returned CUDA error {err}")
 
-    # Transpose + cast [E, D] FP32 -> [D, E] BF16.
-    err = lib.fused_router_bwd_transpose(
-        ctypes.c_void_p(grad_rw_fp32.data_ptr()),
-        ctypes.c_void_p(grad_rw_bf16.data_ptr()),
-        ctypes.c_int(E), ctypes.c_int(D),
-        ctypes.c_void_p(stream),
-    )
-    if err != 0:
-        raise RuntimeError(f"fused_router_bwd_transpose returned CUDA error {err}")
-
-    return grad_rw_bf16
+    return grad_rw_bf16, grad_hidden
 
 
 @triton.jit
@@ -511,12 +723,12 @@ def _fused_router_kernel(
     bias_ptr,             # [E] - router bias for expert selection
     # Output pointers
     expert_ids_ptr,       # [T, K] - selected expert IDs
+    pre_probs_ptr,        # [T, K] - selected pre-normalized probs (sigmoid scores)
     gates_ptr,            # [T, K] - gating weights
-    dispatch_indices_ptr, # [T, K] - dispatch indices
     expert_counts_ptr,    # [E] - count per expert
     # Dimensions
     T,                    # Total tokens
-    D,                    # Hidden dimension
+    D: tl.constexpr,      # Hidden dimension
     E,                    # Number of experts
     K: tl.constexpr,      # TopK (must be constexpr for static_range)
     # Strides
@@ -526,8 +738,10 @@ def _fused_router_kernel(
     stride_w_e,           # router weight stride for E
     # Config
     route_scale,          # Scaling factor for router logits
+    COMPUTE_COUNTS: tl.constexpr,
     # Block sizes
     BLOCK_E: tl.constexpr,
+    BLOCK_D: tl.constexpr,
 ):
     """Optimized fused kernel - one token per program.
 
@@ -546,20 +760,25 @@ def _fused_router_kernel(
     e_mask = e_offs < E
     scores = tl.zeros((BLOCK_E,), dtype=tl.float32)
 
-    # Simple accumulation over D dimension (no blocking for simplicity)
-    for d_idx in range(D):
-        # Load hidden value
-        h_val = tl.load(hidden_ptr + pid_t * stride_h_t + d_idx * stride_h_d).to(tl.float32)
+    # Tiled accumulation over D dimension.
+    # This reduces scalar load/mul loop overhead versus per-dim iteration.
+    for d0 in tl.static_range(0, D, BLOCK_D):
+        d_offs = d0 + tl.arange(0, BLOCK_D)
+        d_mask = d_offs < D
 
-        # Load weights for all experts at this D position
-        w_vals = tl.load(
-            router_weight_ptr + d_idx * stride_w_d + e_offs * stride_w_e,
-            mask=e_mask,
-            other=0.0
+        h_vals = tl.load(
+            hidden_ptr + pid_t * stride_h_t + d_offs * stride_h_d,
+            mask=d_mask,
+            other=0.0,
         ).to(tl.float32)
 
-        # Scalar-vector multiply and accumulate
-        scores += h_val * w_vals
+        w_vals = tl.load(
+            router_weight_ptr + d_offs[:, None] * stride_w_d + e_offs[None, :] * stride_w_e,
+            mask=d_mask[:, None] & e_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        scores += tl.sum(w_vals * h_vals[:, None], axis=0)
 
     # Apply route scaling
     scores = scores * route_scale
@@ -572,38 +791,40 @@ def _fused_router_kernel(
     selection_scores = probs + bias
 
     # TopK selection with iterative argmax.
-    # Accumulate gate_sum in registers during selection to avoid a second
-    # pass over global memory for normalization (saves K loads + K stores).
+    # Accumulate gate_sum in registers during selection and write only pre_probs
+    # first. Normalized gates are written in the second pass from pre_probs.
+    # This removes an extra gates store+load round-trip.
     gate_sum = tl.zeros((), dtype=tl.float32)
     for k in tl.static_range(K):
         # Find maximum among unmasked experts
-        max_idx = tl.argmax(tl.where(e_mask, selection_scores, -float('inf')), axis=0)
+        masked_scores = tl.where(e_mask, selection_scores, -float('inf'))
+        max_idx = tl.argmax(masked_scores, axis=0)
+        max_score = tl.max(masked_scores, axis=0)
+        is_sel = e_offs == max_idx
 
-        # Get original probability for gating (not biased score)
-        gate_val = tl.sum(tl.where(e_offs == max_idx, probs, tl.zeros_like(probs)), axis=0)
+        # Get original probability for gating (not biased score):
+        # selection_score = prob + bias => prob = max_score - bias[max_idx]
+        bias_sel = tl.load(bias_ptr + max_idx).to(tl.float32)
+        gate_val = max_score - bias_sel
 
-        # Store expert ID and unnormalized gate
+        # Store expert ID and pre-normalized gate.
         tl.store(expert_ids_ptr + pid_t * K + k, max_idx.to(tl.int32))
-        tl.store(gates_ptr + pid_t * K + k, gate_val.to(tl.float16))
+        tl.store(pre_probs_ptr + pid_t * K + k, gate_val)
+        if COMPUTE_COUNTS:
+            tl.atomic_add(expert_counts_ptr + max_idx, 1)
 
-        # Accumulate gate sum in register (no global memory round-trip)
+        # Accumulate gate sum in register
         gate_sum += gate_val
 
         # Mask out selected expert for next iteration
-        selection_scores = tl.where(e_offs == max_idx, -float('inf'), selection_scores)
+        selection_scores = tl.where(is_sel, -float('inf'), selection_scores)
 
     # Normalize gates using the register-accumulated sum (single pass)
     gate_sum = tl.maximum(gate_sum, 1e-12)
 
     for k in tl.static_range(K):
-        gate_val = tl.load(gates_ptr + pid_t * K + k).to(tl.float32)
-        tl.store(gates_ptr + pid_t * K + k, (gate_val / gate_sum).to(tl.float16))
-
-    # Compute dispatch indices via atomics
-    for k in tl.static_range(K):
-        expert_id = tl.load(expert_ids_ptr + pid_t * K + k)
-        offset = tl.atomic_add(expert_counts_ptr + expert_id, 1)
-        tl.store(dispatch_indices_ptr + pid_t * K + k, offset)
+        gate_val = tl.load(pre_probs_ptr + pid_t * K + k).to(tl.float32)
+        tl.store(gates_ptr + pid_t * K + k, gate_val / gate_sum)
 
 
 class _FusedRouterFunction(torch.autograd.Function):
@@ -622,7 +843,8 @@ class _FusedRouterFunction(torch.autograd.Function):
         topk: int,
         route_scale: float,
         dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        need_counts: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass using fused Triton kernel."""
         with _nvtx("fused_router/forward"):
             T, D = hidden.shape
@@ -630,18 +852,21 @@ class _FusedRouterFunction(torch.autograd.Function):
             K = topk
 
             # Ensure inputs are contiguous
-            hidden = hidden.contiguous()
+            if not hidden.is_contiguous():
+                raise RuntimeError("hidden must be contiguous on production no-fallback path.")
+            _validate_router_contract_once(E, K)
 
             # Allocate outputs
             expert_ids = torch.empty(T, K, dtype=torch.int32, device=hidden.device)
-            gates = torch.empty(T, K, dtype=torch.float16, device=hidden.device)
-            dispatch_indices = torch.empty(T, K, dtype=torch.int32, device=hidden.device)
-            expert_counts = torch.zeros(E, dtype=torch.int32, device=hidden.device)
+            pre_probs = torch.empty(T, K, dtype=dtype, device=hidden.device)
+            gates = torch.empty(T, K, dtype=dtype, device=hidden.device)
+            if need_counts:
+                expert_counts = torch.zeros(E, dtype=torch.int32, device=hidden.device)
+            else:
+                expert_counts = _get_expert_counts_dummy_i32(hidden.device, E)
 
             # Choose block sizes
-            BLOCK_E = triton.next_power_of_2(E)
-            BLOCK_E = max(BLOCK_E, 32)
-            BLOCK_E = min(BLOCK_E, 256)
+            BLOCK_E, BLOCK_D, num_warps, num_stages = _get_router_launch_config(E, D)
 
             # Launch fused kernel
             grid = (T,)
@@ -650,8 +875,8 @@ class _FusedRouterFunction(torch.autograd.Function):
                 router_weight,
                 bias,
                 expert_ids,
+                pre_probs,
                 gates,
-                dispatch_indices,
                 expert_counts,
                 T=T,
                 D=D,
@@ -662,17 +887,21 @@ class _FusedRouterFunction(torch.autograd.Function):
                 stride_w_d=router_weight.stride(0),
                 stride_w_e=router_weight.stride(1),
                 route_scale=route_scale,
+                COMPUTE_COUNTS=need_counts,
                 BLOCK_E=BLOCK_E,
+                BLOCK_D=BLOCK_D,
+                num_warps=num_warps,
+                num_stages=num_stages,
             )
 
             # Save for backward
-            ctx.save_for_backward(hidden, router_weight, expert_ids, gates)
+            ctx.save_for_backward(hidden, router_weight, expert_ids, pre_probs, gates)
             ctx.route_scale = route_scale
 
-            return expert_ids, gates.to(dtype), dispatch_indices, expert_counts
+            return expert_ids, gates, expert_counts
 
     @staticmethod
-    def backward(ctx, grad_expert_ids, grad_gates, grad_dispatch_indices, grad_expert_counts):
+    def backward(ctx, grad_expert_ids, grad_gates, grad_expert_counts):
         """Backward pass computing gradient w.r.t router_weight.
 
         The gradient flows through:
@@ -682,26 +911,31 @@ class _FusedRouterFunction(torch.autograd.Function):
         sparsity to avoid materializing the dense [T, E] intermediates.
         """
         with _nvtx("fused_router/backward"):
-            hidden, router_weight, expert_ids, gates = ctx.saved_tensors
+            hidden, router_weight, expert_ids, pre_probs, gates = ctx.saved_tensors
             route_scale = ctx.route_scale
 
+            need_hidden = bool(ctx.needs_input_grad[0])
+            need_w = bool(ctx.needs_input_grad[1])
+            grad_hidden = None
             grad_router_weight = None
 
-            if router_weight.requires_grad and grad_gates is not None:
-                gates_f32 = gates.float()
-                grad_gates_f32 = grad_gates.float()
-
-                grad_router_weight = _call_fused_router_backward(
-                    hidden.contiguous(),
-                    router_weight.contiguous(),
-                    expert_ids.contiguous(),
-                    gates_f32.contiguous(),
-                    grad_gates_f32.contiguous(),
+            if grad_gates is not None and (need_hidden or need_w):
+                if not grad_gates.is_contiguous():
+                    raise RuntimeError("grad_gates must be contiguous on production no-fallback path.")
+                grad_router_weight, grad_hidden = _call_fused_router_backward(
+                    hidden,
+                    router_weight,
+                    expert_ids,
+                    pre_probs,
+                    gates,
+                    grad_gates,
                     route_scale,
+                    need_hidden_grad=need_hidden,
+                    need_wgrad=need_w,
                 )
 
             # Return gradients for all inputs (None for non-differentiable ones)
-            return None, grad_router_weight, None, None, None, None
+            return grad_hidden, grad_router_weight, None, None, None, None, None
 
 
 class FusedRouterTopKDispatch(torch.nn.Module):
@@ -717,7 +951,7 @@ class FusedRouterTopKDispatch(torch.nn.Module):
     3. Adds bias for expert load balancing
     4. Performs TopK selection via iterative argmax
     5. Normalizes gates to sum to 1
-    6. Computes per-expert dispatch indices via atomics
+    6. Computes per-expert routed-token counts via atomics
 
     TRAINING SUPPORT:
     - Uses custom autograd function with backward pass
@@ -741,11 +975,16 @@ class FusedRouterTopKDispatch(torch.nn.Module):
         dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
+        if dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"FusedRouterTopKDispatch requires dtype=torch.bfloat16 for fused BF16 backward; got {dtype}."
+            )
         self.hidden_dim = hidden_dim
         self.n_experts = n_experts
         self.topk = topk
         self.route_scale = route_scale
         self.dtype = dtype
+        _validate_router_contract_once(n_experts, topk)
 
         # Router weight matrix [D, E]
         self.router_weight = torch.nn.Parameter(
@@ -762,7 +1001,9 @@ class FusedRouterTopKDispatch(torch.nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        *,
+        need_counts: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass with backward support for training.
 
         Args:
@@ -771,18 +1012,21 @@ class FusedRouterTopKDispatch(torch.nn.Module):
         Returns:
             expert_ids: [T, K] selected expert IDs (int32)
             gates: [T, K] gating weights (normalized, dtype)
-            dispatch_indices: [T, K] per-expert offsets (int32)
             expert_counts: [E] number of tokens per expert (int32)
         """
         with _nvtx("fused_router/module_forward"):
             # Flatten to [T, D]
-            original_shape = hidden.shape
+            if hidden.dtype != torch.bfloat16:
+                raise RuntimeError(f"Fused router requires BF16 hidden input; got {hidden.dtype}.")
             if hidden.dim() == 3:
                 hidden = hidden.view(-1, hidden.size(-1))
 
             T, D = hidden.shape
 
-            assert D == self.hidden_dim, f"Hidden dim mismatch: got {D}, expected {self.hidden_dim}"
+            if D != self.hidden_dim:
+                raise RuntimeError(
+                    f"Hidden dim mismatch: got {D}, expected {self.hidden_dim}"
+                )
 
             # Use custom autograd function for backward support
             return _FusedRouterFunction.apply(
@@ -792,6 +1036,7 @@ class FusedRouterTopKDispatch(torch.nn.Module):
                 self.topk,
                 self.route_scale,
                 self.dtype,
+                need_counts,
             )
 
     @torch.no_grad()
@@ -821,11 +1066,10 @@ class FusedRouterTopKDispatch(torch.nn.Module):
             - When expert_loads is provided: uses fused update only (1 kernel)
         """
         with _nvtx("fused_router/update_bias"):
-            if expert_ids is not None:
-                # Most efficient path: fused bincount + bias update
-                # 2 Triton kernel launches, no CPU sync
-                fused_update_bias_from_expert_ids(expert_ids, self.bias, gamma)
-            else:
-                # Fallback: expert counts already computed, just do fused update
-                # 1 Triton kernel launch, no CPU sync
-                fused_update_bias_from_counts(expert_loads, self.bias, gamma)
+            if expert_ids is None:
+                raise RuntimeError(
+                    "FusedRouterTopKDispatch.update_bias requires expert_ids on production no-fallback path."
+                )
+            # Most efficient path: fused bincount + bias update
+            # 2 Triton kernel launches, no CPU sync
+            fused_update_bias_from_expert_ids(expert_ids, self.bias, gamma)

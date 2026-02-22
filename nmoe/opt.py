@@ -8,6 +8,7 @@ Precision support: bf16, fp8, nvfp4 (default: nvfp4)
 """
 import logging
 import math
+import os
 import torch
 import torch.distributed as dist
 
@@ -17,11 +18,23 @@ from nmoe.config import Config
 from nmoe import zero2
 
 _log = logging.getLogger(__name__)
+_NVTX_ENABLED = (
+  os.getenv("NMOE_NVTX", "0") in ("1", "true", "True")
+  and torch.cuda.is_available()
+  and hasattr(torch.cuda, "nvtx")
+  and hasattr(torch.cuda.nvtx, "range_push")
+  and hasattr(torch.cuda.nvtx, "range_pop")
+)
+_HAS_ALL_REDUCE_COALESCED = hasattr(dist, "all_reduce_coalesced")
+_DP_HELPERS = None
 
 
 @contextmanager
 def _nvtx(tag: str):
-  """Emit an NVTX range for Nsight profiling.  No-op cost when no profiler is attached."""
+  """Emit an NVTX range for Nsight profiling when explicitly enabled."""
+  if not _NVTX_ENABLED:
+    yield
+    return
   torch.cuda.nvtx.range_push(tag)
   try:
     yield
@@ -226,26 +239,89 @@ def update_lr(optimizer: torch.optim.Optimizer, dense_groups: list[dict], step: 
   return float(lr_dense)
 
 
-def _get_dp_group():
-  """Get DP process group, or None if not initialized or DP=1."""
+def _load_dp_helpers():
+  """Load DP helper callables once to avoid repeated import overhead."""
+  global _DP_HELPERS
+  if _DP_HELPERS is not None:
+    return _DP_HELPERS
   try:
-    from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_data_parallel_group
-    if is_nmoe_parallel_initialized():
-      return get_data_parallel_group()
-  except ImportError:
-    pass
-  return None
+    from nmoe.distributed import init_groups
+  except ImportError as e:
+    raise RuntimeError(
+      "Distributed training is initialized but nmoe DP helpers are unavailable. "
+      "Failed to import nmoe.distributed.init_groups."
+    ) from e
+  _DP_HELPERS = (
+    init_groups.is_nmoe_parallel_initialized,
+    init_groups.get_data_parallel_group,
+    init_groups.get_dp_size,
+  )
+  return _DP_HELPERS
+
+
+def _get_dp_group_and_size() -> tuple[object | None, int]:
+  """Get DP process group and world size (strict in distributed mode)."""
+  if not (dist.is_available() and dist.is_initialized()):
+    return None, 1
+  is_nmoe_parallel_initialized, get_data_parallel_group, get_dp_size = _load_dp_helpers()
+  if not is_nmoe_parallel_initialized():
+    raise RuntimeError(
+      "Distributed training is initialized but nmoe parallel groups are not initialized."
+    )
+  dp_group = get_data_parallel_group()
+  if dp_group is None:
+    raise RuntimeError("Data-parallel process group is missing in distributed mode.")
+  dp_size = int(get_dp_size())
+  if dp_size <= 0:
+    raise RuntimeError(f"Invalid DP size reported by nmoe group init: {dp_size}")
+  return dp_group, dp_size
+
+
+def _get_dp_group():
+  """Get DP process group for distributed runs (fail-fast if missing)."""
+  dp_group, _ = _get_dp_group_and_size()
+  return dp_group
 
 
 def _get_dp_size() -> int:
-  """Get DP world size (1 if not initialized)."""
-  try:
-    from nmoe.distributed.init_groups import is_nmoe_parallel_initialized, get_dp_size
-    if is_nmoe_parallel_initialized():
-      return get_dp_size()
-  except ImportError:
-    pass
-  return 1
+  """Get DP world size (strict in distributed mode)."""
+  _, dp_size = _get_dp_group_and_size()
+  return dp_size
+
+
+def _get_post_hook_ffns(model: torch.nn.Module) -> list[object]:
+  """Return cached FFN modules that may need optimizer post-hooks."""
+  cached = getattr(model, "_opt_post_hook_ffns_cache", None)
+  if cached is not None:
+    return cached
+
+  ffns: list[object] = []
+  seen: set[int] = set()
+
+  # Prefer model-maintained MoE cache when available.
+  for ffn in list(getattr(model, "_moe_layers", []) or []):
+    if ffn is None:
+      continue
+    fid = id(ffn)
+    if fid in seen:
+      continue
+    seen.add(fid)
+    ffns.append(ffn)
+
+  # Include any non-MoE FFNs that still expose post-hook methods.
+  for blk in getattr(model, "blocks", []):
+    ffn = getattr(blk, "ffn", None)
+    if ffn is None:
+      continue
+    fid = id(ffn)
+    if fid in seen:
+      continue
+    if hasattr(ffn, "refresh_weight_cache"):
+      seen.add(fid)
+      ffns.append(ffn)
+
+  setattr(model, "_opt_post_hook_ffns_cache", ffns)
+  return ffns
 
 
 def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups: list[dict], zero2_state: dict, cfg: Config, world: int) -> None:
@@ -257,15 +333,19 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups:
   - Expert optimizer stepping
   - Post-step model updates (quantization rebuild, router bias)
   """
-  dp_group = _get_dp_group()
-  dp_size = _get_dp_size()
+  if world > 1:
+    dp_group, dp_size = _get_dp_group_and_size()
+  else:
+    dp_group, dp_size = None, 1
 
   # ZeRO-2 AdamW step for dense params.
   # When EP+DP is active, ZeRO-2 uses the DP group (not WORLD).
   # Dense params are replicated across DP ranks; ZeRO-2 shards within DP group.
   with _nvtx("opt/zero2_step"):
     if world > 1:
-      pg = dp_group if dp_group is not None else dist.group.WORLD
+      if dp_group is None:
+        raise RuntimeError("Missing DP process group for distributed ZeRO-2 step.")
+      pg = dp_group
       zero2.step_dense_adamw(
         dense_groups,
         state=zero2_state,
@@ -283,9 +363,13 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups:
   is_fused_eco = isinstance(optimizer, _NullExpertOptimizer)
   with _nvtx("opt/expert_allreduce"):
     if not is_fused_eco and dp_size > 1 and dp_group is not None:
-      for p in optimizer.param_groups[0]['params']:
-        if p.grad is not None:
-          dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=dp_group)
+      grads = [p.grad for p in optimizer.param_groups[0]['params'] if p.grad is not None]
+      if grads:
+        if not _HAS_ALL_REDUCE_COALESCED:
+          raise RuntimeError(
+            "torch.distributed.all_reduce_coalesced is required on production no-fallback path."
+          )
+        dist.all_reduce_coalesced(grads, op=dist.ReduceOp.AVG, group=dp_group)
 
   # Expert optimizer step (params already sharded via RDEP across EP group).
   # _NullExpertOptimizer.step() is a no-op (fused backward-optimizer already ran).
@@ -294,22 +378,35 @@ def step(model: torch.nn.Module, optimizer: torch.optim.Optimizer, dense_groups:
 
   # Post-step hooks (quantization rebuild, router bias update)
   with _nvtx("opt/post_hooks"), torch.no_grad():
-    for blk in model.blocks:
-      ffn = getattr(blk, 'ffn', None)
-      if ffn is None:
-        continue
+    bias_rate = float(getattr(cfg, "router_bias_update_rate", 0.0))
+    refresh_weight_cache = not getattr(optimizer, "emits_weight_cache", False)
+    if refresh_weight_cache or bias_rate > 0.0:
+      for ffn in _get_post_hook_ffns(model):
 
-      # Refresh quantized weight cache (FP8/NVFP4)
-      # Skip when fused backward-optimizer is active (refresh done inside backward).
-      if (not getattr(optimizer, "emits_weight_cache", False)) and hasattr(ffn, 'refresh_weight_cache'):
-        try:
-          ffn.refresh_weight_cache()
-        except Exception:
-          _log.warning("refresh_weight_cache() failed — stale quantized weights may be used", exc_info=True)
+        # Refresh quantized weight cache (FP8/NVFP4)
+        # Skip when fused backward-optimizer is active (refresh done inside backward).
+        if refresh_weight_cache and hasattr(ffn, 'refresh_weight_cache'):
+          try:
+            ffn.refresh_weight_cache()
+          except Exception as e:
+            raise RuntimeError(
+              "refresh_weight_cache() failed in optimizer post-hook; "
+              "refusing to continue with stale quantized weights."
+            ) from e
 
-      # Update router bias for aux-free load balancing
-      if hasattr(ffn, 'router') and hasattr(ffn, 'last_loads'):
-        try:
-          ffn.router.update_bias(ffn.last_loads, gamma=cfg.router_bias_update_rate)
-        except Exception:
-          _log.warning("router.update_bias() failed — load balancing may be affected", exc_info=True)
+        # Update router bias for aux-free load balancing
+        if (
+          bias_rate > 0.0
+          and hasattr(ffn, 'router')
+          and hasattr(ffn, 'last_loads')
+          and hasattr(ffn, 'last_expert_ids')
+          and ffn.last_loads is not None
+          and ffn.last_expert_ids is not None
+        ):
+          try:
+            ffn.router.update_bias(ffn.last_loads, gamma=bias_rate, expert_ids=ffn.last_expert_ids)
+          except Exception as e:
+            raise RuntimeError(
+              "router.update_bias() failed in optimizer post-hook; "
+              "refusing to continue with stale router bias."
+            ) from e

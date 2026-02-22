@@ -11,13 +11,13 @@ from nmoe.config import Config
 from nmoe.triton.nsa import cmp_attention
 import nmoe.triton.swa as swa_k
 
-import logging as _logging
-_nsa_logger = _logging.getLogger(__name__)
 try:
   _flex_attention = torch.compile(flex_attention)
 except Exception as _e:
-  _nsa_logger.warning("torch.compile(flex_attention) failed: %s. Using eager mode (slower).", _e)
-  _flex_attention = flex_attention
+  raise RuntimeError(
+    "torch.compile(flex_attention) failed for NSA. "
+    "Eager fallback is disabled on production no-fallback path."
+  ) from _e
 
 
 class NSA(nn.Module):

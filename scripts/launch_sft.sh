@@ -33,6 +33,15 @@ VENV="${VENV:-${NMOE_ROOT}/.venv}"
 GPUS_PER_NODE=8
 
 # ============================================================================
+# nmoe no-fallback production contract
+# ============================================================================
+export NMOE_USE_FA4=1
+export NMOE_REQUIRE_FLASHMLA=1
+export NMOE_PACKED_ATTN_BACKEND=flashmla
+export NMOE_ROUTER_BWD_ALLOW_STANDALONE=0
+export NMOE_AUX_LOSS_ALLOW_STANDALONE=0
+
+# ============================================================================
 # Local mode (single-node, no SLURM)
 # ============================================================================
 if [[ "${1:-}" == "--local" ]]; then

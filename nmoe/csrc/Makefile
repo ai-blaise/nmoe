@@ -10,7 +10,9 @@
 #   make clean    - Remove build artifacts
 
 CUDA_HOME ?= /usr/local/cuda
-PYTHON := python3
+PYTHON ?= python3
+NMOE_REQUIRE_NVSHMEM ?= 0
+NMOE_STRICT_LINK ?= 1
 
 # NVSHMEM paths (apt package installs to /usr/include/nvshmem_12 and /usr/lib/x86_64-linux-gnu/nvshmem/12)
 NVSHMEM_INCLUDE ?= /usr/include/nvshmem_12
@@ -20,9 +22,17 @@ NVSHMEM_LIB ?= /usr/lib/x86_64-linux-gnu/nvshmem/12
 PYTHON_INCLUDE := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path('include'))")
 PYBIND11_INCLUDE := $(shell $(PYTHON) -c "import pybind11; print(pybind11.get_include())")
 PYTHON_EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+ifeq ($(strip $(PYTHON_EXT_SUFFIX)),)
+$(error Failed to resolve Python extension suffix from $(PYTHON))
+endif
 
 # Auto-detect NVSHMEM
 HAS_NVSHMEM := $(shell test -f $(NVSHMEM_INCLUDE)/nvshmem.h && echo 1 || echo 0)
+ifeq ($(NMOE_REQUIRE_NVSHMEM),1)
+ifneq ($(HAS_NVSHMEM),1)
+$(error NVSHMEM required but not found at $(NVSHMEM_INCLUDE))
+endif
+endif
 
 # Compilers
 NVCC := $(CUDA_HOME)/bin/nvcc
@@ -31,7 +41,6 @@ CXX := g++
 # Base flags
 NVCC_FLAGS := -std=c++17 -O3 \
     -gencode arch=compute_100a,code=sm_100a \
-    -rdc=true \
     -Xcompiler -fPIC \
     --expt-relaxed-constexpr \
     -DNMOE_ENABLE_PTX_E2M1=1 \
@@ -42,7 +51,22 @@ CXX_FLAGS := -std=c++17 -O3 -fPIC \
     -I$(PYTHON_INCLUDE) \
     -I$(PYBIND11_INCLUDE)
 
-LDFLAGS := -shared -L$(CUDA_HOME)/lib64 -lcublas -lcublasLt -lcudart -lcudadevrt -Wl,-rpath,$(CUDA_HOME)/lib64
+CUDA_DEVRT_LIB :=
+LDFLAGS := -shared -L$(CUDA_HOME)/lib64 -lcublas -lcublasLt -lcudart -Wl,-rpath,$(CUDA_HOME)/lib64
+ifeq ($(NMOE_STRICT_LINK),1)
+LDFLAGS += -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+endif
+
+# Enable RDC + device link only when NVSHMEM is enabled.
+# This preserves the NVSHMEM device-link path while keeping the default
+# non-NVSHMEM build on a simpler, faster non-RDC compilation flow.
+ifeq ($(HAS_NVSHMEM), 1)
+    NVCC_FLAGS += -rdc=true
+    CUDA_DEVRT_LIB := -lcudadevrt
+    USE_RDC := 1
+else
+    USE_RDC := 0
+endif
 
 # NVSHMEM support (if available)
 ifeq ($(HAS_NVSHMEM), 1)
@@ -103,7 +127,7 @@ TORCH_INCLUDE_FLAGS := $(shell $(PYTHON) -c "from torch.utils.cpp_extension impo
 TORCH_LIB_DIR := $(shell $(PYTHON) -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
 
 FLASHMLA_CXX_FLAGS := -DTORCH_EXTENSION_NAME=flashmla_sm100 -DTORCH_API_INCLUDE_EXTENSION_H \
-	-std=c++17 -O3 -fPIC \
+	-std=c++20 -O3 -DNDEBUG -fPIC \
 	$(FLASHMLA_INCLUDE_FLAGS) \
 	$(TORCH_INCLUDE_FLAGS) \
 	-isystem $(CUDA_HOME)/include \
@@ -111,7 +135,7 @@ FLASHMLA_CXX_FLAGS := -DTORCH_EXTENSION_NAME=flashmla_sm100 -DTORCH_API_INCLUDE_
 	-I$(PYBIND11_INCLUDE)
 
 FLASHMLA_NVCC_FLAGS := -DTORCH_EXTENSION_NAME=flashmla_sm100 -DTORCH_API_INCLUDE_EXTENSION_H \
-	-std=c++17 -O3 --use_fast_math -lineinfo \
+	-std=c++20 -O3 -DNDEBUG --use_fast_math -lineinfo \
 	-gencode arch=compute_100a,code=sm_100a \
 	--expt-relaxed-constexpr \
 	--compiler-options '-fPIC' \
@@ -133,6 +157,14 @@ DLINK_OBJ := dlink.o
 GPU_OBJS := $(GPU_CPP_SRCS:.cpp=.o)
 MUON_DLINK_OBJ := muon_dlink.o
 
+ifeq ($(USE_RDC), 1)
+    RDEP_LINK_OBJS := $(RDEP_CUDA_OBJS) $(DLINK_OBJ)
+    MUON_LINK_OBJS := $(MUON_OBJS) $(MUON_DLINK_OBJ)
+else
+    RDEP_LINK_OBJS := $(RDEP_CUDA_OBJS)
+    MUON_LINK_OBJS := $(MUON_OBJS)
+endif
+
 .PHONY: all clean info
 
 all: $(RDEP_TARGET) $(GPU_TARGET) $(MUON_TARGET) $(FLASHMLA_TARGET)
@@ -140,14 +172,17 @@ all: $(RDEP_TARGET) $(GPU_TARGET) $(MUON_TARGET) $(FLASHMLA_TARGET)
 # ========== RDEP module (CUDA + NVSHMEM) ==========
 
 # Device link step (required for -rdc=true)
+ifeq ($(USE_RDC), 1)
 $(DLINK_OBJ): $(RDEP_CUDA_OBJS)
-	$(NVCC) $(NVCC_FLAGS) -dlink -o $@ $^ $(NVSHMEM_DEVICE_LIB) -lcudadevrt
+	$(NVCC) $(NVCC_FLAGS) -dlink -o $@ $^ $(NVSHMEM_DEVICE_LIB) $(CUDA_DEVRT_LIB)
+endif
 
-$(RDEP_TARGET): $(RDEP_CUDA_OBJS) $(DLINK_OBJ) $(RDEP_CPP_OBJS)
-	$(CXX) -o $@ $^ $(NVSHMEM_DEVICE_LIB) $(LDFLAGS)
+$(RDEP_TARGET): $(RDEP_LINK_OBJS) $(RDEP_CPP_OBJS)
+	$(CXX) -o $@ $^ $(NVSHMEM_DEVICE_LIB) $(CUDA_DEVRT_LIB) $(LDFLAGS)
 	@echo ""
 	@echo "Built $(RDEP_TARGET)"
 	@echo "  NVSHMEM: $(NVSHMEM_STATUS)"
+	@echo "  RDC:     $(USE_RDC)"
 	@echo ""
 
 # ========== GPU telemetry module (NVML only, no CUDA) ==========
@@ -161,13 +196,15 @@ $(GPU_TARGET): $(GPU_OBJS)
 
 # ========== MUON module (CUDA) ==========
 
+ifeq ($(USE_RDC), 1)
 $(MUON_DLINK_OBJ): muon.o
-	$(NVCC) $(NVCC_FLAGS) -dlink -o $@ $^ -lcudadevrt
+	$(NVCC) $(NVCC_FLAGS) -dlink -o $@ $^ $(CUDA_DEVRT_LIB)
+endif
 
-$(MUON_TARGET): $(MUON_OBJS) $(MUON_DLINK_OBJ)
+$(MUON_TARGET): $(MUON_LINK_OBJS)
 	@mkdir -p $(OPT_DIR)
 	$(CXX) -o $@ $^ -shared \
-		-L$(CUDA_HOME)/lib64 -lcublas -lcublasLt -lcudart -lcudadevrt -Wl,-rpath,$(CUDA_HOME)/lib64
+		-L$(CUDA_HOME)/lib64 -lcublas -lcublasLt -lcudart $(CUDA_DEVRT_LIB) -Wl,-rpath,$(CUDA_HOME)/lib64
 	@echo ""
 	@echo "Built $(MUON_TARGET)"
 	@echo ""

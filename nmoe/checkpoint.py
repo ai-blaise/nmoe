@@ -1327,12 +1327,24 @@ def dequantize_nvfp4_to_model_gpu(
                 f"Expected 2D [M, K/2] or 3D [E, M, K/2]. CPU dequant fallback has been removed."
             )
 
-        # Allocate BF16 output on GPU
-        if need_transpose:
-            # Output transposed: [K, total_M] then reshape
+        max_transpose_mode = int(getattr(_rdep_ext, "ct_nvfp4_to_bf16_max_transpose_mode", 1))
+        if need_transpose and packed_gpu.ndim == 3 and max_transpose_mode < 2:
+            raise RuntimeError(
+                f"[nvfp4] {out_key}: ct_nvfp4_to_bf16 transpose mode=2 is required for production "
+                "no-fallback path. Rebuild nmoe/csrc extension."
+            )
+
+        # Allocate BF16 output on GPU.
+        # For 3D experts + transpose, prefer direct [E, K, M] when the extension supports mode=2.
+        if need_transpose and packed_gpu.ndim == 3 and max_transpose_mode >= 2:
+            out_bf16 = torch.empty(E, K, M, dtype=torch.bfloat16, device=device)
+            transpose_mode = 2
+        elif need_transpose:
             out_bf16 = torch.empty(K, total_M, dtype=torch.bfloat16, device=device)
+            transpose_mode = 1
         else:
             out_bf16 = torch.empty(total_M, K, dtype=torch.bfloat16, device=device)
+            transpose_mode = 0
 
         # Run GPU kernel
         stream = torch.cuda.current_stream(device)
@@ -1340,14 +1352,17 @@ def dequantize_nvfp4_to_model_gpu(
             packed_flat.data_ptr(), scale_flat.data_ptr(), gs_flat.data_ptr(),
             out_bf16.data_ptr(),
             total_M, K, group_size,
-            gs_stride, expert_rows, 1 if need_transpose else 0,
+            gs_stride, expert_rows, transpose_mode,
             stream,
         )
 
         # Reshape output to match model parameter shape
         if packed_gpu.ndim == 3 and need_transpose:
-            # [K, E*M] → [E, K, M] → matches model [E, in_dim, out_dim]
-            out_bf16 = out_bf16.reshape(K, E, M).permute(1, 0, 2).contiguous()
+            if transpose_mode == 2:
+                # Already materialized as [E, K, M].
+                pass
+            else:
+                out_bf16 = out_bf16.reshape(K, E, M).permute(1, 0, 2).contiguous()
         elif packed_gpu.ndim == 3 and not need_transpose:
             out_bf16 = out_bf16.reshape(E, M, K)
         # For 2D: already [M, K] or [K, M]
@@ -1355,14 +1370,15 @@ def dequantize_nvfp4_to_model_gpu(
         # Write directly to model parameter
         if target_param.shape == out_bf16.shape:
             target_param.data.copy_(out_bf16)
+        elif out_bf16.ndim == 2 and target_param.ndim == 2 and target_param.shape == (out_bf16.shape[1], out_bf16.shape[0]):
+            target_param.data.copy_(out_bf16.transpose(0, 1).contiguous())
+        elif out_bf16.ndim == 3 and target_param.ndim == 3 and target_param.shape == (out_bf16.shape[0], out_bf16.shape[2], out_bf16.shape[1]):
+            target_param.data.copy_(out_bf16.transpose(1, 2).contiguous())
         else:
-            # Shape mismatch — try to reshape
-            try:
-                target_param.data.copy_(out_bf16.reshape(target_param.shape))
-            except RuntimeError:
-                print_fn(f"[nvfp4] WARNING: Shape mismatch for {out_key}: "
-                         f"kernel output {out_bf16.shape} vs param {target_param.shape}")
-                result[out_key] = out_bf16.cpu()
+            # Do not reshape blindly: reshape may silently corrupt layout.
+            print_fn(f"[nvfp4] WARNING: Shape mismatch for {out_key}: "
+                     f"kernel output {out_bf16.shape} vs param {target_param.shape}")
+            result[out_key] = out_bf16.cpu()
 
         # Free GPU temporaries
         del packed_gpu, scale_gpu, gs_gpu, packed_flat, scale_flat, gs_flat, out_bf16
@@ -1389,6 +1405,16 @@ def _is_nvfp4_checkpoint(state: dict) -> bool:
 def _get_nvfp4_group_size(state: dict) -> int:
     """Get NVFP4 group size from checkpoint metadata."""
     return int(state.get('nvfp4_group_size', 16))
+
+
+def _mark_nvfp4_expert_load_counter(model: torch.nn.Module, *, direct: bool) -> None:
+    """Record whether expert NVFP4 load used direct mode vs forbidden fallback."""
+    if direct:
+        key = "_runtime_nvfp4_checkpoint_direct_expert_loads"
+    else:
+        key = "_runtime_nvfp4_checkpoint_non_direct_expert_loads"
+    current = int(getattr(model, key, 0))
+    setattr(model, key, current + 1)
 
 
 def load_nvfp4_expert_buffers(
@@ -1777,8 +1803,8 @@ def load_state(
 
     Args:
         nvfp4_direct: If True, load NVFP4 expert triplets directly to GPU buffers
-            (Option C: NVFP4 primary, no BF16 master weights). If False, dequantize
-            NVFP4 triplets to BF16 on CPU and load via load_state_dict (legacy path).
+            (Option C: NVFP4 primary, no BF16 master weights). NVFP4 non-direct
+            expert load paths are forbidden and will raise.
     """
     it_dir = os.path.dirname(path)
     rd_path = os.path.join(it_dir, 'rd.pt')
@@ -1845,7 +1871,7 @@ def load_state(
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     validate_checkpoint_version(ckpt)  # Validate dp_rank checkpoint version too
 
-    # Load expert weights: either direct NVFP4 buffers or dequant to BF16
+    # Load expert weights: NVFP4 checkpoints must use direct buffer load.
     expert_sd = ckpt['model_expert']
     ckpt_is_nvfp4 = is_nvfp4 or _is_nvfp4_checkpoint(ckpt)
     # Auto-detect Option C: if checkpoint was saved with nvfp4_format metadata, use direct path
@@ -1856,17 +1882,19 @@ def load_state(
         print_fn(f"[nvfp4] Loading expert NVFP4 triplets directly to GPU buffers (Option C)...")
         loaded = load_nvfp4_expert_buffers(expert_sd, model, gs, print_fn)
         if not loaded:
+            _mark_nvfp4_expert_load_counter(model, direct=False)
             raise RuntimeError(
                 "[nvfp4] No NVFP4 triplets found in expert state dict but checkpoint "
                 "is marked as nvfp4_format=compressed_tensors. The checkpoint may be "
                 "corrupted or incompatible. CPU dequant fallback has been removed."
             )
+        _mark_nvfp4_expert_load_counter(model, direct=True)
     elif ckpt_is_nvfp4:
-        # NVFP4 checkpoint but not in direct mode — still use GPU dequant
-        gs = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else group_size
-        print_fn(f"[nvfp4] Dequantizing expert NVFP4 triplets via GPU kernel...")
-        expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, gs, print_fn)
-        model.load_state_dict(expert_sd, strict=False)
+        _mark_nvfp4_expert_load_counter(model, direct=False)
+        raise RuntimeError(
+            "[nvfp4] Expert non-direct load path is forbidden for NVFP4 production runs. "
+            "Set nvfp4_direct=True and provide compressed_tensors expert triplets."
+        )
     else:
         model.load_state_dict(expert_sd, strict=False)
     del expert_sd
@@ -1933,7 +1961,8 @@ def load_state_with_ep_check(
         print_fn: Print function for logging.
         strict_ep: If True, raise error on EP mismatch. If False, warn only.
         nvfp4_direct: If True, load NVFP4 expert triplets directly to GPU buffers
-            (Option C: NVFP4 primary, no BF16 master weights).
+            (Option C: NVFP4 primary, no BF16 master weights). NVFP4 non-direct
+            expert load paths are forbidden and will raise.
 
     Returns:
         (step, tokens, zero2_state, saved_ep_info) tuple.
@@ -2008,7 +2037,7 @@ def load_state_with_ep_check(
     else:
         print_fn("[checkpoint] Skipping fingerprint validation for imported checkpoint (no stored fingerprint)")
 
-    # Load expert weights: either direct NVFP4 buffers or dequant to BF16
+    # Load expert weights: NVFP4 checkpoints must use direct buffer load.
     expert_sd = ckpt['model_expert']
     ckpt_is_nvfp4 = is_nvfp4 or _is_nvfp4_checkpoint(ckpt)
     nvfp4_direct_load = nvfp4_direct or ckpt.get('nvfp4_format') == 'compressed_tensors'
@@ -2018,14 +2047,18 @@ def load_state_with_ep_check(
         print_fn(f"[nvfp4] Loading expert NVFP4 triplets directly to GPU buffers (Option C)...")
         loaded = load_nvfp4_expert_buffers(expert_sd, model, gs, print_fn)
         if not loaded:
-            print_fn("[nvfp4] WARNING: No NVFP4 triplets found in expert state, falling back to GPU dequant")
-            expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, gs, print_fn)
-            model.load_state_dict(expert_sd, strict=False)
+            _mark_nvfp4_expert_load_counter(model, direct=False)
+            raise RuntimeError(
+                "[nvfp4] No NVFP4 triplets found in expert state dict but direct NVFP4 "
+                "load is required for production."
+            )
+        _mark_nvfp4_expert_load_counter(model, direct=True)
     elif ckpt_is_nvfp4:
-        group_size_dp = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else group_size
-        print_fn(f"[nvfp4] Dequantizing expert NVFP4 triplets via GPU kernel...")
-        expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, group_size_dp, print_fn)
-        model.load_state_dict(expert_sd, strict=False)
+        _mark_nvfp4_expert_load_counter(model, direct=False)
+        raise RuntimeError(
+            "[nvfp4] Expert non-direct load path is forbidden for NVFP4 production runs. "
+            "Set nvfp4_direct=True and provide compressed_tensors expert triplets."
+        )
     else:
         model.load_state_dict(expert_sd, strict=False)
     del expert_sd
@@ -2234,12 +2267,15 @@ def load_with_resharding(
     validate_checkpoint_version(rd)
     dense_sd = rd['model_dense']
 
-    # Detect NVFP4 and dequantize on GPU
+    # Detect NVFP4. Precision-invariant production path does not support
+    # dequantized expert resharding.
     is_nvfp4 = _is_nvfp4_checkpoint(rd)
     if is_nvfp4:
-        group_size = _get_nvfp4_group_size(rd)
-        print_fn(f"[reshard/nvfp4] Dequantizing dense NVFP4 triplets via GPU kernel (group_size={group_size})")
-        dense_sd = dequantize_nvfp4_to_model_gpu(dense_sd, model, group_size, print_fn)
+        raise RuntimeError(
+            "[reshard/nvfp4] NVFP4 resharding via dequantized expert tensors is "
+            "disabled for production precision-invariant runs. Use an EP-matched "
+            "NVFP4 checkpoint layout (pre-sharded) and direct expert buffer loading."
+        )
 
     model.load_state_dict(dense_sd, strict=False)
     del dense_sd
@@ -2273,8 +2309,12 @@ def load_with_resharding(
     # Also check dp checkpoint for NVFP4
     if not is_nvfp4:
         is_nvfp4 = _is_nvfp4_checkpoint(ckpt)
-    nvfp4_group_size = _get_nvfp4_group_size(ckpt) if _is_nvfp4_checkpoint(ckpt) else (group_size if is_nvfp4 else 16)
-
+    if is_nvfp4:
+        raise RuntimeError(
+            "[reshard/nvfp4] NVFP4 resharding via dequantized expert tensors is "
+            "disabled for production precision-invariant runs. Use an EP-matched "
+            "NVFP4 checkpoint layout (pre-sharded) and direct expert buffer loading."
+        )
     saved_ep_info = get_ep_shard_info_from_checkpoint(ckpt)
 
     if saved_ep_info is None:
@@ -2291,9 +2331,6 @@ def load_with_resharding(
         # No resharding needed - load directly
         print_fn(f"[reshard] EP config matches, loading directly")
         expert_sd = ckpt['model_expert']
-        if is_nvfp4:
-            print_fn(f"[reshard/nvfp4] Dequantizing expert NVFP4 triplets via GPU kernel...")
-            expert_sd = dequantize_nvfp4_to_model_gpu(expert_sd, model, nvfp4_group_size, print_fn)
         model.load_state_dict(expert_sd, strict=False)
         del expert_sd
         # Restore optimizer state if available
@@ -2308,8 +2345,6 @@ def load_with_resharding(
         if saved_ep_info.ep_size == 1:
             # Single shard contains all experts - can reshard directly
             expert_sd = ckpt['model_expert']
-            if is_nvfp4:
-                expert_sd = dequantize_nvfp4_state_dict_gpu(expert_sd, nvfp4_group_size, print_fn)
             resharded = reshard_expert_weights(
                 expert_sd, saved_ep_info, target_ep_size, target_ep_rank, print_fn
             )
@@ -2339,8 +2374,6 @@ def load_with_resharding(
 
                 src_ckpt = torch.load(src_path, map_location='cpu', weights_only=False)
                 src_expert_sd = src_ckpt['model_expert']
-                if is_nvfp4:
-                    src_expert_sd = dequantize_nvfp4_state_dict_gpu(src_expert_sd, nvfp4_group_size, print_fn)
                 resharded = reshard_expert_weights(
                     src_expert_sd, src_info, target_ep_size, target_ep_rank, print_fn
                 )
@@ -2503,7 +2536,8 @@ def load_checkpoint(
 
             _consensus_checkpoint_signature(step)
 
-            nvfp4_direct = getattr(cfg, 'eco_enabled', False) or eco_fused
+            run_dtype = str(getattr(cfg, 'dtype', 'bf16') or 'bf16').lower()
+            nvfp4_direct = run_dtype == 'nvfp4' or getattr(cfg, 'eco_enabled', False) or eco_fused
             if rank == 0 and nvfp4_direct:
                 print_fn(f"[checkpoint] Loading with nvfp4_direct=True (eco_fused_backward={eco_fused})")
             start_step, tokens_seen, z2 = load_state(

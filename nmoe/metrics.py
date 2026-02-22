@@ -29,11 +29,6 @@ except Exception as e:  # pragma: no cover
     logging.getLogger(__name__).debug("gpu module not available, GPU metrics disabled: %s", e)
     gpu = None  # type: ignore
 
-try:  # Weights & Biases (optional)
-    import wandb as _wandb
-except Exception:  # pragma: no cover
-    _wandb = None  # type: ignore
-
 # ------------------------------------------------------------
 # NVIDIA B200 peak Tensor Core throughput (per GPU, dense)
 #
@@ -725,6 +720,7 @@ def start_metrics(run_id: Optional[str] = None,
     writer: Optional[MetricsWriter] = None
     gpu_snapshot_fn = None
     gpu_stop_fn = None
+    wandb_root: Optional[str] = None
     try:
         rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
     except Exception:
@@ -739,9 +735,11 @@ def start_metrics(run_id: Optional[str] = None,
         os.makedirs(run_dir, exist_ok=True)
         db_path = os.path.join(run_dir, f"rank_{rank}.duckdb")
         writer = MetricsWriter(db_path, run=rid)
+        wandb_root = os.getenv("WANDB_DIR", os.getcwd())
     except Exception:
         logger.debug("metrics: DuckDB writer initialization", exc_info=True)
         writer = None
+        wandb_root = os.getenv("WANDB_DIR", os.getcwd())
 
     # GPU poller via csrc extension (optional)
     try:
@@ -765,26 +763,54 @@ def start_metrics(run_id: Optional[str] = None,
 
     # W&B init (rank 0 only, opt-in via WANDB_ENABLED env var)
     wandb_run = None
-    if rank == 0 and _wandb is not None and os.getenv("WANDB_ENABLED") == "1":
+    if rank == 0 and os.getenv("WANDB_ENABLED") == "1":
         try:
+            # Hard local-only policy: never call home, never use API key.
+            os.environ["WANDB_MODE"] = "offline"
+            os.environ["WANDB_OFFLINE"] = "true"
+            os.environ["WANDB_DISABLE_GIT"] = "true"
+            os.environ.setdefault("WANDB_CONSOLE", "off")
+            if wandb_root:
+                os.environ["WANDB_DIR"] = wandb_root
+            os.environ.pop("WANDB_API_KEY", None)
+            os.environ.pop("WANDB_ENTITY", None)
+            os.environ.pop("WANDB_BASE_URL", None)
+
+            try:
+                import wandb as _wandb  # type: ignore
+            except Exception as import_error:
+                raise RuntimeError(
+                    "WANDB_ENABLED=1 but wandb package is unavailable. "
+                    "Install wandb for local LEET-compatible tracking."
+                ) from import_error
+
             wandb_run = _wandb.init(
-                project=os.getenv("WANDB_PROJECT", "nmoe"),
-                entity=os.getenv("WANDB_ENTITY") or None,
+                project=os.getenv("WANDB_PROJECT", "nmoe-local"),
+                entity=None,
                 id=rid,
                 resume="allow",
+                mode="offline",
+                dir=os.environ.get("WANDB_DIR"),
             )
-            if wandb_run is not None:
-                # Configure wandb to sync more frequently
-                wandb_run.define_metric("step", step_metric="step")
-                wandb_run.define_metric("loss", step_metric="step")
-                wandb_run.define_metric("grad_norm", step_metric="step")
-        except Exception:
-            logger.warning("metrics: W&B init failed, continuing without W&B", exc_info=True)
-            wandb_run = None
+            if wandb_run is None:
+                raise RuntimeError("WANDB_ENABLED=1 but wandb.init returned no run object.")
+
+            actual_mode = str(getattr(getattr(wandb_run, "settings", None), "mode", "")).strip().lower()
+            if actual_mode != "offline":
+                raise RuntimeError(f"W&B local-only policy violated: mode={actual_mode!r}, expected 'offline'.")
+
+            wandb_run.define_metric("step", step_metric="step")
+            wandb_run.define_metric("loss", step_metric="step")
+            wandb_run.define_metric("grad_norm", step_metric="step")
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to initialize local-only W&B tracking. "
+                "This run enforces no-fallback local tracking for LEET TUI."
+            ) from e
 
     # Safety net: ensure wandb data is flushed even if stop_metrics() is never called
     if wandb_run is not None:
-        atexit.register(lambda: _wandb.finish() if _wandb is not None else None)
+        atexit.register(lambda: wandb_run.finish())
 
     return MetricsContext(
         writer=writer,
@@ -809,21 +835,16 @@ def stop_metrics(ctx: Optional[MetricsContext]) -> None:
     except Exception:
         logger.debug("metrics: DuckDB writer close on stop", exc_info=True)
     try:
-        if ctx.wandb_run is not None and _wandb is not None:
-            print("[metrics] wandb.finish() starting – flushing buffered data …")
+        if ctx.wandb_run is not None:
+            print("[metrics] local wandb.finish() starting – flushing local run data …")
             try:
-                _wandb.finish(timeout=60)
+                ctx.wandb_run.finish(timeout=60)
             except TypeError:
                 # wandb < 0.25 does not support timeout kwarg
-                _wandb.finish()
-            print("[metrics] wandb.finish() completed successfully.")
-    except Exception:
-        logger.warning("metrics: W&B finish failed or timed out, attempting fallback", exc_info=True)
-        try:
-            if _wandb is not None:
-                _wandb.finish(exit_code=1)
-        except Exception:
-            logger.debug("metrics: W&B fallback finish also failed", exc_info=True)
+                ctx.wandb_run.finish()
+            print("[metrics] local wandb.finish() completed successfully.")
+    except Exception as e:
+        raise RuntimeError("metrics: local W&B finish failed (no-fallback policy)") from e
 
 
 def collect_router_stats(model: torch.nn.Module):
@@ -841,7 +862,7 @@ def collect_router_stats(model: torch.nn.Module):
         cv = ent = mx = None
         bmin = bmax = None
         experts_active = None
-        if hasattr(ffn, "last_loads"):
+        if hasattr(ffn, "last_loads") and ffn.last_loads is not None:
             l = ffn.last_loads.detach().float()
             m = l.mean()
             if m.item() != 0.0:
@@ -1012,9 +1033,9 @@ def log_training_step(step: int,
                 wandb_payload["memory_max_alloc_gib"] = float(out['max_alloc_gib'])
             if out.get('grad_norm') is not None:
                 wandb_payload["grad_norm"] = float(out['grad_norm'])
-            _wandb.log(wandb_payload, step=step)
-        except Exception:
-            logger.debug("metrics: W&B log core metrics", exc_info=True)
+            ctx.wandb_run.log(wandb_payload, step=step)
+        except Exception as e:
+            raise RuntimeError("metrics: local W&B core metric log failed (no-fallback policy)") from e
 
     # Router metrics (per-layer + aggregates)
     if ctx is not None and ctx.writer is not None and rank == 0:
@@ -1062,9 +1083,9 @@ def log_training_step(step: int,
             if _agg.get('experts_active_mean') is not None:
                 wandb_router["router/experts_active_mean"] = float(_agg['experts_active_mean'])
             if wandb_router:
-                _wandb.log(wandb_router, step=step)
-        except Exception:
-            logger.debug("metrics: W&B log router metrics", exc_info=True)
+                ctx.wandb_run.log(wandb_router, step=step)
+        except Exception as e:
+            raise RuntimeError("metrics: local W&B router metric log failed (no-fallback policy)") from e
 
     # Flush timers for this rank, then flush step-level segment and comm metrics, if any (all ranks, per-rank tags)
     _flush_timers_into_segments()

@@ -136,6 +136,7 @@ __global__ void k_fused_adamw_fp32_vec4(
     float*       __restrict__ exp_avg,
     float*       __restrict__ exp_avg_sq,
     int N4,    // number of float4 groups = N / 4
+    int tail,  // leftover scalar elements (N % 4)
     float beta1,
     float beta2,
     float lr,
@@ -145,59 +146,73 @@ __global__ void k_fused_adamw_fp32_vec4(
     float inv_bc2_sqrt)
 {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= N4) return;
-
-  // Vectorized loads (128-bit aligned)
-  float4 p4 = reinterpret_cast<float4*>(param)[idx];
-  float4 g4 = reinterpret_cast<const float4*>(grad)[idx];
-  float4 m4 = reinterpret_cast<float4*>(exp_avg)[idx];
-  float4 v4 = reinterpret_cast<float4*>(exp_avg_sq)[idx];
+  if (idx >= N4 + tail) return;
 
   const float decay_factor = (weight_decay != 0.0f) ? (1.0f - lr * weight_decay) : 1.0f;
   const float one_m_b1 = 1.0f - beta1;
   const float one_m_b2 = 1.0f - beta2;
 
-  // Component 0
-  {
-    float p = p4.x * decay_factor;
-    float g = g4.x;
-    float m = beta1 * m4.x + one_m_b1 * g;
-    float v = beta2 * v4.x + one_m_b2 * g * g;
-    p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
-    p4.x = p;  m4.x = m;  v4.x = v;
-  }
-  // Component 1
-  {
-    float p = p4.y * decay_factor;
-    float g = g4.y;
-    float m = beta1 * m4.y + one_m_b1 * g;
-    float v = beta2 * v4.y + one_m_b2 * g * g;
-    p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
-    p4.y = p;  m4.y = m;  v4.y = v;
-  }
-  // Component 2
-  {
-    float p = p4.z * decay_factor;
-    float g = g4.z;
-    float m = beta1 * m4.z + one_m_b1 * g;
-    float v = beta2 * v4.z + one_m_b2 * g * g;
-    p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
-    p4.z = p;  m4.z = m;  v4.z = v;
-  }
-  // Component 3
-  {
-    float p = p4.w * decay_factor;
-    float g = g4.w;
-    float m = beta1 * m4.w + one_m_b1 * g;
-    float v = beta2 * v4.w + one_m_b2 * g * g;
-    p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
-    p4.w = p;  m4.w = m;  v4.w = v;
-  }
+  if (idx < N4) {
+    // Vectorized loads (128-bit aligned)
+    float4 p4 = reinterpret_cast<float4*>(param)[idx];
+    float4 g4 = reinterpret_cast<const float4*>(grad)[idx];
+    float4 m4 = reinterpret_cast<float4*>(exp_avg)[idx];
+    float4 v4 = reinterpret_cast<float4*>(exp_avg_sq)[idx];
 
-  // Vectorized stores
-  reinterpret_cast<float4*>(param)[idx]      = p4;
-  reinterpret_cast<float4*>(exp_avg)[idx]    = m4;
-  reinterpret_cast<float4*>(exp_avg_sq)[idx] = v4;
+    // Component 0
+    {
+      float p = p4.x * decay_factor;
+      float g = g4.x;
+      float m = beta1 * m4.x + one_m_b1 * g;
+      float v = beta2 * v4.x + one_m_b2 * g * g;
+      p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
+      p4.x = p;  m4.x = m;  v4.x = v;
+    }
+    // Component 1
+    {
+      float p = p4.y * decay_factor;
+      float g = g4.y;
+      float m = beta1 * m4.y + one_m_b1 * g;
+      float v = beta2 * v4.y + one_m_b2 * g * g;
+      p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
+      p4.y = p;  m4.y = m;  v4.y = v;
+    }
+    // Component 2
+    {
+      float p = p4.z * decay_factor;
+      float g = g4.z;
+      float m = beta1 * m4.z + one_m_b1 * g;
+      float v = beta2 * v4.z + one_m_b2 * g * g;
+      p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
+      p4.z = p;  m4.z = m;  v4.z = v;
+    }
+    // Component 3
+    {
+      float p = p4.w * decay_factor;
+      float g = g4.w;
+      float m = beta1 * m4.w + one_m_b1 * g;
+      float v = beta2 * v4.w + one_m_b2 * g * g;
+      p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
+      p4.w = p;  m4.w = m;  v4.w = v;
+    }
+
+    // Vectorized stores
+    reinterpret_cast<float4*>(param)[idx]      = p4;
+    reinterpret_cast<float4*>(exp_avg)[idx]    = m4;
+    reinterpret_cast<float4*>(exp_avg_sq)[idx] = v4;
+  } else {
+    // Tail idx only when N % 4 != 0; keep arithmetic identical to scalar path.
+    const int tail_idx = N4 * 4 + (idx - N4);
+    float p = param[tail_idx] * decay_factor;
+    float g = grad[tail_idx];
+    float m = beta1 * exp_avg[tail_idx] + one_m_b1 * g;
+    float v = beta2 * exp_avg_sq[tail_idx] + one_m_b2 * g * g;
+    p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
+
+    param[tail_idx]      = p;
+    exp_avg[tail_idx]    = m;
+    exp_avg_sq[tail_idx] = v;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +262,7 @@ __global__ void k_fused_adamw_bf16_vec2(
     __nv_bfloat16*       __restrict__ exp_avg,
     __nv_bfloat16*       __restrict__ exp_avg_sq,
     int N2,    // number of bfloat162 pairs = N / 2
+    int tail,  // leftover scalar elements (N % 2)
     float beta1,
     float beta2,
     float lr,
@@ -257,24 +273,42 @@ __global__ void k_fused_adamw_bf16_vec2(
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= N2) return;
-
-  __nv_bfloat162 p2 = reinterpret_cast<__nv_bfloat162*>(param)[idx];
-  __nv_bfloat162 g2 = reinterpret_cast<const __nv_bfloat162*>(grad)[idx];
-  __nv_bfloat162 m2 = reinterpret_cast<__nv_bfloat162*>(exp_avg)[idx];
-  __nv_bfloat162 v2 = reinterpret_cast<__nv_bfloat162*>(exp_avg_sq)[idx];
+  if (idx >= N2 + tail) return;
 
   const float decay_factor = (weight_decay != 0.0f) ? (1.0f - lr * weight_decay) : 1.0f;
   const float one_m_b1 = 1.0f - beta1;
   const float one_m_b2 = 1.0f - beta2;
 
-  adamw_bf162_update(p2, g2, m2, v2,
-                     decay_factor, beta1, one_m_b1, beta2, one_m_b2,
-                     step_size, inv_bc2_sqrt, eps);
+  if (idx < N2) {
+    __nv_bfloat162 p2 = reinterpret_cast<__nv_bfloat162*>(param)[idx];
+    __nv_bfloat162 g2 = reinterpret_cast<const __nv_bfloat162*>(grad)[idx];
+    __nv_bfloat162 m2 = reinterpret_cast<__nv_bfloat162*>(exp_avg)[idx];
+    __nv_bfloat162 v2 = reinterpret_cast<__nv_bfloat162*>(exp_avg_sq)[idx];
 
-  reinterpret_cast<__nv_bfloat162*>(param)[idx]      = p2;
-  reinterpret_cast<__nv_bfloat162*>(exp_avg)[idx]    = m2;
-  reinterpret_cast<__nv_bfloat162*>(exp_avg_sq)[idx] = v2;
+    adamw_bf162_update(p2, g2, m2, v2,
+                       decay_factor, beta1, one_m_b1, beta2, one_m_b2,
+                       step_size, inv_bc2_sqrt, eps);
+
+    reinterpret_cast<__nv_bfloat162*>(param)[idx]      = p2;
+    reinterpret_cast<__nv_bfloat162*>(exp_avg)[idx]    = m2;
+    reinterpret_cast<__nv_bfloat162*>(exp_avg_sq)[idx] = v2;
+  } else {
+    // Tail idx only when N is odd; keep arithmetic identical to scalar BF16 path.
+    const int tail_idx = N2 * 2;
+    float p = __bfloat162float(param[tail_idx]);
+    float g = __bfloat162float(grad[tail_idx]);
+    float m = __bfloat162float(exp_avg[tail_idx]);
+    float v = __bfloat162float(exp_avg_sq[tail_idx]);
+
+    p *= decay_factor;
+    m = beta1 * m + one_m_b1 * g;
+    v = beta2 * v + one_m_b2 * g * g;
+    p -= step_size * m / (sqrtf(v) * inv_bc2_sqrt + eps);
+
+    param[tail_idx]      = __float2bfloat16(p);
+    exp_avg[tail_idx]    = __float2bfloat16(m);
+    exp_avg_sq[tail_idx] = __float2bfloat16(v);
+  }
 #endif
 }
 
@@ -293,28 +327,19 @@ inline cudaError_t launch_fused_adamw_fp32(
     float step_size, float inv_bc2_sqrt,
     cudaStream_t stream)
 {
-  if (N <= 0) return cudaSuccess;
+  if (N < 0) return cudaErrorInvalidValue;
+  if (N == 0) return cudaSuccess;
 
   // Vectorized path: process groups of 4 via float4.
-  // Tail elements (N % 4 != 0) handled by scalar kernel.
+  // Tail elements (N % 4 != 0) are handled in-kernel to avoid a second launch.
   const int N4   = N / 4;
   const int tail = N - N4 * 4;
-
-  if (N4 > 0) {
-    const int grid = ceil_div(N4, BLOCK);
+  const int total = N4 + tail;
+  if (total > 0) {
+    const int grid = ceil_div(total, BLOCK);
     k_fused_adamw_fp32_vec4<<<grid, BLOCK, 0, stream>>>(
         param, grad, exp_avg, exp_avg_sq,
-        N4, beta1, beta2, lr, weight_decay, eps,
-        step_size, inv_bc2_sqrt);
-  }
-
-  if (tail > 0) {
-    const int offset = N4 * 4;
-    const int grid   = ceil_div(tail, BLOCK);
-    k_fused_adamw_scalar<float><<<grid, BLOCK, 0, stream>>>(
-        param + offset, grad + offset,
-        exp_avg + offset, exp_avg_sq + offset,
-        tail, beta1, beta2, lr, weight_decay, eps,
+        N4, tail, beta1, beta2, lr, weight_decay, eps,
         step_size, inv_bc2_sqrt);
   }
 
@@ -332,31 +357,47 @@ inline cudaError_t launch_fused_adamw_bf16(
     float step_size, float inv_bc2_sqrt,
     cudaStream_t stream)
 {
-  if (N <= 0) return cudaSuccess;
+  if (N < 0) return cudaErrorInvalidValue;
+  if (N == 0) return cudaSuccess;
 
   // Vectorized path: process pairs via __nv_bfloat162.
   const int N2   = N / 2;
   const int tail = N - N2 * 2;
 
-  if (N2 > 0) {
-    const int grid = ceil_div(N2, BLOCK);
+  const int total = N2 + tail;
+  if (total > 0) {
+    const int grid = ceil_div(total, BLOCK);
     k_fused_adamw_bf16_vec2<<<grid, BLOCK, 0, stream>>>(
         param, grad, exp_avg, exp_avg_sq,
-        N2, beta1, beta2, lr, weight_decay, eps,
-        step_size, inv_bc2_sqrt);
-  }
-
-  if (tail > 0) {
-    // Single leftover element
-    const int offset = N2 * 2;
-    k_fused_adamw_scalar<__nv_bfloat16><<<1, 1, 0, stream>>>(
-        param + offset, grad + offset,
-        exp_avg + offset, exp_avg_sq + offset,
-        tail, beta1, beta2, lr, weight_decay, eps,
+        N2, tail, beta1, beta2, lr, weight_decay, eps,
         step_size, inv_bc2_sqrt);
   }
 
   return cudaGetLastError();
+}
+
+inline cudaError_t current_device_supports_bf16(bool* supports_out) {
+  if (supports_out == nullptr) return cudaErrorInvalidValue;
+  static thread_local int cached_dev = -2;
+  static thread_local bool cached_support = false;
+  int dev = -1;
+  cudaError_t err = cudaGetDevice(&dev);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  if (dev == cached_dev) {
+    *supports_out = cached_support;
+    return cudaSuccess;
+  }
+  int cc_major = 0;
+  err = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+  if (err != cudaSuccess) {
+    return err;
+  }
+  cached_dev = dev;
+  cached_support = (cc_major >= 8);
+  *supports_out = cached_support;
+  return cudaSuccess;
 }
 
 }  // namespace dense_adamw
@@ -377,6 +418,12 @@ extern "C" cudaError_t fused_adamw_step_fp32(
     float step_size, float inv_bc2_sqrt,
     cudaStream_t stream)
 {
+  if (N < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (N > 0 && (param == nullptr || grad == nullptr || exp_avg == nullptr || exp_avg_sq == nullptr)) {
+    return cudaErrorInvalidValue;
+  }
   return nmoe::dense_adamw::launch_fused_adamw_fp32(
       static_cast<float*>(param),
       static_cast<const float*>(grad),
@@ -397,6 +444,20 @@ extern "C" cudaError_t fused_adamw_step_bf16(
     float step_size, float inv_bc2_sqrt,
     cudaStream_t stream)
 {
+  if (N < 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (N > 0 && (param == nullptr || grad == nullptr || exp_avg == nullptr || exp_avg_sq == nullptr)) {
+    return cudaErrorInvalidValue;
+  }
+  bool supports_bf16 = false;
+  cudaError_t probe = nmoe::dense_adamw::current_device_supports_bf16(&supports_bf16);
+  if (probe != cudaSuccess) {
+    return probe;
+  }
+  if (!supports_bf16) {
+    return cudaErrorInvalidDeviceFunction;
+  }
   return nmoe::dense_adamw::launch_fused_adamw_bf16(
       static_cast<__nv_bfloat16*>(param),
       static_cast<const __nv_bfloat16*>(grad),

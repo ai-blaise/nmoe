@@ -82,16 +82,16 @@ spec:
                   name: {{ .Values.secrets.huggingface.existingSecret | default .Values.secrets.huggingface.secretName }}
                   key: {{ .Values.secrets.huggingface.key }}
             {{- if .Values.secrets.wandb.enabled }}
-            - name: WANDB_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.secrets.wandb.existingSecret | default .Values.secrets.wandb.secretName }}
-                  key: WANDB_API_KEY
-            - name: WANDB_ENTITY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.secrets.wandb.existingSecret | default .Values.secrets.wandb.secretName }}
-                  key: WANDB_ENTITY
+            - name: WANDB_ENABLED
+              value: "1"
+            - name: WANDB_MODE
+              value: "offline"
+            - name: WANDB_OFFLINE
+              value: "true"
+            - name: WANDB_DISABLE_GIT
+              value: "true"
+            - name: WANDB_CONSOLE
+              value: "off"
             - name: WANDB_PROJECT
               valueFrom:
                 secretKeyRef:

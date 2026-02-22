@@ -15,7 +15,6 @@ import os
 import socket
 import sys
 import ctypes
-import tomllib  # Kept for backward compat; prefer load_config_file
 import time
 from contextlib import nullcontext
 
@@ -77,6 +76,25 @@ def _validate_training_config(cfg: Config, world: int) -> None:
 
   if cfg.seq_len <= 0:
     raise ValueError(f"seq_len must be > 0 (got {cfg.seq_len})")
+  run_dtype = str(getattr(cfg, "dtype", "bf16") or "bf16").lower()
+  if cfg.n_layers > cfg.n_dense_layers:
+    if run_dtype not in {"fp8", "nvfp4"}:
+      raise ValueError(
+        f"MoE training requires blockscaled dtype ('fp8' or 'nvfp4'), got dtype={run_dtype!r}."
+      )
+  if run_dtype == "nvfp4":
+    attn = str(getattr(cfg, "attn", "mla") or "mla").lower()
+    attn_global_every = int(getattr(cfg, "attn_global_every", 1))
+    if attn != "mla":
+      raise ValueError(
+        "dtype=nvfp4 production profile requires attn='mla'. "
+        f"Got attn={attn!r}."
+      )
+    if attn_global_every != 1:
+      raise ValueError(
+        "dtype=nvfp4 production profile requires attn_global_every=1 "
+        f"(pure MLA global attention). Got attn_global_every={attn_global_every}."
+      )
   if cfg.n_activated_experts is not None and cfg.n_routed_experts is not None:
     if cfg.n_activated_experts <= 0:
       raise ValueError(f"n_activated_experts must be > 0 (got {cfg.n_activated_experts})")
@@ -96,8 +114,9 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
   need_quant = dtype in {'fp8', 'nvfp4'}
   need_router = bool(getattr(cfg, 'use_fused_router', True))
   need_eco = bool(getattr(cfg, 'eco_fused_backward', False) and getattr(cfg, 'eco_require_cuda', True))
-  use_fa4 = os.getenv('NMOE_USE_FA4', '0') in ('1', 'true', 'True')
-  require_flashmla = os.getenv('NMOE_REQUIRE_FLASHMLA', '0') in ('1', 'true', 'True')
+  use_fa4 = os.getenv('NMOE_USE_FA4', '1') in ('1', 'true', 'True')
+  require_flashmla = os.getenv('NMOE_REQUIRE_FLASHMLA', '1') in ('1', 'true', 'True')
+  packed_attn_backend = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
 
   # All distributed MoE paths require the core RDEP extension.
   try:
@@ -116,10 +135,17 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
     'dispatch_meta_blockscaled',
     'gather_xe_blockscaled',
     'return_scatter_from_pad_blockscaled',
+    'gather_dy_nogate_dist_bf16',
     'gather_dy_dist_bf16',
+    'zero_padding_rows_bf16',
     'scatter_dx_dist_bf16',
+    'scatter_dx_dist_from_pad_bf16',
+    'scatter_gate_bf16_out_bf16',
+    'send_dgate_dist_bf16_out_bf16',
     'bf16_wgrad_w2_cublaslt',
     'bf16_wgrad_w13_cublaslt',
+    'bf16_wgrad_w13_pair_cublaslt',
+    'bf16_prepare_offs_pad_host',
   ]
   missing_core = [name for name in core_required if not hasattr(_rdep, name)]
   if missing_core:
@@ -131,12 +157,22 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
       'ct_nvfp4_to_bf16',
     ]
     if dtype == 'nvfp4':
-      quant_required.extend(['quant_nvfp4', 'quant_nvfp4_sf_strided_mma'])
+      quant_required.extend([
+        'quant_nvfp4',
+        'quant_nvfp4_sf_strided_mma',
+        'dequant_nvfp4_to_bf16_mma_sf',
+      ])
     else:
-      quant_required.extend(['quant_fp8', 'quant_fp8_sf_strided_mma'])
+      quant_required.extend([
+        'quant_fp8',
+        'quant_fp8_sf_strided_mma',
+        'dequant_fp8_to_bf16_mma_sf',
+      ])
     missing_quant = [name for name in quant_required if not hasattr(_rdep, name)]
     if missing_quant:
       missing['quant'] = missing_quant
+    if dtype == 'nvfp4' and int(getattr(_rdep, 'ct_nvfp4_to_bf16_max_transpose_mode', 1)) < 2:
+      missing.setdefault('quant', []).append('ct_nvfp4_to_bf16_max_transpose_mode>=2')
 
   if need_eco:
     eco_required = [
@@ -153,15 +189,29 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
   if need_router:
     try:
       lib = ctypes.CDLL(_rdep.__file__)
-      router_required = ['fused_router_backward', 'fused_router_bwd_transpose']
+      router_required = [
+        'fused_router_backward',
+        'fused_router_backward_bf16',
+        'fused_router_backward_bf16_fused',
+        'fused_router_bwd_transpose',
+      ]
       missing_router = [name for name in router_required if not hasattr(lib, name)]
     except OSError:
-      missing_router = ['fused_router_backward', 'fused_router_bwd_transpose']
+      missing_router = [
+        'fused_router_backward',
+        'fused_router_backward_bf16',
+        'fused_router_backward_bf16_fused',
+        'fused_router_bwd_transpose',
+      ]
     if missing_router:
       missing['router'] = missing_router
 
   if require_flashmla and not use_fa4:
     missing['attention'] = ['NMOE_USE_FA4=1 required when NMOE_REQUIRE_FLASHMLA=1']
+  if require_flashmla and packed_attn_backend != "flashmla":
+    missing.setdefault('attention', []).append(
+      "NMOE_PACKED_ATTN_BACKEND=flashmla required when NMOE_REQUIRE_FLASHMLA=1"
+    )
   if use_fa4:
     attn_missing: list[str] = []
     try:
@@ -275,17 +325,90 @@ def train(cfg: Config):
   metrics_state = init_metrics(model, cfg.seq_len)
   metrics_ctx = start_metrics(run_id=run_id, metrics_dir=cfg.metrics_dir)
 
-  # Upload training config to W&B (rank 0 only)
+  # Upload a minimal safe config subset to local W&B run metadata (rank 0 only)
   if rank == 0 and metrics_ctx.wandb_run is not None:
-    import dataclasses
     try:
-      metrics_ctx.wandb_run.config.update(dataclasses.asdict(cfg))
-    except Exception:
-      logger.debug("W&B config upload failed", exc_info=True)
+      safe_keys = (
+        "name",
+        "steps",
+        "batch_size",
+        "seq_len",
+        "ep_size",
+        "dp_size",
+        "dtype",
+        "n_layers",
+        "n_heads",
+        "dim",
+        "vocab_size",
+        "n_routed_experts",
+        "n_activated_experts",
+        "moe_inter_dim",
+        "lr_dense",
+        "lr_expert",
+        "lr_gate",
+        "weight_decay",
+      )
+      safe_cfg = {k: getattr(cfg, k) for k in safe_keys if hasattr(cfg, k)}
+      metrics_ctx.wandb_run.config.update(safe_cfg, allow_val_change=True)
+    except Exception as e:
+      raise RuntimeError("Local W&B config upload failed (no-fallback policy).") from e
 
   zero2_state = {}
   with nvtx_ctx('train/load_checkpoint'):
     start_step, tokens_seen, zero2_state = load_checkpoint(checkpointer, model, optimizer, loader, plan, cfg, rank, print)
+
+  run_dtype = str(getattr(cfg, 'dtype', 'bf16') or 'bf16').lower()
+  runtime_rdep_mode = "ipc"
+  moe_layers = list(getattr(model, "_moe_layers", []) or [])
+  if moe_layers:
+    runtime_modes: set[str] = set()
+    for idx, moe in enumerate(moe_layers):
+      mode = str(getattr(getattr(moe, "_rdep", None), "_mode", "") or "").lower()
+      if mode not in {"single", "ipc", "hybrid"}:
+        raise RuntimeError(
+          f"Invalid RDEP mode for MoE layer {idx}: {mode!r}. "
+          "Expected one of {'single','ipc','hybrid'}."
+        )
+      runtime_modes.add(mode)
+    if len(runtime_modes) != 1:
+      raise RuntimeError(
+        f"Inconsistent RDEP runtime modes across MoE layers: {sorted(runtime_modes)}"
+      )
+    runtime_rdep_mode = next(iter(runtime_modes))
+  if run_dtype == 'nvfp4':
+    if not bool(getattr(cfg, 'eco_fused_backward', False)):
+      raise RuntimeError(
+        "dtype=nvfp4 requires eco_fused_backward=true for production training. "
+        "Non-fused NVFP4 expert execution is forbidden."
+      )
+    direct_loads = int(getattr(model, "_runtime_nvfp4_checkpoint_direct_expert_loads", 0))
+    non_direct_loads = int(getattr(model, "_runtime_nvfp4_checkpoint_non_direct_expert_loads", 0))
+    if non_direct_loads > 0:
+      raise RuntimeError(
+        "NVFP4 checkpoint fallback detected before training. "
+        f"non_direct_expert_loads={non_direct_loads}. "
+        "Production path requires direct NVFP4 expert buffer loading."
+      )
+    if int(start_step) > 0 and direct_loads <= 0:
+      raise RuntimeError(
+        "NVFP4 training requires direct expert NVFP4 checkpoint load, "
+        "but no direct expert loads were recorded."
+      )
+    if world <= 1 or runtime_rdep_mode != "hybrid":
+      raise RuntimeError(
+        "dtype=nvfp4 production path requires distributed hybrid RDEP "
+        "(world>1, mode='hybrid'). "
+        f"Got world={world}, mode={runtime_rdep_mode!r}."
+      )
+    non_primary_layers = [
+      idx for idx, moe in enumerate(moe_layers)
+      if not bool(getattr(moe, "_nvfp4_primary", False))
+    ]
+    if non_primary_layers:
+      raise RuntimeError(
+        "NVFP4 production training requires NVFP4-primary expert buffers on every MoE layer. "
+        f"Missing _nvfp4_primary on layers: {non_primary_layers[:16]}"
+      )
 
   # Eagerly allocate ZeRO-2 flat buffers and re-point dense params into them.
   # This must happen BEFORE the first forward pass: at this point only model weights
@@ -328,10 +451,22 @@ def train(cfg: Config):
     fused_eco.attach(model)
     if rank == 0:
       logger.info("FusedBackwardECO attached: %d MoE modules", len(fused_eco._moes))
-
   last_loss: torch.Tensor | None = None
   config_fingerprint = fingerprint(cfg)
   checkpoint_every = getattr(cfg, 'checkpoint_every', 100)
+  grad_norm_params = [p for p in model.parameters() if p.requires_grad]
+  dense_clip_params: list[torch.nn.Parameter] = []
+  if dense_groups:
+    seen_dense: set[int] = set()
+    for group in dense_groups:
+      for p in group.get('params', []):
+        if not isinstance(p, torch.nn.Parameter) or not p.requires_grad:
+          continue
+        pid = id(p)
+        if pid in seen_dense:
+          continue
+        seen_dense.add(pid)
+        dense_clip_params.append(p)
 
   # Gradient accumulation configuration
   accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
@@ -393,8 +528,7 @@ def train(cfg: Config):
           if rank == 0:
             print(f"[INIT] DP group all_reduce OK (dp_size={dp_size})", flush=True)
       except Exception as e:
-        if rank == 0:
-          print(f"[INIT] DP group warmup FAILED: {e}", flush=True)
+        raise RuntimeError("DP group communicator warmup failed (no-fallback policy).") from e
 
       # EP group
       try:
@@ -406,8 +540,7 @@ def train(cfg: Config):
           if rank == 0:
             print(f"[INIT] EP group all_reduce OK (ep_size={ep_size})", flush=True)
       except Exception as e:
-        if rank == 0:
-          print(f"[INIT] EP group warmup FAILED: {e}", flush=True)
+        raise RuntimeError("EP group communicator warmup failed (no-fallback policy).") from e
 
       # Barrier to ensure all ranks complete warmup
       _dist.barrier()
@@ -496,7 +629,10 @@ def train(cfg: Config):
             fused_eco.pre_backward(step_num)
           with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
             loss.backward()
-          if fused_eco is not None:
+          if fused_eco is not None and fused_eco.is_final_microstep:
+            # Drain async ECO comm/update queue only once per optimizer step.
+            # Non-final micro-steps only accumulate optimizer state (no weight update),
+            # so forcing a full drain/sync here is unnecessary overhead.
             fused_eco.post_backward()
 
           accumulated_loss_gpu += loss.detach() * (accum_steps if accum_steps > 1 else 1)
@@ -507,9 +643,9 @@ def train(cfg: Config):
         # Lightweight NaN guard: compute grad_norm once and check for NaN/Inf
         # instead of iterating all 200K+ parameters with .item() calls.
         # Uses fused foreach op (1 kernel) instead of per-param norm computation (~N kernels)
-        _grad_params = [p for p in model.parameters() if p.grad is not None]
+        _grad_params = [p for p in grad_norm_params if p.grad is not None]
         grad_norm = fused_grad_norm_(_grad_params) if _grad_params else torch.tensor(0.0, device='cuda')
-        _grad_norm_bad = (grad_norm != grad_norm) or (grad_norm == float('inf'))  # NaN or Inf
+        _grad_norm_bad = not torch.isfinite(grad_norm).item()
         if _grad_norm_bad:
             if rank == 0:
                 print(f"[NAN-GUARD] Skipping optimizer step {step_num} due to NaN/Inf grad_norm={grad_norm}", flush=True)
@@ -527,19 +663,20 @@ def train(cfg: Config):
               with nvtx_ctx('train/grad_clip'):
                 if fused_eco is not None:
                   # Only clip dense parameters (expert grads already consumed in backward)
-                  dense_params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+                  dense_params = [p for p in dense_clip_params if p.grad is not None]
                   if dense_params:
                     fused_clip_grad_norm_(dense_params, grad_clip)
                 else:
-                  fused_clip_grad_norm_(model.parameters(), grad_clip)
+                  if _grad_params:
+                    fused_clip_grad_norm_(_grad_params, grad_clip)
 
             with nvtx_ctx('train/opt_step'), time_ctx('time_ms/opt_step'):
               step(model, optimizer, dense_groups, zero2_state, cfg, world)
 
-        accumulated_loss = accumulated_loss_gpu.item()  # single GPU→CPU sync per step
         tokens_this_step = int(inputs.numel()) * accum_steps
         tokens_seen += cfg.batch_size * cfg.seq_len
-        last_loss = torch.tensor(accumulated_loss / accum_steps if accum_steps > 1 else accumulated_loss)
+        loss_scale = float(accum_steps) if accum_steps > 1 else 1.0
+        last_loss = (accumulated_loss_gpu / loss_scale).detach()
 
         s = step_num + 1
         log_training_step(
@@ -560,6 +697,9 @@ def train(cfg: Config):
           "rdep_dispatch_blockscaled_hybrid_calls": 0.0,
           "rdep_dispatch_bf16_ipc_calls": 0.0,
           "rdep_dispatch_bf16_hybrid_calls": 0.0,
+          "nvfp4_forward_bf16_materialization_fallback_calls": 0.0,
+          "nvfp4_checkpoint_direct_expert_loads": 0.0,
+          "nvfp4_checkpoint_non_direct_expert_loads": 0.0,
           "eco_fused_update_calls": 0.0,
           "eco_cuda_fused_kernel_calls": 0.0,
         }
@@ -577,6 +717,27 @@ def train(cfg: Config):
             metrics_ctx.writer.insert_many(step=s, items=runtime_items)
           except Exception:
             logger.debug("metrics: runtime counter write failed", exc_info=True)
+        if runtime_counts["nvfp4_forward_bf16_materialization_fallback_calls"] > 0:
+          raise RuntimeError(
+            "Forbidden NVFP4 forward BF16 materialization fallback was triggered. "
+            "Aborting run to preserve precision-invariant execution."
+          )
+        if runtime_counts["nvfp4_checkpoint_non_direct_expert_loads"] > 0:
+          raise RuntimeError(
+            "Forbidden NVFP4 non-direct expert checkpoint load path was triggered. "
+            "Aborting run to preserve precision-invariant execution."
+          )
+        if run_dtype in {"fp8", "nvfp4"} and world > 1 and runtime_rdep_mode == "hybrid":
+          bf16_dispatch_calls = (
+            runtime_counts["rdep_dispatch_bf16_ipc_calls"]
+            + runtime_counts["rdep_dispatch_bf16_hybrid_calls"]
+          )
+          if bf16_dispatch_calls > 0:
+            raise RuntimeError(
+              "Forbidden BF16 distributed dispatch path was triggered during blockscaled training. "
+              f"bf16_dispatch_calls={bf16_dispatch_calls} "
+              "(ipc + hybrid). Rebuild/verify RDEP blockscaled kernels."
+            )
 
         # Log expert load imbalance
         if s % cfg.log_every == 0 and rank == 0:
@@ -671,8 +832,17 @@ def main():
     print("Usage: python -m nmoe.train <config.toml> [--key=value ...]", file=sys.stderr)
     sys.exit(1)
 
-  # Load base config (auto-detect TOML or YAML)
-  cfg_dict = load_config_file(sys.argv[1])
+  config_path = sys.argv[1]
+  if not config_path.lower().endswith(".toml"):
+    print(
+      f"Unsupported config format for production training: {config_path}. "
+      "Only .toml is supported.",
+      file=sys.stderr,
+    )
+    sys.exit(1)
+
+  # Load base config from TOML.
+  cfg_dict = load_config_file(config_path)
 
   # Apply environment variable overrides (NMOE_DTYPE, NMOE_STEPS, etc.)
   for key in ['dtype', 'steps', 'batch_size', 'seq_len', 'resume']:

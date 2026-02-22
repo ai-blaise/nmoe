@@ -15,6 +15,7 @@
 
 #include "ptx.cu"
 #include "swizzle.cuh"
+#include <cstdio>
 #include <vector>
 
 namespace nmoe {
@@ -40,6 +41,53 @@ constexpr int SF_VEC_FP4 = 32;      // Scale factor granularity for NVFP4 (32 BF
 
 __host__ __device__ __forceinline__ int ceil_div(int a, int b) {
     return (a + b - 1) / b;
+}
+
+__host__ __device__ __forceinline__ bool nmoe_is_pow2(int x) {
+    return x > 0 && ((x & (x - 1)) == 0);
+}
+
+__host__ __device__ __forceinline__ int nmoe_pow2_shift(int x) {
+#ifdef __CUDA_ARCH__
+    return __ffs(x) - 1;
+#else
+    return __builtin_ctz(static_cast<unsigned int>(x));
+#endif
+}
+
+// offs is cumulative expert boundaries [E+1] with offs[0]=0 and offs[E]=M_pad.
+// Return e in [0, E-1] such that offs[e] <= m < offs[e+1].
+__device__ __forceinline__ int find_expert_for_row(
+    const int32_t* __restrict__ offs,
+    int E,
+    int m)
+{
+    int lo = 0;
+    int hi = E - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= m) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+__device__ __forceinline__ int find_expert_for_row_hint(
+    const int32_t* __restrict__ offs,
+    int E,
+    int m,
+    int M_e_stride)
+{
+    if (E <= 0) return 0;
+    if (M_e_stride > 0) {
+        int e = m / M_e_stride;
+        e = max(0, min(e, E - 1));
+        if (offs[e] <= m && m < offs[e + 1]) return e;
+    }
+    return find_expert_for_row(offs, E, m);
 }
 
 // ============================================================================
@@ -96,15 +144,172 @@ __global__ void k_dequantize_fp8_to_bf16(
 #endif
 }
 
+// Fast path for K % 32 == 0: removes tail checks inside the hot inner loops.
+__global__ void k_dequantize_fp8_to_bf16_aligned32(
+    const uint16_t* __restrict__ q_u16, int ldq,
+    const uint8_t* __restrict__ sfa, int ld_sf,
+    __nv_bfloat16* __restrict__ out, int ldo,
+    int M, int K)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int tile_m = blockIdx.y * TILE_M;
+    const int tile_k = blockIdx.x * TILE_K;
+
+    for (int row_off = threadIdx.x; row_off < TILE_M; row_off += blockDim.x) {
+        const int m = tile_m + row_off;
+        if (m >= M) continue;
+
+        const int k_end = min(tile_k + TILE_K, K);
+        const uint16_t* q_row = q_u16 + static_cast<size_t>(m) * ldq;
+        const uint8_t* sfa_row = sfa + static_cast<size_t>(m) * ld_sf;
+        __nv_bfloat16* out_row = out + static_cast<size_t>(m) * ldo;
+
+        for (int k0 = tile_k; k0 < k_end; k0 += SF_VEC_FP8) {
+            const int sf_idx = k0 / SF_VEC_FP8;
+            const float scale = ptx::e8m0_decode_to_f32(sfa_row[sf_idx]);
+
+            #pragma unroll
+            for (int i = 0; i < SF_VEC_FP8 / 2; ++i) {
+                const int c0 = 2 * i;
+                const uint16_t packed = q_row[(k0 + c0) / 2];
+                uint8_t b0, b1;
+                ptx::unpack_u16_to_2u8(packed, b0, b1);
+                out_row[k0 + c0] = __float2bfloat16(ptx::e4m3_byte_to_f32(b0) * scale);
+                out_row[k0 + c0 + 1] = __float2bfloat16(ptx::e4m3_byte_to_f32(b1) * scale);
+            }
+        }
+    }
+#endif
+}
+
+// Same as k_dequantize_fp8_to_bf16, but SFA is provided in CUTLASS MMA-swizzled layout.
+__global__ void k_dequantize_fp8_to_bf16_mma_sf(
+    const uint16_t* __restrict__ q_u16, int ldq,
+    const uint8_t* __restrict__ sfa_mma, int ld_sf,
+    __nv_bfloat16* __restrict__ out, int ldo,
+    int M, int K)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int tile_m = blockIdx.y * TILE_M;
+    const int tile_k = blockIdx.x * TILE_K;
+
+    for (int row_off = threadIdx.x; row_off < TILE_M; row_off += blockDim.x) {
+        const int m = tile_m + row_off;
+        if (m >= M) continue;
+
+        const int k_end = min(tile_k + TILE_K, K);
+        const uint16_t* q_row = q_u16 + static_cast<size_t>(m) * ldq;
+        __nv_bfloat16* out_row = out + static_cast<size_t>(m) * ldo;
+
+        for (int k0 = tile_k; k0 < k_end; k0 += SF_VEC_FP8) {
+            const int span = min(SF_VEC_FP8, k_end - k0);
+            const int sf_idx = k0 / SF_VEC_FP8;
+            const size_t sf_off = cutlass_sf_swizzle_offset(
+                static_cast<size_t>(m),
+                static_cast<size_t>(sf_idx),
+                static_cast<uint32_t>(M),
+                static_cast<uint32_t>(ld_sf));
+            const uint8_t sf_byte = sfa_mma[sf_off];
+            const float scale = ptx::e8m0_decode_to_f32(sf_byte);
+
+            #pragma unroll
+            for (int i = 0; i < SF_VEC_FP8 / 2; ++i) {
+                const int c0 = 2 * i;
+                const int c1 = c0 + 1;
+                if (c0 >= span) break;
+
+                const uint16_t packed = q_row[(k0 + c0) / 2];
+                uint8_t b0, b1;
+                ptx::unpack_u16_to_2u8(packed, b0, b1);
+
+                const float x0 = ptx::e4m3_byte_to_f32(b0) * scale;
+                out_row[k0 + c0] = __float2bfloat16(x0);
+                if (c1 < span) {
+                    const float x1 = ptx::e4m3_byte_to_f32(b1) * scale;
+                    out_row[k0 + c1] = __float2bfloat16(x1);
+                }
+            }
+        }
+    }
+#endif
+}
+
+// Fast path for K % 32 == 0: removes tail checks inside the hot inner loops.
+__global__ void k_dequantize_fp8_to_bf16_mma_sf_aligned32(
+    const uint16_t* __restrict__ q_u16, int ldq,
+    const uint8_t* __restrict__ sfa_mma, int ld_sf,
+    __nv_bfloat16* __restrict__ out, int ldo,
+    int M, int K)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int tile_m = blockIdx.y * TILE_M;
+    const int tile_k = blockIdx.x * TILE_K;
+
+    for (int row_off = threadIdx.x; row_off < TILE_M; row_off += blockDim.x) {
+        const int m = tile_m + row_off;
+        if (m >= M) continue;
+
+        const int k_end = min(tile_k + TILE_K, K);
+        const uint16_t* q_row = q_u16 + static_cast<size_t>(m) * ldq;
+        __nv_bfloat16* out_row = out + static_cast<size_t>(m) * ldo;
+
+        for (int k0 = tile_k; k0 < k_end; k0 += SF_VEC_FP8) {
+            const int sf_idx = k0 / SF_VEC_FP8;
+            const size_t sf_off = cutlass_sf_swizzle_offset(
+                static_cast<size_t>(m),
+                static_cast<size_t>(sf_idx),
+                static_cast<uint32_t>(M),
+                static_cast<uint32_t>(ld_sf));
+            const float scale = ptx::e8m0_decode_to_f32(sfa_mma[sf_off]);
+
+            #pragma unroll
+            for (int i = 0; i < SF_VEC_FP8 / 2; ++i) {
+                const int c0 = 2 * i;
+                const uint16_t packed = q_row[(k0 + c0) / 2];
+                uint8_t b0, b1;
+                ptx::unpack_u16_to_2u8(packed, b0, b1);
+                out_row[k0 + c0] = __float2bfloat16(ptx::e4m3_byte_to_f32(b0) * scale);
+                out_row[k0 + c0 + 1] = __float2bfloat16(ptx::e4m3_byte_to_f32(b1) * scale);
+            }
+        }
+    }
+#endif
+}
+
 inline cudaError_t launch_dequantize_fp8_to_bf16(
     const uint16_t* q_u16, int ldq,
     const uint8_t* sfa, int ld_sf,
     __nv_bfloat16* out, int ldo,
     int M, int K, cudaStream_t stream = 0)
 {
+    if (M <= 0 || K <= 0) return cudaSuccess;
     dim3 grid(ceil_div(K, TILE_K), ceil_div(M, TILE_M));
     dim3 block(THREADS);
-    k_dequantize_fp8_to_bf16<<<grid, block, 0, stream>>>(q_u16, ldq, sfa, ld_sf, out, ldo, M, K);
+    if ((K & (SF_VEC_FP8 - 1)) == 0) {
+        k_dequantize_fp8_to_bf16_aligned32<<<grid, block, 0, stream>>>(
+            q_u16, ldq, sfa, ld_sf, out, ldo, M, K);
+    } else {
+        k_dequantize_fp8_to_bf16<<<grid, block, 0, stream>>>(q_u16, ldq, sfa, ld_sf, out, ldo, M, K);
+    }
+    return cudaGetLastError();
+}
+
+inline cudaError_t launch_dequantize_fp8_to_bf16_mma_sf(
+    const uint16_t* q_u16, int ldq,
+    const uint8_t* sfa_mma, int ld_sf,
+    __nv_bfloat16* out, int ldo,
+    int M, int K, cudaStream_t stream = 0)
+{
+    if (M <= 0 || K <= 0) return cudaSuccess;
+    dim3 grid(ceil_div(K, TILE_K), ceil_div(M, TILE_M));
+    dim3 block(THREADS);
+    if ((K & (SF_VEC_FP8 - 1)) == 0) {
+        k_dequantize_fp8_to_bf16_mma_sf_aligned32<<<grid, block, 0, stream>>>(
+            q_u16, ldq, sfa_mma, ld_sf, out, ldo, M, K);
+    } else {
+        k_dequantize_fp8_to_bf16_mma_sf<<<grid, block, 0, stream>>>(
+            q_u16, ldq, sfa_mma, ld_sf, out, ldo, M, K);
+    }
     return cudaGetLastError();
 }
 
@@ -296,8 +501,7 @@ __global__ void k_quantize_pack_tilewise_fp8_sf_strided_mma(
     int M_e = 0;
     size_t expert_base = 0;
     if (lane == 0) {
-        int e = 0;
-        while ((e + 1) < E && offs[e + 1] <= m) ++e;
+        const int e = find_expert_for_row_hint(offs, E, m, M_e_stride);
         const int start_e = static_cast<int>(offs[e]);
         const int end_e = static_cast<int>(offs[e + 1]);
         M_e = end_e - start_e;
@@ -305,17 +509,14 @@ __global__ void k_quantize_pack_tilewise_fp8_sf_strided_mma(
         expert_base = static_cast<size_t>(e) * static_cast<size_t>(M_e_stride) * static_cast<size_t>(sf_k);
     }
 
-    const int k_end = min(tile_k + TILE_K, K);
-    const int k_span = k_end - tile_k;
-
     const __nv_bfloat16* x_row = x + static_cast<size_t>(m) * ldx + tile_k;
     uint16_t* out_row = out_u16 + static_cast<size_t>(m) * ldp + tile_k / 2;
 
     const unsigned mask = 0xffffffffu;
-    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP8) {
+    #pragma unroll
+    for (int k0 = 0; k0 < TILE_K; k0 += SF_VEC_FP8) {
         const int j = k0 + lane;
-        float v = 0.0f;
-        if (j < k_span) v = __bfloat162float(x_row[j]);
+        const float v = __bfloat162float(x_row[j]);
 
         float amax = fabsf(v);
         #pragma unroll
@@ -323,7 +524,7 @@ __global__ void k_quantize_pack_tilewise_fp8_sf_strided_mma(
             amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
         }
 
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP8_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
@@ -333,17 +534,15 @@ __global__ void k_quantize_pack_tilewise_fp8_sf_strided_mma(
                 static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
                 static_cast<uint32_t>(M_e), static_cast<uint32_t>(sf_k));
             sf_mma[expert_base + dst_offset] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t scale_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
 
         const uint8_t b0 = ptx::f32_to_e4m3_byte(v * inv_scale);
         int b1_i = static_cast<int>(b0);
         b1_i = __shfl_down_sync(mask, b1_i, 1);
-        if (((lane & 1) == 0) && (j < k_span)) {
-            const uint8_t b1 = (j + 1 < k_span) ? static_cast<uint8_t>(b1_i) : 0;
+        if ((lane & 1) == 0) {
+            const uint8_t b1 = static_cast<uint8_t>(b1_i);
             out_row[(k0 + lane) / 2] = ptx::pack2_u8_to_u16(b0, b1);
         }
     }
@@ -378,8 +577,7 @@ __global__ void k_quantize_pack_tilewise_nvfp4_sf_strided_mma(
     int M_e = 0;
     size_t expert_base = 0;
     if (lane == 0) {
-        int e = 0;
-        while ((e + 1) < E && offs[e + 1] <= m) ++e;
+        const int e = find_expert_for_row_hint(offs, E, m, M_e_stride);
         const int start_e = static_cast<int>(offs[e]);
         const int end_e = static_cast<int>(offs[e + 1]);
         M_e = end_e - start_e;
@@ -387,17 +585,14 @@ __global__ void k_quantize_pack_tilewise_nvfp4_sf_strided_mma(
         expert_base = static_cast<size_t>(e) * static_cast<size_t>(M_e_stride) * static_cast<size_t>(sf_k);
     }
 
-    const int k_end = min(tile_k + TILE_K, K);
-    const int k_span = k_end - tile_k;
-
     const __nv_bfloat16* x_row = x + static_cast<size_t>(m) * ldx + tile_k;
     uint16_t* out_row = out_u16 + static_cast<size_t>(m) * ldp + tile_k / 4;
 
     const unsigned mask = 0xffffffffu;
-    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP4) {
+    #pragma unroll
+    for (int k0 = 0; k0 < TILE_K; k0 += SF_VEC_FP4) {
         const int j = k0 + lane;
-        float v = 0.0f;
-        if (j < k_span) v = __bfloat162float(x_row[j]);
+        const float v = __bfloat162float(x_row[j]);
 
         float amax = fabsf(v);
         #pragma unroll
@@ -405,7 +600,7 @@ __global__ void k_quantize_pack_tilewise_nvfp4_sf_strided_mma(
             amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
         }
 
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP4_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
@@ -415,11 +610,9 @@ __global__ void k_quantize_pack_tilewise_nvfp4_sf_strided_mma(
                 static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
                 static_cast<uint32_t>(M_e), static_cast<uint32_t>(sf_k));
             sf_mma[expert_base + dst_offset] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t scale_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
         const float af = v * inv_scale;
 
         const int g = lane & ~3;
@@ -427,7 +620,7 @@ __global__ void k_quantize_pack_tilewise_nvfp4_sf_strided_mma(
         const float v1 = __shfl_sync(mask, af, g + 1);
         const float v2 = __shfl_sync(mask, af, g + 2);
         const float v3 = __shfl_sync(mask, af, g + 3);
-        if ((lane == g) && (g < k_span)) {
+        if (lane == g) {
             out_row[(k0 >> 2) + (g >> 2)] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
         }
     }
@@ -472,11 +665,13 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma(
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 #if NMOE_ENABLE_PTX_E2M1
-    // Linearized grid: tile_k varies fastest
     int tile_k_block = static_cast<int>(blockIdx.x);
-    const int grid_k = ceil_div(K_in, TILE_K);
-    const int m_block = tile_k_block / grid_k;
-    tile_k_block -= m_block * grid_k;
+    int m_block = static_cast<int>(blockIdx.y);
+    if (gridDim.y == 1) {
+        const int grid_k = ceil_div(K_in, TILE_K);
+        m_block = tile_k_block / grid_k;
+        tile_k_block -= m_block * grid_k;
+    }
     const int tile_k = tile_k_block * TILE_K;
 
     const int warp_id = threadIdx.x >> 5;
@@ -492,9 +687,15 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma(
     // Expert-local SF base
     const size_t expert_sf_base = static_cast<size_t>(e) * static_cast<size_t>(M_stride) * static_cast<size_t>(sf_k);
 
-    // Global scale for this expert
-    const float global_scale = ct_gs[e];
-    const float inv_gs = (global_scale > 0.0f) ? (1.0f / global_scale) : 0.0f;
+    const unsigned mask = 0xffffffffu;
+
+    // Global scale for this expert.
+    float inv_gs = 0.0f;
+    if (lane == 0) {
+        const float global_scale = ct_gs[e];
+        inv_gs = (global_scale > 0.0f) ? __frcp_rn(global_scale) : 0.0f;
+    }
+    inv_gs = __shfl_sync(mask, inv_gs, 0);
 
     // Row pointers into CT packed data and scales
     const size_t ct_row_packed = (static_cast<size_t>(e) * M_ct + m_local) * (K_in / 2);
@@ -503,29 +704,40 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma(
     // Output row pointer
     uint16_t* out_row = out_u16 + static_cast<size_t>(m) * (K_in / 4) + tile_k / 4;
 
-    const int k_end = min(tile_k + TILE_K, K_in);
-    const int k_span = k_end - tile_k;
+    const bool gs_pow2 = nmoe_is_pow2(group_size);
+    const int gs_shift = gs_pow2 ? nmoe_pow2_shift(group_size) : 0;
 
-    const unsigned mask = 0xffffffffu;
-    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP4) {
+    #pragma unroll
+    for (int k0 = 0; k0 < TILE_K; k0 += SF_VEC_FP4) {
         const int k_abs = tile_k + k0 + lane;  // Absolute element index
-        float v = 0.0f;
-
-        if (lane < k_span - k0) {
-            // Unpack E2M1 nibble from CT format
-            const int byte_idx = k_abs / 2;
-            const uint8_t packed_byte = ct_packed[ct_row_packed + byte_idx];
-            const uint8_t nibble = (k_abs & 1) ? (packed_byte >> 4) : (packed_byte & 0x0F);
-
-            // Dequant nibble to float: sign * LUT[magnitude]
-            v = ptx::e2m1_nibble_to_f32(nibble);
-
-            // Apply per-group scale: effective_scale = E4M3_scale / global_scale
-            const int group_idx = k_abs / group_size;
-            const uint8_t scale_byte = ct_scale[ct_row_scale + group_idx];
-            const float group_scale_f32 = ptx::e4m3_byte_to_f32(scale_byte);
-            v *= group_scale_f32 * inv_gs;
+        // Unpack E2M1 nibble from CT format.
+        const int byte_idx = k_abs >> 1;
+        uint8_t packed_byte = 0;
+        if ((lane & 1) == 0) {
+            packed_byte = ct_packed[ct_row_packed + byte_idx];
         }
+        packed_byte = static_cast<uint8_t>(__shfl_sync(mask, static_cast<int>(packed_byte), lane & ~1));
+        const uint8_t nibble = (k_abs & 1) ? (packed_byte >> 4) : (packed_byte & 0x0F);
+        float v = ptx::e2m1_nibble_to_f32(nibble);
+
+        // Apply per-group scale: effective_scale = E4M3_scale / global_scale.
+        const int group_idx = gs_pow2 ? (k_abs >> gs_shift) : (k_abs / group_size);
+        float group_scale_f32 = 0.0f;
+        if (gs_pow2 && group_size <= 32) {
+            const int leader = lane & ~(group_size - 1);
+            if (lane == leader) {
+                group_scale_f32 = ptx::e4m3_byte_to_f32(ct_scale[ct_row_scale + group_idx]);
+            }
+            group_scale_f32 = __shfl_sync(mask, group_scale_f32, leader);
+        } else {
+            const unsigned group_mask = __match_any_sync(mask, group_idx);
+            const int leader = __ffs(static_cast<int>(group_mask)) - 1;
+            if (lane == leader) {
+                group_scale_f32 = ptx::e4m3_byte_to_f32(ct_scale[ct_row_scale + group_idx]);
+            }
+            group_scale_f32 = __shfl_sync(mask, group_scale_f32, leader);
+        }
+        v *= group_scale_f32 * inv_gs;
 
         // Warp-reduce amax over 32 elements
         float amax = fabsf(v);
@@ -535,7 +747,7 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma(
         }
 
         // Lane 0 computes E8M0 scale and writes MMA-swizzled
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP4_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
@@ -545,11 +757,9 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma(
                 static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
                 static_cast<uint32_t>(M_stride), static_cast<uint32_t>(sf_k));
             sf_mma[expert_sf_base + dst_offset] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t e8m0_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(e8m0_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
         const float af = v * inv_scale;
 
         // Pack 4 E2M1 values per uint16 using PTX
@@ -558,7 +768,7 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma(
         const float v1 = __shfl_sync(mask, af, g + 1);
         const float v2 = __shfl_sync(mask, af, g + 2);
         const float v3 = __shfl_sync(mask, af, g + 3);
-        if ((lane == g) && (g < k_span - k0)) {
+        if (lane == g) {
             out_row[(k0 >> 2) + (g >> 2)] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
         }
     }
@@ -590,9 +800,12 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma_interleaved(
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
 #if NMOE_ENABLE_PTX_E2M1
     int tile_k_block = static_cast<int>(blockIdx.x);
-    const int grid_k = ceil_div(K_in, TILE_K);
-    const int m_block = tile_k_block / grid_k;
-    tile_k_block -= m_block * grid_k;
+    int m_block = static_cast<int>(blockIdx.y);
+    if (gridDim.y == 1) {
+        const int grid_k = ceil_div(K_in, TILE_K);
+        m_block = tile_k_block / grid_k;
+        tile_k_block -= m_block * grid_k;
+    }
     const int tile_k = tile_k_block * TILE_K;
 
     const int warp_id = threadIdx.x >> 5;
@@ -613,8 +826,14 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma_interleaved(
     // Select source pointers
     const uint8_t* ct_packed = is_b ? ct_packed_b : ct_packed_a;
     const uint8_t* ct_scale  = is_b ? ct_scale_b  : ct_scale_a;
-    const float    global_scale = is_b ? ct_gs_b[e] : ct_gs_a[e];
-    const float    inv_gs = (global_scale > 0.0f) ? (1.0f / global_scale) : 0.0f;
+    const unsigned mask = 0xffffffffu;
+
+    float inv_gs = 0.0f;
+    if (lane == 0) {
+        const float global_scale = is_b ? ct_gs_b[e] : ct_gs_a[e];
+        inv_gs = (global_scale > 0.0f) ? __frcp_rn(global_scale) : 0.0f;
+    }
+    inv_gs = __shfl_sync(mask, inv_gs, 0);
 
     // Expert-local SF base
     const size_t expert_sf_base = static_cast<size_t>(e) * static_cast<size_t>(M_stride) * static_cast<size_t>(sf_k);
@@ -626,26 +845,38 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma_interleaved(
     // Output row pointer
     uint16_t* out_row = out_u16 + static_cast<size_t>(m) * (K_in / 4) + tile_k / 4;
 
-    const int k_end = min(tile_k + TILE_K, K_in);
-    const int k_span = k_end - tile_k;
+    const bool gs_pow2 = nmoe_is_pow2(group_size);
+    const int gs_shift = gs_pow2 ? nmoe_pow2_shift(group_size) : 0;
 
-    const unsigned mask = 0xffffffffu;
-    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP4) {
+    #pragma unroll
+    for (int k0 = 0; k0 < TILE_K; k0 += SF_VEC_FP4) {
         const int k_abs = tile_k + k0 + lane;
-        float v = 0.0f;
-
-        if (lane < k_span - k0) {
-            const int byte_idx = k_abs / 2;
-            const uint8_t packed_byte = ct_packed[ct_row_packed + byte_idx];
-            const uint8_t nibble = (k_abs & 1) ? (packed_byte >> 4) : (packed_byte & 0x0F);
-
-            v = ptx::e2m1_nibble_to_f32(nibble);
-
-            const int group_idx = k_abs / group_size;
-            const uint8_t scale_byte = ct_scale[ct_row_scale + group_idx];
-            const float group_scale_f32 = ptx::e4m3_byte_to_f32(scale_byte);
-            v *= group_scale_f32 * inv_gs;
+        const int byte_idx = k_abs >> 1;
+        uint8_t packed_byte = 0;
+        if ((lane & 1) == 0) {
+            packed_byte = ct_packed[ct_row_packed + byte_idx];
         }
+        packed_byte = static_cast<uint8_t>(__shfl_sync(mask, static_cast<int>(packed_byte), lane & ~1));
+        const uint8_t nibble = (k_abs & 1) ? (packed_byte >> 4) : (packed_byte & 0x0F);
+        float v = ptx::e2m1_nibble_to_f32(nibble);
+
+        const int group_idx = gs_pow2 ? (k_abs >> gs_shift) : (k_abs / group_size);
+        float group_scale_f32 = 0.0f;
+        if (gs_pow2 && group_size <= 32) {
+            const int leader = lane & ~(group_size - 1);
+            if (lane == leader) {
+                group_scale_f32 = ptx::e4m3_byte_to_f32(ct_scale[ct_row_scale + group_idx]);
+            }
+            group_scale_f32 = __shfl_sync(mask, group_scale_f32, leader);
+        } else {
+            const unsigned group_mask = __match_any_sync(mask, group_idx);
+            const int leader = __ffs(static_cast<int>(group_mask)) - 1;
+            if (lane == leader) {
+                group_scale_f32 = ptx::e4m3_byte_to_f32(ct_scale[ct_row_scale + group_idx]);
+            }
+            group_scale_f32 = __shfl_sync(mask, group_scale_f32, leader);
+        }
+        v *= group_scale_f32 * inv_gs;
 
         float amax = fabsf(v);
         #pragma unroll
@@ -653,7 +884,7 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma_interleaved(
             amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
         }
 
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP4_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
@@ -663,11 +894,9 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma_interleaved(
                 static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
                 static_cast<uint32_t>(M_stride), static_cast<uint32_t>(sf_k));
             sf_mma[expert_sf_base + dst_offset] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t e8m0_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(e8m0_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
         const float af = v * inv_scale;
 
         const int g = lane & ~3;
@@ -675,7 +904,7 @@ __global__ void k_ct_nvfp4_to_blockscaled_mma_interleaved(
         const float v1 = __shfl_sync(mask, af, g + 1);
         const float v2 = __shfl_sync(mask, af, g + 2);
         const float v3 = __shfl_sync(mask, af, g + 3);
-        if ((lane == g) && (g < k_span - k0)) {
+        if (lane == g) {
             out_row[(k0 >> 2) + (g >> 2)] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
         }
     }
@@ -697,13 +926,22 @@ inline cudaError_t launch_ct_nvfp4_to_blockscaled_mma(
     cudaStream_t stream = 0)
 {
 #if NMOE_ENABLE_PTX_E2M1
+    if ((K_in & (TILE_K - 1)) != 0) return cudaErrorInvalidValue;
     const int M_total = E * M_ct;
-    const int grid_k = ceil_div(K_in, TILE_K);
+    const int grid_k = K_in / TILE_K;
     const int grid_m = ceil_div(M_total, QUANT_WARPS);
-    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
-    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
-    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    if (grid_k <= 0 || grid_m <= 0) return cudaErrorInvalidConfiguration;
     dim3 block(QUANT_THREADS);
+    if (grid_k <= 65535 && grid_m <= 65535) {
+        dim3 grid(static_cast<uint32_t>(grid_k), static_cast<uint32_t>(grid_m), 1);
+        k_ct_nvfp4_to_blockscaled_mma<<<grid, block, 0, stream>>>(
+            ct_packed, ct_scale, ct_gs, out_u16, sf_mma,
+            E, M_ct, K_in, M_stride, group_size, sf_k);
+        return cudaGetLastError();
+    }
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
     k_ct_nvfp4_to_blockscaled_mma<<<grid, block, 0, stream>>>(
         ct_packed, ct_scale, ct_gs, out_u16, sf_mma,
         E, M_ct, K_in, M_stride, group_size, sf_k);
@@ -723,13 +961,24 @@ inline cudaError_t launch_ct_nvfp4_to_blockscaled_mma_interleaved(
     cudaStream_t stream = 0)
 {
 #if NMOE_ENABLE_PTX_E2M1
+    if ((K_in & (TILE_K - 1)) != 0) return cudaErrorInvalidValue;
     const int M_total = E * 2 * M_ct;
-    const int grid_k = ceil_div(K_in, TILE_K);
+    const int grid_k = K_in / TILE_K;
     const int grid_m = ceil_div(M_total, QUANT_WARPS);
-    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
-    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
-    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    if (grid_k <= 0 || grid_m <= 0) return cudaErrorInvalidConfiguration;
     dim3 block(QUANT_THREADS);
+    if (grid_k <= 65535 && grid_m <= 65535) {
+        dim3 grid(static_cast<uint32_t>(grid_k), static_cast<uint32_t>(grid_m), 1);
+        k_ct_nvfp4_to_blockscaled_mma_interleaved<<<grid, block, 0, stream>>>(
+            ct_packed_a, ct_scale_a, ct_gs_a,
+            ct_packed_b, ct_scale_b, ct_gs_b,
+            out_u16, sf_mma,
+            E, M_ct, K_in, M_stride, group_size, sf_k);
+        return cudaGetLastError();
+    }
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
     k_ct_nvfp4_to_blockscaled_mma_interleaved<<<grid, block, 0, stream>>>(
         ct_packed_a, ct_scale_a, ct_gs_a,
         ct_packed_b, ct_scale_b, ct_gs_b,
@@ -755,81 +1004,105 @@ inline cudaError_t launch_ct_nvfp4_to_blockscaled_mma_interleaved(
 //   element[2k] in lo nibble, element[2k+1] in hi nibble
 //   E2M1 nibble: sign bit 3, magnitude bits 0-2
 //
-// Supports optional transpose: when transpose=true, output[k][m] = dequant(input[m][k])
-//   Used for expert W1/W3/W2 where HF stores [E, out_features, in_features]
-//   but nmoe model expects [E, in_features, out_features].
+// Supports optional transpose modes:
+//   transpose=0 -> output[m, k]
+//   transpose=1 -> output[k, m] (legacy transposed layout)
+//   transpose=2 -> output[e, k, m_local] where M = E * expert_rows
+//                  (expert-major transposed layout; avoids post-kernel permute+copy)
+// Used for expert W1/W3/W2 where HF stores [E, out_features, in_features]
+// but nmoe model expects [E, in_features, out_features].
 //
-// Grid: linear, each thread handles one BF16 output element.
+// Grid: linear, each thread handles one packed byte (2 BF16 output elements).
 
 __global__ void k_ct_nvfp4_to_bf16(
     const uint8_t* __restrict__ ct_packed,   // [M, K/2] compressed_tensors packed
     const uint8_t* __restrict__ ct_scale,    // [M, n_groups] E4M3 per-group scales
     const float*   __restrict__ ct_gs,       // [1] or [E] global scale
-    __nv_bfloat16* __restrict__ out,         // [M, K] BF16 output (or [K, M] if transpose)
+    __nv_bfloat16* __restrict__ out,         // [M, K], [K, M], or [E, K, expert_rows]
     int M, int K,                            // Input dimensions (rows × cols unpacked)
     int group_size,                          // CT group size (typically 16)
     int gs_stride,                           // 0 = single global_scale, 1 = per-expert
     int expert_rows,                         // Rows per expert (0 = no expert dimension)
-    int transpose)                           // 1 = write transposed [K, M]
+    int transpose)                           // 0=normal, 1=legacy transposed, 2=expert-major transposed
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = M * K;
-    if (idx >= total) return;
-
-    const int m = idx / K;
-    const int k = idx % K;
-
-    // Read the packed byte containing this element's nibble
-    const int byte_idx = m * (K / 2) + k / 2;
-    const uint8_t byte_val = ct_packed[byte_idx];
-
-    // Extract nibble: even k → lo nibble, odd k → hi nibble
-    const uint8_t nibble = (k & 1) ? ((byte_val >> 4) & 0x0F) : (byte_val & 0x0F);
-
-    // E2M1 dequant: sign in bit 3, magnitude LUT in bits 0-2
-    const int sign_bit = (nibble >> 3) & 1;
-    const int mag_idx = nibble & 0x07;
-
-    // E2M1 magnitude LUT: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
-    // Encoded as float constants — compiler will keep in registers
-    float val;
-    switch (mag_idx) {
-        case 0: val = 0.0f; break;
-        case 1: val = 0.5f; break;
-        case 2: val = 1.0f; break;
-        case 3: val = 1.5f; break;
-        case 4: val = 2.0f; break;
-        case 5: val = 3.0f; break;
-        case 6: val = 4.0f; break;
-        default: val = 6.0f; break;
+    const int K_half = K >> 1;
+    int m = 0;
+    int k0 = 0;
+    int idx = 0;
+    if (gridDim.y > 1) {
+        const int kb = blockIdx.x * blockDim.x + threadIdx.x;
+        m = blockIdx.y * blockDim.y + threadIdx.y;
+        if (m >= M || kb >= K_half) return;
+        idx = m * K_half + kb;
+        k0 = kb << 1;
+    } else {
+        idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total_bytes = M * K_half;
+        if (idx >= total_bytes) return;
+        m = idx / K_half;
+        k0 = (idx - m * K_half) << 1;
     }
-    if (sign_bit) val = -val;
+    const bool gs_pow2 = nmoe_is_pow2(group_size);
+    const int gs_shift = gs_pow2 ? nmoe_pow2_shift(group_size) : 0;
+    const bool er_pow2 = nmoe_is_pow2(expert_rows);
+    const int er_shift = er_pow2 ? nmoe_pow2_shift(expert_rows) : 0;
+    const int k1 = k0 + 1;
+
+    // Read one packed byte and decode both nibbles.
+    const uint8_t byte_val = ct_packed[idx];
+    const uint8_t nibble0 = byte_val & 0x0F;
+    const uint8_t nibble1 = (byte_val >> 4) & 0x0F;
+
+    float val0 = ptx::e2m1_nibble_to_f32(nibble0);
+    float val1 = ptx::e2m1_nibble_to_f32(nibble1);
 
     // Apply per-group E4M3 scale / global_scale
     const int n_groups = K / group_size;
-    const int group_idx = k / group_size;
-    const int scale_idx = m * n_groups + group_idx;
-    const float group_scale = ptx::e4m3_byte_to_f32(ct_scale[scale_idx]);
+    const int group_idx0 = gs_pow2 ? (k0 >> gs_shift) : (k0 / group_size);
+    const int scale_row = m * n_groups;
+    const float group_scale0 = ptx::e4m3_byte_to_f32(ct_scale[scale_row + group_idx0]);
+    float group_scale1 = group_scale0;
+    if ((group_size & 1) != 0) {
+        const int group_idx1 = gs_pow2 ? (k1 >> gs_shift) : (k1 / group_size);
+        if (group_idx1 != group_idx0) {
+            group_scale1 = ptx::e4m3_byte_to_f32(ct_scale[scale_row + group_idx1]);
+        }
+    }
+
+    const int expert_idx = (expert_rows > 0)
+        ? (er_pow2 ? (m >> er_shift) : (m / expert_rows))
+        : 0;
 
     // Global scale: single value or per-expert
     float global_scale;
     if (gs_stride == 0) {
         global_scale = ct_gs[0];
     } else {
-        const int expert_idx = (expert_rows > 0) ? (m / expert_rows) : 0;
         global_scale = ct_gs[expert_idx];
     }
 
-    val *= group_scale / fmaxf(global_scale, 1e-10f);
+    const float inv_gs = __frcp_rn(fmaxf(global_scale, 1e-10f));
+    val0 *= group_scale0 * inv_gs;
+    val1 *= group_scale1 * inv_gs;
 
-    // Write output
-    if (transpose) {
-        // Transposed write: out[k, m] = val
-        out[k * M + m] = __float2bfloat16(val);
+    // Write outputs.
+    if (transpose == 1) {
+        // Transposed write: out[k, m].
+        out[k0 * M + m] = __float2bfloat16(val0);
+        out[k1 * M + m] = __float2bfloat16(val1);
+    } else if (transpose == 2) {
+        // Expert-major transposed write: out[e, k, m_local].
+        const int m_local = m - expert_idx * expert_rows;
+        const size_t out_base =
+            static_cast<size_t>(expert_idx) * static_cast<size_t>(K) * static_cast<size_t>(expert_rows)
+            + static_cast<size_t>(m_local);
+        out[out_base + static_cast<size_t>(k0) * static_cast<size_t>(expert_rows)] = __float2bfloat16(val0);
+        out[out_base + static_cast<size_t>(k1) * static_cast<size_t>(expert_rows)] = __float2bfloat16(val1);
     } else {
-        // Normal write: out[m, k] = val
-        out[idx] = __float2bfloat16(val);
+        // Normal write: out[m, k].
+        const size_t row_base = static_cast<size_t>(m) * static_cast<size_t>(K);
+        reinterpret_cast<__nv_bfloat162*>(out + row_base + k0)[0] = __floats2bfloat162_rn(val0, val1);
     }
 #else
     (void)ct_packed; (void)ct_scale; (void)ct_gs;
@@ -847,13 +1120,26 @@ inline cudaError_t launch_ct_nvfp4_to_bf16(
     int gs_stride, int expert_rows, int transpose,
     cudaStream_t stream = 0)
 {
-    const int total = M * K;
-    if (total <= 0) return cudaSuccess;
-    constexpr int BLOCK = 256;
-    const int grid = ceil_div(total, BLOCK);
-    k_ct_nvfp4_to_bf16<<<grid, BLOCK, 0, stream>>>(
-        ct_packed, ct_scale, ct_gs, out,
-        M, K, group_size, gs_stride, expert_rows, transpose);
+    const int K_half = K >> 1;
+    const int total_bytes = M * K_half;
+    if (total_bytes <= 0) return cudaSuccess;
+    constexpr int BX = 128;
+    constexpr int BY = 2;
+    const int grid_x_2d = ceil_div(K_half, BX);
+    const int grid_y_2d = ceil_div(M, BY);
+    if (grid_y_2d <= 65535) {
+        dim3 block(BX, BY);
+        dim3 grid(grid_x_2d, grid_y_2d);
+        k_ct_nvfp4_to_bf16<<<grid, block, 0, stream>>>(
+            ct_packed, ct_scale, ct_gs, out,
+            M, K, group_size, gs_stride, expert_rows, transpose);
+    } else {
+        constexpr int BLOCK_1D = 256;
+        const int grid = ceil_div(total_bytes, BLOCK_1D);
+        k_ct_nvfp4_to_bf16<<<grid, BLOCK_1D, 0, stream>>>(
+            ct_packed, ct_scale, ct_gs, out,
+            M, K, group_size, gs_stride, expert_rows, transpose);
+    }
     return cudaGetLastError();
 }
 
@@ -912,17 +1198,15 @@ __global__ void k_swiglu_quantize_pack_tilewise_fp8(
         }
 
         // Compute/store scale byte once per 32-wide chunk.
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP8_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
             const uint8_t scale_byte = ptx::e8m0_encode_from_pos_f32(scale);
             sfa_row[k0 / SF_VEC_FP8] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t scale_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
 
         // Quantize + pack (2 FP8 bytes per u16).
         const uint8_t b0 = ptx::f32_to_e4m3_byte(a * inv_scale);
@@ -974,17 +1258,15 @@ __global__ void k_swiglu_quantize_pack_tilewise_nvfp4(
             amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
         }
 
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP4_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
             const uint8_t scale_byte = ptx::e8m0_encode_from_pos_f32(scale);
             sfa_row[k0 / SF_VEC_FP4] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t scale_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
         const float af = a * inv_scale;
 
         // Pack 4 FP4 nibbles per u16 (8 writes per 32-wide chunk).
@@ -993,7 +1275,7 @@ __global__ void k_swiglu_quantize_pack_tilewise_nvfp4(
         const float v1 = __shfl_sync(mask, af, g + 1);
         const float v2 = __shfl_sync(mask, af, g + 2);
         const float v3 = __shfl_sync(mask, af, g + 3);
-        if ((lane == g) && (g < k_span)) {
+        if ((lane == g) && (g < (k_span - k0))) {
             out_row[(k0 >> 2) + (g >> 2)] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
         }
     }
@@ -1036,8 +1318,7 @@ __global__ void k_swiglu_quantize_pack_tilewise_fp8_sf_strided_mma(
     int M_e = 0;
     size_t expert_base = 0;
     if (lane == 0) {
-        int e = 0;
-        while ((e + 1) < E && offs[e + 1] <= m) ++e;
+        const int e = find_expert_for_row_hint(offs, E, m, M_e_stride);
         const int start_e = static_cast<int>(offs[e]);
         const int end_e = static_cast<int>(offs[e + 1]);
         M_e = end_e - start_e;
@@ -1045,21 +1326,17 @@ __global__ void k_swiglu_quantize_pack_tilewise_fp8_sf_strided_mma(
         expert_base = static_cast<size_t>(e) * static_cast<size_t>(M_e_stride) * static_cast<size_t>(sf_k);
     }
 
-    const int k_end = min(tile_k + TILE_K, K);
-    const int k_span = k_end - tile_k;
     const __nv_bfloat16* h13_row = h13 + static_cast<size_t>(m) * ld_h13;
     uint16_t* out_row = out_u16 + static_cast<size_t>(m) * ld_out + tile_k / 2;
 
     const unsigned mask = 0xffffffffu;
     const __nv_bfloat162* h13_row2 = reinterpret_cast<const __nv_bfloat162*>(h13_row) + tile_k;
-    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP8) {
+    #pragma unroll
+    for (int k0 = 0; k0 < TILE_K; k0 += SF_VEC_FP8) {
         const int j = k0 + lane;
-        float a = 0.0f;
-        if (j < k_span) {
-            const __nv_bfloat162 gu = h13_row2[j];
-            const float2 f2 = __bfloat1622float2(gu);
-            a = silu_f32(f2.x) * f2.y;
-        }
+        const __nv_bfloat162 gu = h13_row2[j];
+        const float2 f2 = __bfloat1622float2(gu);
+        const float a = silu_f32(f2.x) * f2.y;
 
         float amax = fabsf(a);
         #pragma unroll
@@ -1067,7 +1344,7 @@ __global__ void k_swiglu_quantize_pack_tilewise_fp8_sf_strided_mma(
             amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
         }
 
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP8_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
@@ -1077,17 +1354,15 @@ __global__ void k_swiglu_quantize_pack_tilewise_fp8_sf_strided_mma(
                 static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
                 static_cast<uint32_t>(M_e), static_cast<uint32_t>(sf_k));
             sf_mma[expert_base + dst_offset] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t scale_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
 
         const uint8_t b0 = ptx::f32_to_e4m3_byte(a * inv_scale);
         int b1_i = static_cast<int>(b0);
         b1_i = __shfl_down_sync(mask, b1_i, 1);
-        if (((lane & 1) == 0) && (j < k_span)) {
-            const uint8_t b1 = (j + 1 < k_span) ? static_cast<uint8_t>(b1_i) : 0;
+        if ((lane & 1) == 0) {
+            const uint8_t b1 = static_cast<uint8_t>(b1_i);
             out_row[(k0 + lane) / 2] = ptx::pack2_u8_to_u16(b0, b1);
         }
     }
@@ -1122,8 +1397,7 @@ __global__ void k_swiglu_quantize_pack_tilewise_nvfp4_sf_strided_mma(
     int M_e = 0;
     size_t expert_base = 0;
     if (lane == 0) {
-        int e = 0;
-        while ((e + 1) < E && offs[e + 1] <= m) ++e;
+        const int e = find_expert_for_row_hint(offs, E, m, M_e_stride);
         const int start_e = static_cast<int>(offs[e]);
         const int end_e = static_cast<int>(offs[e + 1]);
         M_e = end_e - start_e;
@@ -1131,21 +1405,17 @@ __global__ void k_swiglu_quantize_pack_tilewise_nvfp4_sf_strided_mma(
         expert_base = static_cast<size_t>(e) * static_cast<size_t>(M_e_stride) * static_cast<size_t>(sf_k);
     }
 
-    const int k_end = min(tile_k + TILE_K, K);
-    const int k_span = k_end - tile_k;
     const __nv_bfloat16* h13_row = h13 + static_cast<size_t>(m) * ld_h13;
     uint16_t* out_row = out_u16 + static_cast<size_t>(m) * ld_out + tile_k / 4;
 
     const unsigned mask = 0xffffffffu;
     const __nv_bfloat162* h13_row2 = reinterpret_cast<const __nv_bfloat162*>(h13_row) + tile_k;
-    for (int k0 = 0; k0 < k_span; k0 += SF_VEC_FP4) {
+    #pragma unroll
+    for (int k0 = 0; k0 < TILE_K; k0 += SF_VEC_FP4) {
         const int j = k0 + lane;
-        float a = 0.0f;
-        if (j < k_span) {
-            const __nv_bfloat162 gu = h13_row2[j];
-            const float2 f2 = __bfloat1622float2(gu);
-            a = silu_f32(f2.x) * f2.y;
-        }
+        const __nv_bfloat162 gu = h13_row2[j];
+        const float2 f2 = __bfloat1622float2(gu);
+        const float a = silu_f32(f2.x) * f2.y;
 
         float amax = fabsf(a);
         #pragma unroll
@@ -1153,7 +1423,7 @@ __global__ void k_swiglu_quantize_pack_tilewise_nvfp4_sf_strided_mma(
             amax = fmaxf(amax, __shfl_down_sync(mask, amax, off));
         }
 
-        int scale_i = 0;
+        float inv_scale = 1.0f;
         if (lane == 0) {
             float scale = amax / FP4_MAX;
             if (!(scale > 0.0f)) scale = 1.0f;
@@ -1163,11 +1433,9 @@ __global__ void k_swiglu_quantize_pack_tilewise_nvfp4_sf_strided_mma(
                 static_cast<size_t>(m_local), static_cast<size_t>(k_sf),
                 static_cast<uint32_t>(M_e), static_cast<uint32_t>(sf_k));
             sf_mma[expert_base + dst_offset] = scale_byte;
-            scale_i = static_cast<int>(scale_byte);
+            inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
         }
-        scale_i = __shfl_sync(mask, scale_i, 0);
-        const uint8_t scale_byte = static_cast<uint8_t>(scale_i);
-        const float inv_scale = ptx::e8m0_inv_decode_to_f32(scale_byte);
+        inv_scale = __shfl_sync(mask, inv_scale, 0);
         const float af = a * inv_scale;
 
         const int g = lane & ~3;
@@ -1175,7 +1443,7 @@ __global__ void k_swiglu_quantize_pack_tilewise_nvfp4_sf_strided_mma(
         const float v1 = __shfl_sync(mask, af, g + 1);
         const float v2 = __shfl_sync(mask, af, g + 2);
         const float v3 = __shfl_sync(mask, af, g + 3);
-        if ((lane == g) && (g < k_span)) {
+        if (lane == g) {
             out_row[(k0 >> 2) + (g >> 2)] = ptx::f32x4_to_e2m1x4_packed(v0, v1, v2, v3);
         }
     }
@@ -1259,12 +1527,20 @@ inline cudaError_t launch_quantize_fp8_sf_strided_mma(
     int M_pad, int K,
     cudaStream_t stream = 0)
 {
-    const int grid_k = ceil_div(K, TILE_K);
+    if ((K & (TILE_K - 1)) != 0) return cudaErrorInvalidValue;
+    const int grid_k = K / TILE_K;
     const int grid_m = ceil_div(M_pad, QUANT_WARPS);
-    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
-    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
-    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    if (grid_k <= 0 || grid_m <= 0) return cudaErrorInvalidConfiguration;
     dim3 block(QUANT_THREADS);
+    if (grid_k <= 65535 && grid_m <= 65535) {
+        dim3 grid(static_cast<uint32_t>(grid_k), static_cast<uint32_t>(grid_m), 1);
+        k_quantize_pack_tilewise_fp8_sf_strided_mma<<<grid, block, 0, stream>>>(
+            x, ldx, out_u16, ldp, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
+        return cudaGetLastError();
+    }
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
     k_quantize_pack_tilewise_fp8_sf_strided_mma<<<grid, block, 0, stream>>>(
         x, ldx, out_u16, ldp, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
     return cudaGetLastError();
@@ -1298,12 +1574,20 @@ inline cudaError_t launch_quantize_nvfp4_sf_strided_mma(
     cudaStream_t stream = 0)
 {
 #if NMOE_ENABLE_PTX_E2M1
-    const int grid_k = ceil_div(K, TILE_K);
+    if ((K & (TILE_K - 1)) != 0) return cudaErrorInvalidValue;
+    const int grid_k = K / TILE_K;
     const int grid_m = ceil_div(M_pad, QUANT_WARPS);
-    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
-    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
-    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    if (grid_k <= 0 || grid_m <= 0) return cudaErrorInvalidConfiguration;
     dim3 block(QUANT_THREADS);
+    if (grid_k <= 65535 && grid_m <= 65535) {
+        dim3 grid(static_cast<uint32_t>(grid_k), static_cast<uint32_t>(grid_m), 1);
+        k_quantize_pack_tilewise_nvfp4_sf_strided_mma<<<grid, block, 0, stream>>>(
+            x, ldx, out_u16, ldp, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
+        return cudaGetLastError();
+    }
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
     k_quantize_pack_tilewise_nvfp4_sf_strided_mma<<<grid, block, 0, stream>>>(
         x, ldx, out_u16, ldp, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
     return cudaGetLastError();
@@ -1356,12 +1640,20 @@ inline cudaError_t launch_swiglu_quantize_fp8_sf_strided_mma(
     int M_pad, int K,
     cudaStream_t stream = 0)
 {
-    const int grid_k = ceil_div(K, TILE_K);
+    if ((K & (TILE_K - 1)) != 0) return cudaErrorInvalidValue;
+    const int grid_k = K / TILE_K;
     const int grid_m = ceil_div(M_pad, SWIGLU_WARPS);
-    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
-    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
-    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    if (grid_k <= 0 || grid_m <= 0) return cudaErrorInvalidConfiguration;
     dim3 block(SWIGLU_THREADS);
+    if (grid_k <= 65535 && grid_m <= 65535) {
+        dim3 grid(static_cast<uint32_t>(grid_k), static_cast<uint32_t>(grid_m), 1);
+        k_swiglu_quantize_pack_tilewise_fp8_sf_strided_mma<<<grid, block, 0, stream>>>(
+            h13, ld_h13, out_u16, ld_out, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
+        return cudaGetLastError();
+    }
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
     k_swiglu_quantize_pack_tilewise_fp8_sf_strided_mma<<<grid, block, 0, stream>>>(
         h13, ld_h13, out_u16, ld_out, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
     return cudaGetLastError();
@@ -1395,12 +1687,20 @@ inline cudaError_t launch_swiglu_quantize_nvfp4_sf_strided_mma(
     cudaStream_t stream = 0)
 {
 #if NMOE_ENABLE_PTX_E2M1
-    const int grid_k = ceil_div(K, TILE_K);
+    if ((K & (TILE_K - 1)) != 0) return cudaErrorInvalidValue;
+    const int grid_k = K / TILE_K;
     const int grid_m = ceil_div(M_pad, SWIGLU_WARPS);
-    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
-    if (grid_x <= 0 || grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
-    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
+    if (grid_k <= 0 || grid_m <= 0) return cudaErrorInvalidConfiguration;
     dim3 block(SWIGLU_THREADS);
+    if (grid_k <= 65535 && grid_m <= 65535) {
+        dim3 grid(static_cast<uint32_t>(grid_k), static_cast<uint32_t>(grid_m), 1);
+        k_swiglu_quantize_pack_tilewise_nvfp4_sf_strided_mma<<<grid, block, 0, stream>>>(
+            h13, ld_h13, out_u16, ld_out, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
+        return cudaGetLastError();
+    }
+    const int64_t grid_x = static_cast<int64_t>(grid_k) * static_cast<int64_t>(grid_m);
+    if (grid_x > 0x7fffffffll) return cudaErrorInvalidConfiguration;
+    dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
     k_swiglu_quantize_pack_tilewise_nvfp4_sf_strided_mma<<<grid, block, 0, stream>>>(
         h13, ld_h13, out_u16, ld_out, sf_mma, offs, E, M_e_stride, sf_k, M_pad, K);
     return cudaGetLastError();
@@ -1779,9 +2079,15 @@ inline cudaError_t launch_swizzle_sf_strided(
     int E, int sf_k, int sf_k_pad, int M_pad, int M_e_swizzle,
     cudaStream_t stream = 0)
 {
-    // Zero output first (padding bytes)
-    // Output size is E * M_e_swizzle * sf_k_pad (each expert gets fixed-size region)
-    cudaMemsetAsync(sf_mma, 0, static_cast<size_t>(E) * M_e_swizzle * sf_k_pad, stream);
+    // Skip the large memset when swizzle writes the full output region.
+    const int64_t full_rows = static_cast<int64_t>(E) * static_cast<int64_t>(M_e_swizzle);
+    const bool writes_full = (sf_k == sf_k_pad) && (full_rows == static_cast<int64_t>(M_pad));
+    if (!writes_full) {
+        const size_t out_bytes =
+            static_cast<size_t>(E) * static_cast<size_t>(M_e_swizzle) * static_cast<size_t>(sf_k_pad);
+        cudaError_t zerr = cudaMemsetAsync(sf_mma, 0, out_bytes, stream);
+        if (zerr != cudaSuccess) return zerr;
+    }
 
     const int total = M_pad * sf_k;
     const int threads = 256;
@@ -1973,6 +2279,61 @@ inline cudaError_t launch_build_grouped_gemm_metadata(
 // C API for Python bindings
 // ============================================================================
 
+namespace {
+
+static cudaError_t require_sm100_or_newer(const char* fn_name) {
+    int device = -1;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) return err;
+
+    thread_local int cached_device = -1;
+    thread_local cudaError_t cached_result = cudaSuccess;
+    thread_local bool cached = false;
+    if (cached && device == cached_device) {
+        return cached_result;
+    }
+
+    int cc_major = 0;
+    int cc_minor = 0;
+    err = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device);
+    if (err != cudaSuccess) return err;
+    err = cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, device);
+    if (err != cudaSuccess) return err;
+
+    cached = true;
+    cached_device = device;
+    if (cc_major < 10) {
+        fprintf(stderr, "%s requires sm_100+; got sm_%d%d\n", fn_name, cc_major, cc_minor);
+        cached_result = cudaErrorNotSupported;
+        return cached_result;
+    }
+
+    cudaFuncAttributes attrs{};
+    err = cudaFuncGetAttributes(&attrs, nmoe::quant::k_quantize_pack_tilewise_nvfp4_sf_strided_mma);
+    if (err != cudaSuccess) {
+        cached_result = err;
+        return cached_result;
+    }
+    if (attrs.binaryVersion < 100) {
+        fprintf(stderr,
+                "%s requires sm_100+ compiled quant kernels; loaded binary target is sm_%d\n",
+                fn_name, attrs.binaryVersion);
+        cached_result = cudaErrorNotSupported;
+        return cached_result;
+    }
+
+    cached_result = cudaSuccess;
+    return cached_result;
+}
+
+} // namespace
+
+#define NMOE_REQUIRE_SM100(fn_name)                      \
+    do {                                                 \
+        cudaError_t arch_err__ = require_sm100_or_newer(fn_name); \
+        if (arch_err__ != cudaSuccess) return arch_err__; \
+    } while (0)
+
 extern "C" {
 
 cudaError_t quant_fp8(
@@ -1982,6 +2343,7 @@ cudaError_t quant_fp8(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("quant_fp8");
     return nmoe::quant::launch_quantize_fp8(
         reinterpret_cast<const __nv_bfloat16*>(x), ldx,
         reinterpret_cast<uint16_t*>(out), ld_out,
@@ -1996,6 +2358,7 @@ cudaError_t quant_nvfp4(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("quant_nvfp4");
     return nmoe::quant::launch_quantize_nvfp4(
         reinterpret_cast<const __nv_bfloat16*>(x), ldx,
         reinterpret_cast<uint16_t*>(out), ld_out,
@@ -2012,6 +2375,7 @@ cudaError_t quant_fp8_sf_strided_mma(
     int M_pad, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("quant_fp8_sf_strided_mma");
     if ((K & 31) != 0) return cudaErrorInvalidValue;
     if ((M_e_stride & 127) != 0) return cudaErrorInvalidValue;
     const int sf_k = K / 32;
@@ -2034,6 +2398,7 @@ cudaError_t quant_nvfp4_sf_strided_mma(
     int M_pad, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("quant_nvfp4_sf_strided_mma");
     if ((K & 31) != 0) return cudaErrorInvalidValue;
     if ((M_e_stride & 127) != 0) return cudaErrorInvalidValue;
     const int sf_k = K / 32;
@@ -2057,6 +2422,7 @@ cudaError_t swiglu_bwd_bf16(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swiglu_bwd_bf16");
     return nmoe::quant::launch_swiglu_bwd_bf16(
         reinterpret_cast<const __nv_bfloat16*>(h1), ld_h1,
         reinterpret_cast<const __nv_bfloat16*>(h3), ld_h3,
@@ -2074,6 +2440,7 @@ cudaError_t swiglu_quant_fp8(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swiglu_quant_fp8");
     return nmoe::quant::launch_swiglu_quantize_fp8(
         reinterpret_cast<const __nv_bfloat16*>(h13), ld_h13,
         reinterpret_cast<uint16_t*>(out), ld_out,
@@ -2088,6 +2455,7 @@ cudaError_t swiglu_quant_nvfp4(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swiglu_quant_nvfp4");
     return nmoe::quant::launch_swiglu_quantize_nvfp4(
         reinterpret_cast<const __nv_bfloat16*>(h13), ld_h13,
         reinterpret_cast<uint16_t*>(out), ld_out,
@@ -2104,6 +2472,7 @@ cudaError_t swiglu_quant_fp8_sf_strided_mma(
     int M_pad, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swiglu_quant_fp8_sf_strided_mma");
     if ((K & 31) != 0) return cudaErrorInvalidValue;
     if ((M_e_stride & 127) != 0) return cudaErrorInvalidValue;
     const int sf_k = K / 32;
@@ -2126,6 +2495,7 @@ cudaError_t swiglu_quant_nvfp4_sf_strided_mma(
     int M_pad, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swiglu_quant_nvfp4_sf_strided_mma");
     if ((K & 31) != 0) return cudaErrorInvalidValue;
     if ((M_e_stride & 127) != 0) return cudaErrorInvalidValue;
     const int sf_k = K / 32;
@@ -2144,6 +2514,7 @@ extern "C" cudaError_t swizzle_sf_dense_nvfp4(
     const void* sf_mkl, void* sf_mma,
     int M, int sf_k, cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swizzle_sf_dense_nvfp4");
     return nmoe::quant::launch_swizzle_sf_dense_nvfp4(
         reinterpret_cast<const uint8_t*>(sf_mkl),
         reinterpret_cast<uint8_t*>(sf_mma),
@@ -2158,6 +2529,7 @@ cudaError_t quant_fp8_with_sfa(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("quant_fp8_with_sfa");
     return nmoe::quant::launch_quantize_fp8_with_sfa(
         reinterpret_cast<const __nv_bfloat16*>(x), ldx,
         reinterpret_cast<uint16_t*>(out), ld_out,
@@ -2172,10 +2544,86 @@ cudaError_t quant_nvfp4_with_sfa(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("quant_nvfp4_with_sfa");
     return nmoe::quant::launch_quantize_nvfp4_with_sfa(
         reinterpret_cast<const __nv_bfloat16*>(x), ldx,
         reinterpret_cast<uint16_t*>(out), ld_out,
         reinterpret_cast<const uint8_t*>(sfa), ld_sf,
+        M, K, stream);
+}
+
+cudaError_t dequant_fp8_to_bf16(
+    const void* q, int ldq,
+    const void* sfa, int ld_sf,
+    void* out, int ld_out,
+    int M, int K,
+    cudaStream_t stream)
+{
+    NMOE_REQUIRE_SM100("dequant_fp8_to_bf16");
+    return nmoe::quant::launch_dequantize_fp8_to_bf16(
+        reinterpret_cast<const uint16_t*>(q), ldq,
+        reinterpret_cast<const uint8_t*>(sfa), ld_sf,
+        reinterpret_cast<__nv_bfloat16*>(out), ld_out,
+        M, K, stream);
+}
+
+cudaError_t dequant_fp8_to_bf16_mma_sf(
+    const void* q, int ldq,
+    const void* sfa, int ld_sf,
+    void* out, int ld_out,
+    int M, int K,
+    cudaStream_t stream)
+{
+    NMOE_REQUIRE_SM100("dequant_fp8_to_bf16_mma_sf");
+    return nmoe::quant::launch_dequantize_fp8_to_bf16_mma_sf(
+        reinterpret_cast<const uint16_t*>(q), ldq,
+        reinterpret_cast<const uint8_t*>(sfa), ld_sf,
+        reinterpret_cast<__nv_bfloat16*>(out), ld_out,
+        M, K, stream);
+}
+
+namespace nmoe { namespace quant {
+inline cudaError_t launch_dequantize_nvfp4_to_bf16(
+    const uint16_t* q_u16, int ldq,
+    const uint8_t*  sfa,   int ld_sf,
+    __nv_bfloat16*  out,   int ldo,
+    int M, int K,
+    cudaStream_t stream);
+inline cudaError_t launch_dequantize_nvfp4_to_bf16_mma_sf(
+    const uint16_t* q_u16, int ldq,
+    const uint8_t*  sfa_mma, int ld_sf,
+    __nv_bfloat16*  out,   int ldo,
+    int M, int K,
+    cudaStream_t stream);
+}} // namespace nmoe::quant
+
+cudaError_t dequant_nvfp4_to_bf16(
+    const void* q, int ldq,
+    const void* sfa, int ld_sf,
+    void* out, int ld_out,
+    int M, int K,
+    cudaStream_t stream)
+{
+    NMOE_REQUIRE_SM100("dequant_nvfp4_to_bf16");
+    return nmoe::quant::launch_dequantize_nvfp4_to_bf16(
+        reinterpret_cast<const uint16_t*>(q), ldq,
+        reinterpret_cast<const uint8_t*>(sfa), ld_sf,
+        reinterpret_cast<__nv_bfloat16*>(out), ld_out,
+        M, K, stream);
+}
+
+cudaError_t dequant_nvfp4_to_bf16_mma_sf(
+    const void* q, int ldq,
+    const void* sfa, int ld_sf,
+    void* out, int ld_out,
+    int M, int K,
+    cudaStream_t stream)
+{
+    NMOE_REQUIRE_SM100("dequant_nvfp4_to_bf16_mma_sf");
+    return nmoe::quant::launch_dequantize_nvfp4_to_bf16_mma_sf(
+        reinterpret_cast<const uint16_t*>(q), ldq,
+        reinterpret_cast<const uint8_t*>(sfa), ld_sf,
+        reinterpret_cast<__nv_bfloat16*>(out), ld_out,
         M, K, stream);
 }
 
@@ -2225,6 +2673,120 @@ __global__ void k_dequantize_nvfp4_to_bf16(
 #endif
 }
 
+// Fast path for K % 32 == 0: removes tail checks inside the hot inner loops.
+__global__ void k_dequantize_nvfp4_to_bf16_aligned32(
+    const uint16_t* __restrict__ q_u16, int ldq,
+    const uint8_t* __restrict__ sfa, int ld_sf,
+    __nv_bfloat16* __restrict__ out, int ldo,
+    int M, int K)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int row0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int dr = blockDim.x * gridDim.x;
+    for (int m = row0; m < M; m += dr) {
+        const uint16_t* q_row = q_u16 + static_cast<size_t>(m) * ldq;
+        const uint8_t* sf_row = sfa + static_cast<size_t>(m) * ld_sf;
+        __nv_bfloat16* o_row = out + static_cast<size_t>(m) * ldo;
+
+        for (int k0 = 0; k0 < K; k0 += SF_VEC_FP4) {
+            const int sf_idx = k0 / SF_VEC_FP4;
+            const float scale = ptx::e8m0_decode_to_f32(sf_row[sf_idx]);
+            #pragma unroll
+            for (int i = 0; i < SF_VEC_FP4 / 4; ++i) {
+                const int c = 4 * i;
+                const uint16_t packed = q_row[(k0 + c) / 4];
+                float x0, x1, x2, x3;
+                ptx::e2m1x4_packed_to_f32x4(packed, x0, x1, x2, x3);
+                o_row[k0 + c + 0] = __float2bfloat16(x0 * scale);
+                o_row[k0 + c + 1] = __float2bfloat16(x1 * scale);
+                o_row[k0 + c + 2] = __float2bfloat16(x2 * scale);
+                o_row[k0 + c + 3] = __float2bfloat16(x3 * scale);
+            }
+        }
+    }
+#endif
+}
+
+// Same as k_dequantize_nvfp4_to_bf16, but SFA is provided in CUTLASS MMA-swizzled layout.
+__global__ void k_dequantize_nvfp4_to_bf16_mma_sf(
+    const uint16_t* __restrict__ q_u16, int ldq,
+    const uint8_t*  __restrict__ sfa_mma, int ld_sf,
+    __nv_bfloat16*  __restrict__ out,  int ldo,
+    int M, int K)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int row0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int dr = blockDim.x * gridDim.x;
+    for (int m = row0; m < M; m += dr) {
+        const uint16_t* q_row = q_u16 + static_cast<size_t>(m) * ldq;
+        __nv_bfloat16* o_row = out + static_cast<size_t>(m) * ldo;
+
+        for (int k0 = 0; k0 < K; k0 += SF_VEC_FP4) {
+            const int span = min(SF_VEC_FP4, K - k0);
+            const int sf_idx = k0 / SF_VEC_FP4;
+            const size_t sf_off = cutlass_sf_swizzle_offset(
+                static_cast<size_t>(m),
+                static_cast<size_t>(sf_idx),
+                static_cast<uint32_t>(M),
+                static_cast<uint32_t>(ld_sf));
+            const float scale = ptx::e8m0_decode_to_f32(sfa_mma[sf_off]);
+
+            #pragma unroll
+            for (int i = 0; i < SF_VEC_FP4 / 4; ++i) {
+                const int c = 4 * i;
+                if (c >= span) break;
+                const uint16_t packed = q_row[(k0 + c) / 4];
+                float x0, x1, x2, x3;
+                ptx::e2m1x4_packed_to_f32x4(packed, x0, x1, x2, x3);
+                if (k0 + c + 0 < K) o_row[k0 + c + 0] = __float2bfloat16(x0 * scale);
+                if (k0 + c + 1 < K) o_row[k0 + c + 1] = __float2bfloat16(x1 * scale);
+                if (k0 + c + 2 < K) o_row[k0 + c + 2] = __float2bfloat16(x2 * scale);
+                if (k0 + c + 3 < K) o_row[k0 + c + 3] = __float2bfloat16(x3 * scale);
+            }
+        }
+    }
+#endif
+}
+
+// Fast path for K % 32 == 0: removes tail checks inside the hot inner loops.
+__global__ void k_dequantize_nvfp4_to_bf16_mma_sf_aligned32(
+    const uint16_t* __restrict__ q_u16, int ldq,
+    const uint8_t* __restrict__ sfa_mma, int ld_sf,
+    __nv_bfloat16* __restrict__ out, int ldo,
+    int M, int K)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    const int row0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int dr = blockDim.x * gridDim.x;
+    for (int m = row0; m < M; m += dr) {
+        const uint16_t* q_row = q_u16 + static_cast<size_t>(m) * ldq;
+        __nv_bfloat16* o_row = out + static_cast<size_t>(m) * ldo;
+
+        for (int k0 = 0; k0 < K; k0 += SF_VEC_FP4) {
+            const int sf_idx = k0 / SF_VEC_FP4;
+            const size_t sf_off = cutlass_sf_swizzle_offset(
+                static_cast<size_t>(m),
+                static_cast<size_t>(sf_idx),
+                static_cast<uint32_t>(M),
+                static_cast<uint32_t>(ld_sf));
+            const float scale = ptx::e8m0_decode_to_f32(sfa_mma[sf_off]);
+
+            #pragma unroll
+            for (int i = 0; i < SF_VEC_FP4 / 4; ++i) {
+                const int c = 4 * i;
+                const uint16_t packed = q_row[(k0 + c) / 4];
+                float x0, x1, x2, x3;
+                ptx::e2m1x4_packed_to_f32x4(packed, x0, x1, x2, x3);
+                o_row[k0 + c + 0] = __float2bfloat16(x0 * scale);
+                o_row[k0 + c + 1] = __float2bfloat16(x1 * scale);
+                o_row[k0 + c + 2] = __float2bfloat16(x2 * scale);
+                o_row[k0 + c + 3] = __float2bfloat16(x3 * scale);
+            }
+        }
+    }
+#endif
+}
+
 inline cudaError_t launch_dequantize_nvfp4_to_bf16(
     const uint16_t* q_u16, int ldq,
     const uint8_t*  sfa,   int ld_sf,
@@ -2232,9 +2794,35 @@ inline cudaError_t launch_dequantize_nvfp4_to_bf16(
     int M, int K,
     cudaStream_t stream = 0)
 {
+    if (M <= 0 || K <= 0) return cudaSuccess;
     const int threads = 128;
     const int blocks  = (M + threads - 1) / threads;
-    k_dequantize_nvfp4_to_bf16<<<blocks, threads, 0, stream>>>(q_u16, ldq, sfa, ld_sf, out, ldo, M, K);
+    if ((K & (SF_VEC_FP4 - 1)) == 0) {
+        k_dequantize_nvfp4_to_bf16_aligned32<<<blocks, threads, 0, stream>>>(
+            q_u16, ldq, sfa, ld_sf, out, ldo, M, K);
+    } else {
+        k_dequantize_nvfp4_to_bf16<<<blocks, threads, 0, stream>>>(q_u16, ldq, sfa, ld_sf, out, ldo, M, K);
+    }
+    return cudaGetLastError();
+}
+
+inline cudaError_t launch_dequantize_nvfp4_to_bf16_mma_sf(
+    const uint16_t* q_u16, int ldq,
+    const uint8_t*  sfa_mma, int ld_sf,
+    __nv_bfloat16*  out,   int ldo,
+    int M, int K,
+    cudaStream_t stream = 0)
+{
+    if (M <= 0 || K <= 0) return cudaSuccess;
+    const int threads = 128;
+    const int blocks = (M + threads - 1) / threads;
+    if ((K & (SF_VEC_FP4 - 1)) == 0) {
+        k_dequantize_nvfp4_to_bf16_mma_sf_aligned32<<<blocks, threads, 0, stream>>>(
+            q_u16, ldq, sfa_mma, ld_sf, out, ldo, M, K);
+    } else {
+        k_dequantize_nvfp4_to_bf16_mma_sf<<<blocks, threads, 0, stream>>>(
+            q_u16, ldq, sfa_mma, ld_sf, out, ldo, M, K);
+    }
     return cudaGetLastError();
 }
 
@@ -2247,6 +2835,7 @@ extern "C" cudaError_t repack_nvfp4_dense_perm(
     int M, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("repack_nvfp4_dense_perm");
     return nmoe::quant::launch_repack_nvfp4_dense_perm(
         reinterpret_cast<const uint8_t*>(in_u8), ldi_bytes,
         reinterpret_cast<uint8_t*>(out_u8), ldo_bytes,
@@ -2337,6 +2926,7 @@ extern "C" cudaError_t fused_dense_nvfp4_gemm_bf16(
     int M, int N, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("fused_dense_nvfp4_gemm_bf16");
     return nmoe::quant::launch_fused_dense_nvfp4_gemm_bf16(
         reinterpret_cast<const uint16_t*>(A_q), ldq,
         reinterpret_cast<const uint8_t*>(SFA), ld_sf,
@@ -2377,10 +2967,10 @@ __global__ void k_fused_dense_quant_nvfp4_gemm_bf16(
             float v = __bfloat162float(A_row[k0 + i]);
             amax = fmaxf(amax, fabsf(v));
         }
-        float scale_pos = (amax > 0.f) ? (amax / 6.0f) : 1.0f;
-        uint8_t sb = nmoe::ptx::e8m0_encode_from_pos_f32(scale_pos);
-        float scale = nmoe::ptx::e8m0_decode_to_f32(sb);
-        float inv_scale = (scale > 0.f) ? (1.0f/scale) : 0.f;
+        const float scale_pos = (amax > 0.f) ? (amax / FP4_MAX) : 1.0f;
+        const uint8_t sb = nmoe::ptx::e8m0_encode_from_pos_f32(scale_pos);
+        const float scale = nmoe::ptx::e8m0_decode_to_f32(sb);
+        const float inv_scale = nmoe::ptx::e8m0_inv_decode_to_f32(sb);
 
         // process in groups of 4 using existing pack/depack helpers
         #pragma unroll
@@ -2432,6 +3022,7 @@ extern "C" cudaError_t fused_dense_quant_nvfp4_gemm_bf16(
     int M, int N, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("fused_dense_quant_nvfp4_gemm_bf16");
     return nmoe::quant::launch_fused_dense_quant_nvfp4_gemm_bf16(
         reinterpret_cast<const __nv_bfloat16*>(A), lda,
         reinterpret_cast<const __nv_bfloat16*>(W), ldw,
@@ -2450,6 +3041,7 @@ cudaError_t swizzle_sf_mkl_to_mma(
     int M, int sf_k,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swizzle_sf_mkl_to_mma");
     return nmoe::quant::launch_swizzle_sf(
         reinterpret_cast<const uint8_t*>(sf_mkl),
         reinterpret_cast<uint8_t*>(sf_mma),
@@ -2464,6 +3056,7 @@ cudaError_t swizzle_sf_strided(
     int E, int sf_k, int sf_k_pad, int M_pad, int M_e_swizzle,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("swizzle_sf_strided");
     return nmoe::quant::launch_swizzle_sf_strided(
         reinterpret_cast<const uint8_t*>(sf_mkl),
         reinterpret_cast<uint8_t*>(sf_mma),
@@ -2477,6 +3070,7 @@ cudaError_t unswizzle_sf_strided(
     int E, int sf_k, int sf_k_pad, int M_pad, int M_e_swizzle,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("unswizzle_sf_strided");
     return nmoe::quant::launch_unswizzle_sf_strided(
         reinterpret_cast<const uint8_t*>(sf_mma),
         reinterpret_cast<uint8_t*>(sf_mkl),
@@ -2500,6 +3094,7 @@ cudaError_t build_grouped_gemm_metadata(
     int32_t* sizes_mnkl, int32_t* strides_abc, int64_t* ptrs_abc, int64_t* ptrs_sfasfb,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("build_grouped_gemm_metadata");
     return nmoe::quant::launch_build_grouped_gemm_metadata(
         offs, E,
         A_base, A_row_bytes,
@@ -2528,51 +3123,16 @@ extern "C" cudaError_t grouped_dense_nvfp4_gemm_bf16_strided(
     int E, int sf_k,
     cudaStream_t stream)
 {
-    // Copy metadata to host once (small arrays) to avoid host-side device deref
-    std::vector<int32_t> sizes_h(E * 4);
-    std::vector<int32_t> strides_h(E * 6);
-    std::vector<int64_t> ptrs_abc_h(E * 3);
-    std::vector<int64_t> ptrs_sfasfb_h(E * 2);
-    cudaError_t err;
-    err = cudaMemcpyAsync(sizes_h.data(), d_sizes_mnkl, sizes_h.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) return err;
-    err = cudaMemcpyAsync(strides_h.data(), d_strides_abc, strides_h.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) return err;
-    err = cudaMemcpyAsync(ptrs_abc_h.data(), d_ptrs_abc, ptrs_abc_h.size()*sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) return err;
-    err = cudaMemcpyAsync(ptrs_sfasfb_h.data(), d_ptrs_sfasfb, ptrs_sfasfb_h.size()*sizeof(int64_t), cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) return err;
-    err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) return err;
-
-    for (int e = 0; e < E; ++e) {
-        const int32_t M = sizes_h[e*4 + 0];
-        const int32_t N = sizes_h[e*4 + 1];
-        const int32_t K = sizes_h[e*4 + 2];
-        if (M <= 0 || N <= 0 || K <= 0) continue;
-        const int32_t A_s0 = strides_h[e*6 + 0];
-        [[maybe_unused]] const int32_t A_s1 = strides_h[e*6 + 1];
-        const int32_t B_s0 = strides_h[e*6 + 2];
-        [[maybe_unused]] const int32_t B_s1 = strides_h[e*6 + 3];
-        const int32_t C_s0 = strides_h[e*6 + 4];
-        [[maybe_unused]] const int32_t C_s1 = strides_h[e*6 + 5];
-
-        const uint16_t* A_q = reinterpret_cast<const uint16_t*>(ptrs_abc_h[e*3 + 0]);
-        const __nv_bfloat16* B = reinterpret_cast<const __nv_bfloat16*>(ptrs_abc_h[e*3 + 1]);
-        __nv_bfloat16* C = reinterpret_cast<__nv_bfloat16*>(ptrs_abc_h[e*3 + 2]);
-        const uint8_t* SFA = reinterpret_cast<const uint8_t*>(ptrs_sfasfb_h[e*2 + 0]);
-
-        err = fused_dense_nvfp4_gemm_bf16(
-            A_q, A_s0,
-            SFA, sf_k,
-            B, B_s0,
-            nullptr,
-            C, C_s0,
-            M, N, K,
-            stream);
-        if (err != cudaSuccess) return err;
-    }
-    return cudaSuccess;
+    // Intentionally disabled in production: this legacy path performs
+    // D2H metadata copies + host stream synchronization.
+    (void)d_sizes_mnkl;
+    (void)d_strides_abc;
+    (void)d_ptrs_abc;
+    (void)d_ptrs_sfasfb;
+    (void)E;
+    (void)sf_k;
+    (void)stream;
+    return cudaErrorNotSupported;
 }
 
 // ============================================================================
@@ -2605,10 +3165,10 @@ __global__ void k_fused_dense_quant_fp8_gemm_bf16(
             float v = __bfloat162float(a_row[k0 + i]);
             amax = fmaxf(amax, fabsf(v));
         }
-        float scale = (amax > 0.0f) ? (amax / FP8_MAX) : 1.0f;
-        uint8_t sbyte = ptx::e8m0_encode_from_pos_f32(scale);
-        float s = ptx::e8m0_decode_to_f32(sbyte);
-        float invs = 1.0f / s;
+        const float scale = (amax > 0.0f) ? (amax / FP8_MAX) : 1.0f;
+        const uint8_t sbyte = ptx::e8m0_encode_from_pos_f32(scale);
+        const float s = ptx::e8m0_decode_to_f32(sbyte);
+        const float invs = ptx::e8m0_inv_decode_to_f32(sbyte);
 
         #pragma unroll
         for (int i = 0; i < SF_VEC_FP8; ++i) {
@@ -2648,6 +3208,7 @@ extern "C" cudaError_t fused_dense_quant_fp8_gemm_bf16(
     int M, int N, int K,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("fused_dense_quant_fp8_gemm_bf16");
     return nmoe::quant::launch_fused_dense_quant_fp8_gemm_bf16(
         reinterpret_cast<const __nv_bfloat16*>(A), lda,
         reinterpret_cast<const __nv_bfloat16*>(W), ldw,
@@ -2666,6 +3227,7 @@ extern "C" cudaError_t ct_nvfp4_to_blockscaled_mma(
     int E, int M_ct, int K_in, int M_stride, int group_size,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("ct_nvfp4_to_blockscaled_mma");
     if ((K_in & 31) != 0) return cudaErrorInvalidValue;
     if ((M_stride & 127) != 0) return cudaErrorInvalidValue;
     const int sf_k = K_in / 32;
@@ -2689,6 +3251,7 @@ extern "C" cudaError_t ct_nvfp4_to_blockscaled_mma_interleaved(
     int E, int M_ct, int K_in, int M_stride, int group_size,
     cudaStream_t stream)
 {
+    NMOE_REQUIRE_SM100("ct_nvfp4_to_blockscaled_mma_interleaved");
     if ((K_in & 31) != 0) return cudaErrorInvalidValue;
     if ((M_stride & 127) != 0) return cudaErrorInvalidValue;
     const int sf_k = K_in / 32;
@@ -2720,8 +3283,17 @@ extern "C" cudaError_t ct_nvfp4_to_bf16(
     cudaStream_t stream)
 {
     if (K <= 0 || M <= 0) return cudaSuccess;
+    NMOE_REQUIRE_SM100("ct_nvfp4_to_bf16");
     if ((K & 1) != 0) return cudaErrorInvalidValue;  // K must be even (packed pairs)
     if (group_size <= 0 || (K % group_size) != 0) return cudaErrorInvalidValue;
+    if (gs_stride != 0 && gs_stride != 1) return cudaErrorInvalidValue;
+    if (transpose < 0 || transpose > 2) return cudaErrorInvalidValue;
+    if (gs_stride == 1) {
+        if (expert_rows <= 0 || (M % expert_rows) != 0) return cudaErrorInvalidValue;
+    }
+    if (transpose == 2) {
+        if (expert_rows <= 0 || (M % expert_rows) != 0) return cudaErrorInvalidValue;
+    }
 
     return nmoe::quant::launch_ct_nvfp4_to_bf16(
         reinterpret_cast<const uint8_t*>(ct_packed),
@@ -2731,3 +3303,5 @@ extern "C" cudaError_t ct_nvfp4_to_bf16(
         M, K, group_size, gs_stride, expert_rows, transpose,
         stream);
 }
+
+#undef NMOE_REQUIRE_SM100

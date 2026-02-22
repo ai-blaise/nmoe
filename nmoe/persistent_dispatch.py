@@ -15,6 +15,13 @@ from typing import Optional, Tuple, List, Union
 from dataclasses import dataclass
 
 
+def _canonical_device(device: Union[str, torch.device]) -> torch.device:
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return d
+
+
 @dataclass
 class PersistentWorkItem:
     """Work item for persistent dispatch."""
@@ -56,11 +63,15 @@ class PersistentDispatchQueue:
 
         # Pre-allocate buffer pools
         self._input_buffers: List[torch.Tensor] = []
-        self._output_buffers: List[torch.Tensor] = []
+        self._eid_buffers: List[torch.Tensor] = []
+        self._gate_buffers: List[torch.Tensor] = []
         self._events: List[torch.cuda.Event] = []
+        self._topk: Optional[int] = None
+        self._gates_dtype: Optional[torch.dtype] = None
 
-        # Separate stream for async execution
-        self._compute_stream = torch.cuda.Stream()
+        # Separate stream for async execution (initialized per device).
+        self._compute_stream: Optional[torch.cuda.Stream] = None
+        self._device: Optional[torch.device] = None
 
         # Buffer management
         self._current_buffer = 0
@@ -73,25 +84,67 @@ class PersistentDispatchQueue:
             device: Target device for buffers. Can be string ("cuda", "cuda:0")
                    or torch.device instance.
         """
+        target_device = _canonical_device(device)
+        rdep_device = getattr(self.rdep, "_device", None)
+        if rdep_device is not None and target_device != rdep_device:
+            raise RuntimeError(
+                f"PersistentDispatchQueue device {target_device} must match RDEP device {rdep_device}."
+            )
         if self._initialized:
+            if self._device is not None and target_device != self._device:
+                raise RuntimeError(
+                    f"PersistentDispatchQueue already initialized on {self._device}, "
+                    f"cannot reinitialize on {target_device}."
+                )
             return
 
-        # P3.2: Normalize device to torch.device for consistent handling
-        if isinstance(device, str):
-            device = torch.device(device)
+        self._device = target_device
+        self._compute_stream = torch.cuda.Stream(device=target_device)
 
         for _ in range(self.n_buffers):
             self._input_buffers.append(
                 torch.empty(self.max_batch_size, self.dim,
-                           dtype=torch.bfloat16, device=device)
+                           dtype=torch.bfloat16, device=target_device)
             )
-            self._output_buffers.append(
-                torch.empty(self.max_batch_size, self.dim,
-                           dtype=torch.bfloat16, device=device)
-            )
-            self._events.append(torch.cuda.Event())
+            evt = torch.cuda.Event()
+            # Mark buffer as initially available.
+            evt.record(torch.cuda.current_stream(device=target_device))
+            self._events.append(evt)
 
         self._initialized = True
+
+    def _ensure_routing_buffers(self, topk: int, gates_dtype: torch.dtype) -> None:
+        if self._device is None:
+            raise RuntimeError("PersistentDispatchQueue must be initialized before routing buffer setup.")
+        if self._topk is None:
+            self._topk = int(topk)
+            self._gates_dtype = gates_dtype
+            for _ in range(self.n_buffers):
+                self._eid_buffers.append(
+                    torch.empty(
+                        self.max_batch_size,
+                        self._topk,
+                        dtype=torch.int32,
+                        device=self._device,
+                    )
+                )
+                self._gate_buffers.append(
+                    torch.empty(
+                        self.max_batch_size,
+                        self._topk,
+                        dtype=self._gates_dtype,
+                        device=self._device,
+                    )
+                )
+            return
+        if int(topk) != self._topk:
+            raise RuntimeError(
+                f"PersistentDispatchQueue topk mismatch: expected {self._topk}, got {int(topk)}."
+            )
+        if gates_dtype != self._gates_dtype:
+            raise RuntimeError(
+                f"PersistentDispatchQueue gates dtype mismatch: expected {self._gates_dtype}, got {gates_dtype}."
+            )
 
     def dispatch_async(
         self,
@@ -115,48 +168,82 @@ class PersistentDispatchQueue:
             W_cache: Pre-computed weight cache for blockscaled mode (optional)
 
         Returns:
-            output: Pre-allocated output buffer (will be filled when event fires)
+            output: Output tensor from rdep dispatch (ready when event fires)
             event: CUDA event that will be recorded when dispatch completes
         """
         if not self._initialized:
             self.initialize(x.device)
+        assert self._device is not None
+        if x.device != self._device:
+            raise RuntimeError(
+                f"PersistentDispatchQueue is bound to {self._device}, got input on {x.device}."
+            )
+        for name, tensor in (
+            ("eid", eid),
+            ("gates", gates),
+            ("W1", W1),
+            ("W3", W3),
+            ("W2", W2),
+        ):
+            if tensor.device != self._device:
+                raise RuntimeError(
+                    f"PersistentDispatchQueue expects {name} on {self._device}, got {tensor.device}."
+                )
+        if W_cache is not None and W_cache.device != self._device:
+            raise RuntimeError(
+                f"PersistentDispatchQueue expects W_cache on {self._device}, got {W_cache.device}."
+            )
 
         T = x.shape[0]
         if T > self.max_batch_size:
             raise ValueError(f"Batch size {T} exceeds max {self.max_batch_size}")
+        if eid.dim() != 2 or gates.dim() != 2:
+            raise ValueError("eid and gates must be rank-2 tensors with shape [T, K].")
+        if eid.shape[0] != T or gates.shape[0] != T:
+            raise ValueError(
+                f"eid/gates token dimension mismatch: x has T={T}, eid has {eid.shape[0]}, gates has {gates.shape[0]}."
+            )
+        K = int(eid.shape[1])
+        if gates.shape[1] != K:
+            raise ValueError(
+                f"eid/gates top-k mismatch: eid has K={K}, gates has K={gates.shape[1]}."
+            )
+        self._ensure_routing_buffers(K, gates.dtype)
 
         # Get current buffer
         buf_idx = self._current_buffer
         self._current_buffer = (self._current_buffer + 1) % self.n_buffers
 
-        # Wait for previous use of this buffer to complete
-        self._events[buf_idx].synchronize()
+        # Keep dependency on device stream; avoid host blocking sync.
+        cur_stream = torch.cuda.current_stream(device=x.device)
+        cur_stream.wait_event(self._events[buf_idx])
 
         # Copy input to buffer (on current/default stream)
         self._input_buffers[buf_idx][:T].copy_(x)
+        self._eid_buffers[buf_idx][:T, :K].copy_(eid)
+        self._gate_buffers[buf_idx][:T, :K].copy_(gates)
 
         # Execute dispatch on separate stream
         # CRITICAL: Synchronize compute stream with current stream to ensure
         # the copy above completes before dispatch reads from the buffer
-        self._compute_stream.wait_stream(torch.cuda.current_stream())
+        self._compute_stream.wait_stream(cur_stream)
 
+        assert self._compute_stream is not None
         with torch.cuda.stream(self._compute_stream):
             # Use the buffered input with all required weight tensors
             output = self.rdep.dispatch(
                 self._input_buffers[buf_idx][:T],
-                eid,
-                gates,
+                self._eid_buffers[buf_idx][:T, :K],
+                self._gate_buffers[buf_idx][:T, :K],
                 W1,
                 W3,
                 W2,
                 W_cache,
             )
-            # Copy to output buffer
-            self._output_buffers[buf_idx][:T].copy_(output)
             # Record completion event
             self._events[buf_idx].record()
 
-        return self._output_buffers[buf_idx][:T], self._events[buf_idx]
+        return output, self._events[buf_idx]
 
     def dispatch_sync(
         self,
@@ -170,14 +257,14 @@ class PersistentDispatchQueue:
     ) -> torch.Tensor:
         """Submit work and wait for result (convenience method)."""
         output, event = self.dispatch_async(x, eid, gates, W1, W3, W2, W_cache)
-        event.synchronize()
-        return output.clone()
+        torch.cuda.current_stream(device=output.device).wait_event(event)
+        return output
 
     def flush(self) -> None:
         """Wait for all pending work to complete."""
-        torch.cuda.current_stream().wait_stream(self._compute_stream)
-        for event in self._events:
-            event.synchronize()
+        if self._compute_stream is None:
+            return
+        self._compute_stream.synchronize()
 
 
 class PersistentDecodeRunner:
@@ -195,9 +282,11 @@ class PersistentDecodeRunner:
         self.queue = PersistentDispatchQueue(rdep, max_batch_size, dim)
         self._in_decode_mode = False
 
-    def enter_decode_mode(self) -> None:
+    def enter_decode_mode(self, device: Optional[Union[str, torch.device]] = None) -> None:
         """Enter persistent decode mode."""
-        self.queue.initialize()
+        if device is None:
+            device = "cuda"
+        self.queue.initialize(device=device)
         self._in_decode_mode = True
 
     def exit_decode_mode(self) -> None:
@@ -230,8 +319,8 @@ class PersistentDecodeRunner:
             [T, D] output tensor
         """
         if not self._in_decode_mode:
-            # Fallback to regular dispatch
-            return self.queue.rdep.dispatch(x, eid, gates, W1, W3, W2, W_cache)
+            # Auto-enter decode mode to avoid silently bypassing persistent path.
+            self.enter_decode_mode(device=x.device)
 
         return self.queue.dispatch_sync(x, eid, gates, W1, W3, W2, W_cache)
 
@@ -241,7 +330,3 @@ class PersistentDecodeRunner:
 
     def __exit__(self, *args):
         self.exit_decode_mode()
-
-
-
-

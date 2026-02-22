@@ -9,6 +9,7 @@ Used by MoE expert MLP compute. Production contract:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Tuple, Type, Union
 from inspect import isclass
 
@@ -63,17 +64,33 @@ from nmoe.csrc import rdep
 # -- Local helpers --
 
 
+@lru_cache(maxsize=16)
+def _num_sms_for_device(device_index: int) -> int:
+    props = torch.cuda.get_device_properties(int(device_index))
+    return int(props.multi_processor_count)
+
+
+@lru_cache(maxsize=16)
+def _device_capability_for_index(device_index: int) -> tuple[int, int]:
+    cap = torch.cuda.get_device_capability(int(device_index))
+    return (int(cap[0]), int(cap[1]))
+
+
 def _num_sms(device: int | None = None) -> int:
     dev = torch.cuda.current_device() if device is None else int(device)
-    props = torch.cuda.get_device_properties(dev)
-    return int(props.multi_processor_count)
+    return _num_sms_for_device(dev)
+
+
+def _get_device_capability(device: int | None = None) -> tuple[int, int]:
+    dev = torch.cuda.current_device() if device is None else int(device)
+    return _device_capability_for_index(dev)
 
 
 def _require_sm100(device_index: int | None = None) -> None:
     """Fail fast off-target. nmoe is B200-only (SM100)."""
     dev = torch.cuda.current_device() if device_index is None else int(device_index)
-    cap = torch.cuda.get_device_capability(dev)
-    if tuple(cap) != (10, 0):
+    cap = _get_device_capability(dev)
+    if cap != (10, 0):
         raise RuntimeError(f"blockscaled GEMM requires SM100 (B200). Got capability={cap}.")
 
 
@@ -2033,6 +2050,9 @@ class _ExpertScratch:
     A_act: torch.Tensor
     # Post-activation SFA (packed by offs): uint8 [M_cap, sf_k_out] MMA layout
     A_sf: torch.Tensor
+    # Cached metadata/scratch tensors used by grouped kernels.
+    offs: torch.Tensor
+    dummy_c: torch.Tensor
 
 
 _EXPERT_SCRATCH: dict[tuple[int, str, int, int, int], _ExpertScratch] = {}
@@ -2187,10 +2207,11 @@ def run_grouped_blockscaled_strided(
     #
     # This is much tighter than E*ceil(M_e_stride/ct_m) and avoids pathological
     # JIT compile times for small runs on large-capacity buffers.
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
     tiles_n = (N + ct_n - 1) // ct_n
     # Tensormap workspace is indexed by CTA coordinates (gridDim.x*y*z), not by total tiles.
     # Keep this bounded by active CTAs to avoid multi-minute JITs / allocator spikes.
-    max_clusters_cap = max(1, int(_num_sms()))
+    max_clusters_cap = max(1, int(_num_sms(device_index)))
 
     # Exact number of work tiles for the persistent scheduler.
     # With RDEP-style padding, M_pad is 128-aligned and concatenates all experts
@@ -2201,9 +2222,8 @@ def run_grouped_blockscaled_strided(
     total_num_clusters = max(1, int(tiles_m_total) * int(tiles_n))
 
     # Device index for compile key
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
     _require_sm100(device_index)
-    sm_arch = torch.cuda.get_device_capability(device_index)
+    sm_arch = _get_device_capability(device_index)
 
     # Build compile key (stable across batches - max_clusters NOT included).
     ckey = _StridedCompileKey(
@@ -2244,7 +2264,7 @@ def run_grouped_blockscaled_strided(
             update_tensormaps_in_smem=tensormap_update_smem,
             group_count=E,
             problem_sizes_mnkl_host=problem_sizes,
-            max_active_clusters=_num_sms(),
+            max_active_clusters=_num_sms(device_index),
             fuse_swiglu_quant=bool(fuse_swiglu_quant),
         )
         kernel = KernelCls(params)
@@ -2653,16 +2673,30 @@ def expert_blockscaled(
         else:
             raise ValueError(f"Unsupported profile: {profile}")
         A_sf = torch.empty((M_cap_needed, sf_k_out), device=Xe_q_pad.device, dtype=torch.uint8)
-        scratch = _ExpertScratch(M_cap=M_cap_needed, A_act=A_act, A_sf=A_sf)
+        offs = torch.empty((E + 1,), device=Xe_q_pad.device, dtype=torch.int32)
+        dummy_c = torch.empty((1, 1, 1), device=Xe_q_pad.device, dtype=torch.bfloat16)
+        scratch = _ExpertScratch(
+            M_cap=M_cap_needed,
+            A_act=A_act,
+            A_sf=A_sf,
+            offs=offs,
+            dummy_c=dummy_c,
+        )
         _EXPERT_SCRATCH[scratch_key] = scratch
 
-    # offs: [E+1] with leading 0.
-    #
-    # NOTE: Avoid CUDA scalar/slice assignment here: it is surprisingly expensive
-    # (can introduce ms-scale launch-side overhead). A tiny cat is faster and
-    # keeps the GPU fed.
-    offs_pad_i32 = offs_pad if offs_pad.dtype == torch.int32 else offs_pad.to(torch.int32)
-    offs = torch.cat((offs_pad_i32.new_zeros((1,)), offs_pad_i32), dim=0)
+    # offs: [E+1] with leading 0 (reused scratch to avoid per-step allocation).
+    if offs_pad.device != Xe_q_pad.device:
+        raise ValueError(
+            f"offs_pad must be on same device as Xe_q_pad. "
+            f"Got offs_pad.device={offs_pad.device}, Xe_q_pad.device={Xe_q_pad.device}."
+        )
+    if offs_pad.ndim != 1 or int(offs_pad.shape[0]) != E:
+        raise ValueError(f"offs_pad must have shape [{E}]. Got shape={tuple(offs_pad.shape)}.")
+    if offs_pad.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"offs_pad must be int32 or int64. Got dtype={offs_pad.dtype}.")
+    scratch.offs[:1].zero_()
+    scratch.offs[1:E + 1].copy_(offs_pad)
+    offs = scratch.offs
 
     # Convert packed activations to CUTLASS operand format
     if profile == "fp8":
@@ -2673,9 +2707,8 @@ def expert_blockscaled(
         raise ValueError(f"Unsupported profile: {profile}")
 
     # GEMM 1+2 (W13) with fused SwiGLU + quantization (no BF16 H13 materialization).
-    dummy_c = torch.empty((1, 1, 1), device=Xe_q_pad.device, dtype=torch.bfloat16)
     run_grouped_blockscaled_strided(
-        A_q, Xe_sf_pad, W_cache.W13_q, W_cache.W13_sf_mma, dummy_c, offs,
+        A_q, Xe_sf_pad, W_cache.W13_q, W_cache.W13_sf_mma, scratch.dummy_c, offs,
         profile=profile, N=2 * Dff, K=H,
         fuse_swiglu_quant=True,
         out_act=scratch.A_act[:M_pad],
@@ -2774,9 +2807,6 @@ def quantize_weights_from_nvfp4(
 
     For W2: uses single-source kernel.
 
-    Falls back to BF16 dequant path for FP8 profile (which uses different
-    blockscaled format).
-
     Args:
         W1_packed: [E, Dff, H//2] uint8 (HF nn.Linear [out, in//2])
         W1_scale: [E, Dff, H//group_size] float8_e4m3fn
@@ -2786,7 +2816,7 @@ def quantize_weights_from_nvfp4(
         W2_scale: [E, H, Dff//group_size] float8_e4m3fn
         W2_gs: [E, 1] or [E] float32
         group_size: NVFP4 group size (default 16)
-        profile: 'fp8' or 'nvfp4'
+        profile: quantization profile (must be 'nvfp4' for this conversion path)
 
     Returns:
         QuantizedWeightsFused with interleaved W13 and W2 in MMA layout
@@ -2800,7 +2830,8 @@ def quantize_weights_from_nvfp4(
     H = W1_packed.shape[2] * 2    # in_features (dim)
 
     # W2: [E, H, Dff//2] → H = out_features (dim), Dff = in_features
-    assert W2_packed.shape[1] == H, f"W2 out_dim {W2_packed.shape[1]} != H {H}"
+    if W2_packed.shape[1] != H:
+        raise RuntimeError(f"W2 out_dim {W2_packed.shape[1]} != H {H}")
 
     stream = torch.cuda.current_stream(W1_packed.device)
     device = W1_packed.device
@@ -2809,6 +2840,21 @@ def quantize_weights_from_nvfp4(
         # =====================================================================
         # Direct CT NVFP4 → blockscaled MMA (zero BF16 intermediates)
         # =====================================================================
+        if (
+            not W1_packed.is_contiguous()
+            or not W3_packed.is_contiguous()
+            or not W2_packed.is_contiguous()
+            or not W1_scale.is_contiguous()
+            or not W3_scale.is_contiguous()
+            or not W2_scale.is_contiguous()
+            or not W1_gs.is_contiguous()
+            or not W3_gs.is_contiguous()
+            or not W2_gs.is_contiguous()
+        ):
+            raise RuntimeError(
+                "NVFP4 buffers must be contiguous before quantize_weights_from_nvfp4. "
+                "Canonicalize once at buffer set/load time."
+            )
 
         # --- W13 interleaved (W1 + W3) ---
         # CT rows = Dff (out_features), CT cols = H (in_features)
@@ -2817,8 +2863,10 @@ def quantize_weights_from_nvfp4(
         K13 = H
         sf_k13 = K13 // 32
         # M_stride must be multiple of 128 (validated by C API)
-        assert M13 % 128 == 0, f"M13={M13} must be multiple of 128"
-        assert sf_k13 % 4 == 0, f"sf_k13={sf_k13} must be multiple of 4"
+        if M13 % 128 != 0:
+            raise RuntimeError(f"M13={M13} must be multiple of 128")
+        if sf_k13 % 4 != 0:
+            raise RuntimeError(f"sf_k13={sf_k13} must be multiple of 4")
 
         W13_u16 = torch.empty((E * M13, K13 // 4), device=device, dtype=torch.uint16)
         W13_sf_mma = torch.empty((E, M13, sf_k13), device=device, dtype=torch.uint8)
@@ -2832,10 +2880,10 @@ def quantize_weights_from_nvfp4(
         s3 = W3_scale.view(torch.uint8).contiguous()
 
         rdep.ct_nvfp4_to_blockscaled_mma_interleaved(
-            W1_packed.contiguous().data_ptr(),
+            W1_packed.data_ptr(),
             s1.data_ptr(),
             gs1.data_ptr(),
-            W3_packed.contiguous().data_ptr(),
+            W3_packed.data_ptr(),
             s3.data_ptr(),
             gs3.data_ptr(),
             W13_u16.data_ptr(),
@@ -2854,8 +2902,10 @@ def quantize_weights_from_nvfp4(
         M2 = H
         K2 = Dff
         sf_k2 = K2 // 32
-        assert M2 % 128 == 0, f"M2={M2} must be multiple of 128"
-        assert sf_k2 % 4 == 0, f"sf_k2={sf_k2} must be multiple of 4"
+        if M2 % 128 != 0:
+            raise RuntimeError(f"M2={M2} must be multiple of 128")
+        if sf_k2 % 4 != 0:
+            raise RuntimeError(f"sf_k2={sf_k2} must be multiple of 4")
 
         W2_u16 = torch.empty((E * M2, K2 // 4), device=device, dtype=torch.uint16)
         W2_sf_mma = torch.empty((E, M2, sf_k2), device=device, dtype=torch.uint8)
@@ -2864,7 +2914,7 @@ def quantize_weights_from_nvfp4(
         s2 = W2_scale.view(torch.uint8).contiguous()
 
         rdep.ct_nvfp4_to_blockscaled_mma(
-            W2_packed.contiguous().data_ptr(),
+            W2_packed.data_ptr(),
             s2.data_ptr(),
             gs2.data_ptr(),
             W2_u16.data_ptr(),
@@ -2877,57 +2927,10 @@ def quantize_weights_from_nvfp4(
         W2_sf_mma = W2_sf_mma.view(E, M2, sf_k2, 1)
 
     else:
-        # FP8 profile: fall back to BF16 dequant path (FP8 blockscaled uses
-        # different packed format, direct kernel not implemented)
-        W1_bf16 = _dequant_nvfp4_triplet_to_bf16(W1_packed, W1_scale, W1_gs, group_size)
-        W1_bf16 = W1_bf16.transpose(-1, -2).contiguous()
-        W3_bf16 = _dequant_nvfp4_triplet_to_bf16(W3_packed, W3_scale, W3_gs, group_size)
-        W3_bf16 = W3_bf16.transpose(-1, -2).contiguous()
-
-        M13 = 2 * Dff
-        K13 = H
-        sf_k13 = K13 // 32
-
-        W13_t = torch.stack((W1_bf16, W3_bf16), dim=-1).view(E, H, M13).transpose(1, 2).contiguous()
-        del W1_bf16, W3_bf16
-
-        W13_x = W13_t.view(E * M13, K13)
-        offs13 = torch.arange(0, (E + 1) * M13, step=M13, device=device, dtype=torch.int32)
-        W13_u16 = torch.empty((E * M13, K13 // 2), device=device, dtype=torch.uint16)
-        W13_sf_mma = torch.empty((E, M13, sf_k13), device=device, dtype=torch.uint8)
-
-        rdep.quant_fp8_sf_strided_mma(
-            W13_x.data_ptr(), K13,
-            W13_u16.data_ptr(), K13 // 2,
-            W13_sf_mma.data_ptr(),
-            offs13.data_ptr(),
-            E, M13, E * M13, K13, stream,
+        raise RuntimeError(
+            "quantize_weights_from_nvfp4 supports profile='nvfp4' only. "
+            f"Got profile={profile!r}. Refusing BF16 fallback conversion path."
         )
-        W13_q = W13_u16.view(torch.uint8).view(E, M13, K13, 1).view(torch.float8_e4m3fn)
-        W13_sf_mma = W13_sf_mma.view(E, M13, sf_k13, 1)
-        del W13_t, W13_x, offs13, W13_u16
-
-        W2_bf16 = _dequant_nvfp4_triplet_to_bf16(W2_packed, W2_scale, W2_gs, group_size)
-        W2_bf16 = W2_bf16.transpose(-1, -2).contiguous()
-        M2 = H
-        K2 = Dff
-        sf_k2 = K2 // 32
-        W2_t = W2_bf16.transpose(1, 2).contiguous()
-        del W2_bf16
-        W2_x = W2_t.view(E * M2, K2)
-        offs2 = torch.arange(0, (E + 1) * M2, step=M2, device=device, dtype=torch.int32)
-        W2_u16 = torch.empty((E * M2, K2 // 2), device=device, dtype=torch.uint16)
-        W2_sf_mma = torch.empty((E, M2, sf_k2), device=device, dtype=torch.uint8)
-        rdep.quant_fp8_sf_strided_mma(
-            W2_x.data_ptr(), K2,
-            W2_u16.data_ptr(), K2 // 2,
-            W2_sf_mma.data_ptr(),
-            offs2.data_ptr(),
-            E, M2, E * M2, K2, stream,
-        )
-        W2_q = W2_u16.view(torch.uint8).view(E, M2, K2, 1).view(torch.float8_e4m3fn)
-        W2_sf_mma = W2_sf_mma.view(E, M2, sf_k2, 1)
-        del W2_t, W2_x, offs2, W2_u16
 
     return QuantizedWeightsFused(
         W13_q=W13_q,

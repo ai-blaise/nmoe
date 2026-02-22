@@ -11,28 +11,60 @@ from nmoe.config import Config
 from nmoe.norm import RMSNorm
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+  return os.getenv(name, default) in ("1", "true", "True")
+
+
+_NVTX_ENABLED = (
+  _env_flag("NMOE_NVTX", "0")
+  and torch.cuda.is_available()
+  and hasattr(torch.cuda, "nvtx")
+  and hasattr(torch.cuda.nvtx, "range")
+)
+
+
 def _require(cond: bool, msg: str) -> None:
   if not cond:
     raise RuntimeError(msg)
 
 
+_sm100_validated_devices: set[int] = set()
+
+
 def _sm100_only(device: torch.device) -> None:
   _require(torch.cuda.is_available(), "MLA requires CUDA (B200 / SM100).")
+  dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+  if dev_idx in _sm100_validated_devices:
+    return
   major, minor = torch.cuda.get_device_capability(device)
   _require(major == 10, f"MLA requires SM100 (B200). Got compute capability {major}.{minor}.")
+  _sm100_validated_devices.add(dev_idx)
 
 
 def _nvtx(tag: str):
-  if os.getenv('NMOE_NVTX', '0') not in ('1', 'true', 'True'):
-    return nullcontext()
-  if torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'):
+  if _NVTX_ENABLED:
     return torch.cuda.nvtx.range(tag)
   return nullcontext()
 
 
-# Use PyTorch SDPA by default. FA4 cute-dsl has a bug with (192, 128) dimensions on SM100.
-# Set NMOE_USE_FA4=1 to use FA4+FlashMLA (may produce NaN).
-_USE_SDPA = os.getenv('NMOE_USE_FA4', '0') not in ('1', 'true', 'True')
+# Production default is FlashMLA/FA4 only. SDPA is explicit debug fallback.
+_USE_SDPA = os.getenv('NMOE_USE_FA4', '1') not in ('1', 'true', 'True')
+_REQUIRE_FLASHMLA = _env_flag("NMOE_REQUIRE_FLASHMLA", "1")
+_PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
+_VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
+_MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
+_MLA_STREAM_CACHE_LIMIT = max(1, int(os.getenv("NMOE_MLA_STREAM_CACHE_LIMIT", "8")))
+
+
+def _check_flashmla_varlen_available() -> tuple[bool, str]:
+  try:
+    from flash_mla import flash_attn_varlen_func as _flash_attn_varlen_func  # noqa: F401
+    return True, ""
+  except Exception as e:
+    return False, str(e)
+
+
+_FLASHMLA_VARLEN_AVAILABLE, _FLASHMLA_VARLEN_ERR = _check_flashmla_varlen_available()
 
 
 # Module-level workspace cache for MLA backward pass.
@@ -41,7 +73,20 @@ _USE_SDPA = os.getenv('NMOE_USE_FA4', '0') not in ('1', 'true', 'True')
 # - Avoid per-backward allocation churn (token/s stability, allocator pressure)
 # - Bounded growth: one buffer per device, grown in-place as needed
 # - Scratch-only: not part of module state / checkpoints
-_mla_workspace_cache: dict[torch.device, torch.Tensor] = {}
+_mla_workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
+_mla_uniform_cu_cache: dict[tuple[int, int, int], torch.Tensor] = {}
+_fa4_fwd = None
+_flashmla_mod = None
+
+
+def _get_fa4_flashmla_modules():
+  global _fa4_fwd, _flashmla_mod
+  if _fa4_fwd is None or _flashmla_mod is None:
+    from flash_attn.cute.interface import _flash_attn_fwd as _fa4_impl  # type: ignore
+    from nmoe.csrc import flashmla_sm100 as _flashmla_impl  # type: ignore
+    _fa4_fwd = _fa4_impl
+    _flashmla_mod = _flashmla_impl
+  return _fa4_fwd, _flashmla_mod
 
 
 def _get_mla_workspace(device: torch.device, workspace_bytes: int) -> torch.Tensor:
@@ -49,11 +94,33 @@ def _get_mla_workspace(device: torch.device, workspace_bytes: int) -> torch.Tens
 
   Returns a `torch.uint8` CUDA tensor with `numel() >= workspace_bytes`.
   """
-  buf = _mla_workspace_cache.get(device)
+  if workspace_bytes > _MLA_WORKSPACE_CACHE_MAX_BYTES:
+    return torch.empty((workspace_bytes,), device=device, dtype=torch.uint8)
+  dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+  stream_id = int(torch.cuda.current_stream(device).cuda_stream)
+  key = (dev_idx, stream_id)
+  buf = _mla_workspace_cache.get(key)
   if buf is None or buf.numel() < workspace_bytes:
     buf = torch.empty((workspace_bytes,), device=device, dtype=torch.uint8)
-    _mla_workspace_cache[device] = buf
+    _mla_workspace_cache[key] = buf
+    # Keep only a bounded number of stream-keyed workspaces per device.
+    dev_keys = [k for k in _mla_workspace_cache.keys() if k[0] == dev_idx]
+    while len(dev_keys) > _MLA_STREAM_CACHE_LIMIT:
+      _mla_workspace_cache.pop(dev_keys[0], None)
+      dev_keys.pop(0)
   return buf
+
+
+def _get_uniform_cu(device: torch.device, bsz: int, seqlen: int) -> torch.Tensor:
+  """Get cached uniform cu-seqlens tensor [0, S, 2S, ..., B*S] on target device."""
+  dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+  key = (dev_idx, int(bsz), int(seqlen))
+  cu = _mla_uniform_cu_cache.get(key)
+  if cu is None or cu.device != device:
+    cu = torch.arange(0, (bsz + 1) * seqlen, step=seqlen, device=device, dtype=torch.int32)
+    _mla_uniform_cu_cache[key] = cu
+  cu.record_stream(torch.cuda.current_stream(device))
+  return cu
 
 
 def _mla_sdpa_forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float) -> torch.Tensor:
@@ -91,6 +158,7 @@ def _build_block_causal_mask(
     cu_seqlens: torch.Tensor,
     seqlen: int,
     device: torch.device,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
   """Build block-diagonal causal mask from cumulative sequence lengths.
 
@@ -105,7 +173,16 @@ def _build_block_causal_mask(
   Returns:
     mask: [seqlen, seqlen] bool tensor where True = can attend
   """
+  _require(cu_seqlens.ndim == 1 and cu_seqlens.numel() >= 1, "cu_seqlens must be 1D with at least one element.")
+  if cu_seqlens.dtype != torch.int32:
+    cu_seqlens = cu_seqlens.to(dtype=torch.int32)
+  if cu_seqlens.device != device:
+    cu_seqlens = cu_seqlens.to(device=device, non_blocking=True)
+  if not cu_seqlens.is_contiguous():
+    cu_seqlens = cu_seqlens.contiguous()
+
   pos = torch.arange(seqlen, device=device, dtype=cu_seqlens.dtype)
+  total_tokens = cu_seqlens[-1]
 
   # Assign document ID to each position using searchsorted
   # cu_seqlens[1:] contains document end boundaries
@@ -119,12 +196,17 @@ def _build_block_causal_mask(
   q_idx = pos.unsqueeze(1)  # [seqlen, 1] - query positions (rows)
   k_idx = pos.unsqueeze(0)  # [1, seqlen] - key positions (cols)
   causal_mask = q_idx >= k_idx  # [seqlen, seqlen]
+  valid_mask = (q_idx < total_tokens) & (k_idx < total_tokens)
 
   q_doc = doc_ids.unsqueeze(1)  # [seqlen, 1]
   k_doc = doc_ids.unsqueeze(0)  # [1, seqlen]
   doc_mask = q_doc == k_doc  # [seqlen, seqlen]
 
-  return causal_mask & doc_mask
+  mask = causal_mask & doc_mask & valid_mask
+  if out is not None:
+    out.copy_(mask)
+    return out
+  return mask
 
 
 def _mla_sdpa_packed_forward(
@@ -159,23 +241,10 @@ def _mla_sdpa_packed_forward(
   device = q.device
 
   with _nvtx("attn/sdpa_packed_fwd"):
-    # Build block-diagonal causal masks for all batch elements
-    # Each mask is [seqlen, seqlen] with True where attention is allowed
-    masks = []
+    # Build block-diagonal causal masks directly into final [B, 1, S, S] buffer.
+    mask = torch.empty((bsz, 1, seqlen, seqlen), device=device, dtype=torch.bool)
     for b in range(bsz):
-      mask = _build_block_causal_mask(cu_seqlens_list[b], seqlen, device)
-      masks.append(mask)
-
-    # Stack masks: [B, S, S] -> [B, 1, S, S] (broadcasts over heads)
-    mask = torch.stack(masks, dim=0).unsqueeze(1)
-
-    # Convert bool mask to additive float mask for SDPA
-    # True (attend) -> 0.0, False (block) -> -inf
-    float_mask = torch.where(
-        mask,
-        torch.tensor(0.0, device=device, dtype=q.dtype),
-        torch.tensor(float('-inf'), device=device, dtype=q.dtype),
-    )
+      _build_block_causal_mask(cu_seqlens_list[b], seqlen, device, out=mask[b, 0])
 
     # SDPA expects [B, H, S, D] layout
     q_t = q.transpose(1, 2)  # [B, H, S, D_qk]
@@ -185,7 +254,7 @@ def _mla_sdpa_packed_forward(
     # Single SDPA call with block-diagonal causal mask
     out = F.scaled_dot_product_attention(
         q_t, k_t, v_t,
-        attn_mask=float_mask,
+        attn_mask=mask,
         scale=softmax_scale,
     )
 
@@ -193,149 +262,107 @@ def _mla_sdpa_packed_forward(
     return out.transpose(1, 2)
 
 
-class _MlaFlashMlaVarlenPacked(torch.autograd.Function):
-  """MLA attention using FlashMLA varlen for packed sequences.
+def _mla_flashmla_packed_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    cu_seqlens_list: list[torch.Tensor],
+) -> torch.Tensor:
+  from flash_mla import flash_attn_varlen_func
 
-  Uses the FlashMLA dense_prefill_fwd/bwd with per-document cu_seqlens
-  to achieve zero-mask-memory document-isolated causal attention.
+  bsz, seqlen, n_heads, _ = q.shape
+  d_v = v.shape[-1]
+  device = q.device
 
-  This processes each batch element independently through the varlen API,
-  since each element may have a different number of packed documents.
-  """
+  merged_cu_parts: list[torch.Tensor] = [torch.zeros((1,), device=device, dtype=torch.int32)]
+  token_counts_t: list[torch.Tensor] = []
+  start_checks: list[torch.Tensor] = []
+  monotonic_checks: list[torch.Tensor] = []
+  has_end_boundary: list[bool] = []
+  has_any_end_boundary = False
 
-  @staticmethod
-  def forward(ctx, q, k, v, softmax_scale, cu_seqlens_list):
-    """Forward pass with FlashMLA varlen for packed sequences.
+  for b in range(bsz):
+    cu_in = cu_seqlens_list[b]
+    _require(cu_in.ndim == 1 and cu_in.numel() >= 1, f"cu_seqlens[{b}] must be 1D with at least one element.")
 
-    Args:
-      q: [B, S, H, D_qk] query tensor (BF16, CUDA)
-      k: [B, S, H, D_qk] key tensor
-      v: [B, S, H, D_v] value tensor
-      softmax_scale: float scaling factor
-      cu_seqlens_list: list of B int32 tensors, each [num_docs_i + 1]
-    """
-    from flash_mla import flash_attn_varlen_func
+    cu = cu_in
+    _require(
+      cu.device == device and cu.dtype == torch.int32,
+      f"cu_seqlens[{b}] must be CUDA int32 on device {device}, got {cu.device}/{cu.dtype}."
+    )
+    _require(cu.is_contiguous(), f"cu_seqlens[{b}] must be contiguous.")
 
-    bsz, seqlen, n_heads, d_qk = q.shape
-    d_v = v.shape[-1]
+    has_end = cu.numel() > 1
+    has_end_boundary.append(has_end)
+    has_any_end_boundary = has_any_end_boundary or has_end
+    token_counts_t.append(cu[-1])
+    if _VALIDATE_PACKED_CU:
+      start_checks.append(cu[0] == 0)
+    if has_end:
+      deltas = cu[1:] - cu[:-1]
+      if _VALIDATE_PACKED_CU:
+        monotonic_checks.append(torch.all(deltas >= 0))
 
-    # Process each batch element through varlen API
-    outputs = []
-    all_lse = []
-    all_cu = []
-    max_seqlens = []
+  token_counts = torch.stack(token_counts_t, dim=0)
+  if _VALIDATE_PACKED_CU:
+    _require(
+      bool(torch.all((token_counts >= 0) & (token_counts <= seqlen)).item()),
+      f"Packed cu_seqlens total_tokens must be in [0, {seqlen}].",
+    )
+    has_end = torch.tensor(has_end_boundary, device=device, dtype=torch.bool)
+    _require(
+      bool(torch.all(has_end | (token_counts == 0)).item()),
+      "Packed cu_seqlens must include an end boundary when total_tokens > 0.",
+    )
+    if start_checks:
+      _require(bool(torch.stack(start_checks).all().item()), "Packed cu_seqlens must start at 0.")
+    if monotonic_checks:
+      _require(bool(torch.stack(monotonic_checks).all().item()), "Packed cu_seqlens must be nondecreasing.")
 
-    for b in range(bsz):
-      cu = cu_seqlens_list[b]  # [num_docs + 1] int32
-      # Filter out zero-length padding "documents" at the end
-      # (the packer may add a padding region as the last segment)
-      num_docs = cu.shape[0] - 1
-      total_tokens = cu[-1].item()
+  # Fast empty-pack path without CUDA scalar readback.
+  # Canonical packed inputs represent empty sequences as cu_seqlens=[0].
+  if not has_any_end_boundary:
+    return torch.zeros((bsz, seqlen, n_heads, d_v), device=device, dtype=v.dtype)
 
-      # Extract this batch element's tokens
-      q_b = q[b, :total_tokens].contiguous()  # [total_tokens, H, D_qk]
-      k_b = k[b, :total_tokens].contiguous()
-      v_b = v[b, :total_tokens].contiguous()
+  batch_offsets = torch.zeros((bsz + 1,), device=device, dtype=torch.int32)
+  batch_offsets[1:] = token_counts.cumsum(dim=0)
+  for b in range(bsz):
+    cu = cu_seqlens_list[b]
+    if cu.numel() > 1:
+      merged_cu_parts.append(cu[1:] + batch_offsets[b])
 
-      # Compute max seqlen for this batch element
-      doc_lengths = cu[1:] - cu[:-1]
-      max_seqlen = int(doc_lengths.max().item()) if num_docs > 0 else 0
+  token_pos = torch.arange(seqlen, device=device, dtype=torch.int32).unsqueeze(0)
+  valid_token = token_pos < token_counts.unsqueeze(1)
+  q_merged = q[valid_token]
+  k_merged = k[valid_token]
+  v_merged = v[valid_token]
+  merged_cu = torch.cat(merged_cu_parts, dim=0)
+  max_seqlen = int(seqlen)
 
-      out_b, lse_b = flash_attn_varlen_func(
-          q_b, k_b, v_b,
-          cu_seqlens_qo=cu,
-          cu_seqlens_kv=cu,
-          max_seqlen_qo=max_seqlen,
-          max_seqlen_kv=max_seqlen,
-          causal=True,
-          softmax_scale=softmax_scale,
-          is_varlen=True,
-      )
+  out_merged, _ = flash_attn_varlen_func(
+      q_merged,
+      k_merged,
+      v_merged,
+      cu_seqlens_qo=merged_cu,
+      cu_seqlens_kv=merged_cu,
+      max_seqlen_qo=max_seqlen,
+      max_seqlen_kv=max_seqlen,
+      causal=True,
+      softmax_scale=softmax_scale,
+      is_varlen=True,
+  )
 
-      # Pad output back to seqlen
-      if total_tokens < seqlen:
-        pad_out = torch.zeros(seqlen - total_tokens, n_heads, d_v,
-                              device=out_b.device, dtype=out_b.dtype)
-        out_b = torch.cat([out_b, pad_out], dim=0)
-
-      outputs.append(out_b)
-      all_lse.append(lse_b)
-      all_cu.append(cu)
-      max_seqlens.append(max_seqlen)
-
-    output = torch.stack(outputs, dim=0)  # [B, S, H, D_v]
-
-    # Save for backward
-    ctx.save_for_backward(q, k, v, output, *all_lse, *all_cu)
-    ctx.softmax_scale = softmax_scale
-    ctx.bsz = bsz
-    ctx.seqlen = seqlen
-    ctx.n_heads = n_heads
-    ctx.d_qk = d_qk
-    ctx.d_v = d_v
-    ctx.max_seqlens = max_seqlens
-    ctx.num_lse = bsz
-    ctx.num_cu = bsz
-
-    return output
-
-  @staticmethod
-  def backward(ctx, d_out):
-    from flash_mla.flash_mla_interface import _flash_attn_varlen_backward
-
-    saved = ctx.saved_tensors
-    q = saved[0]
-    k = saved[1]
-    v = saved[2]
-    output = saved[3]
-    all_lse = saved[4:4 + ctx.num_lse]
-    all_cu = saved[4 + ctx.num_lse:]
-
-    bsz = ctx.bsz
-    seqlen = ctx.seqlen
-    n_heads = ctx.n_heads
-    d_qk = ctx.d_qk
-    d_v = ctx.d_v
-    softmax_scale = ctx.softmax_scale
-    max_seqlens = ctx.max_seqlens
-
-    dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
-    dv = torch.zeros_like(v)
-
-    for b in range(bsz):
-      cu = all_cu[b]
-      lse = all_lse[b]
-      total_tokens = cu[-1].item()
-      max_seqlen = max_seqlens[b]
-
-      if total_tokens == 0 or max_seqlen == 0:
-        continue
-
-      q_b = q[b, :total_tokens].contiguous()
-      k_b = k[b, :total_tokens].contiguous()
-      v_b = v[b, :total_tokens].contiguous()
-      out_b = output[b, :total_tokens].contiguous()
-      do_b = d_out[b, :total_tokens].contiguous()
-
-      dq_b, dk_b, dv_b = _flash_attn_varlen_backward(
-          do_b, q_b, k_b, v_b, out_b, lse,
-          cu, cu, max_seqlen, max_seqlen,
-          causal=True, softmax_scale=softmax_scale, is_varlen=True,
-      )
-
-      dq[b, :total_tokens] = dq_b
-      dk[b, :total_tokens] = dk_b
-      dv[b, :total_tokens] = dv_b
-
-    return dq, dk, dv, None, None
+  # Always scatter from merged output to avoid CUDA scalar .item() sync checks.
+  out = torch.zeros((bsz, seqlen, n_heads, d_v), device=device, dtype=out_merged.dtype)
+  out[valid_token] = out_merged
+  return out
 
 
 class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
   """MLA attention using FA4 forward + FlashMLA backward.
 
-  WARNING: FA4 cute-dsl has a known bug with (192, 128) dimensions on SM100 that
-  produces NaN outputs. Use PyTorch SDPA instead (default).
+  Production path uses FA4+FlashMLA only; SDPA exists only as explicit debug fallback.
   """
   @staticmethod
   def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float) -> torch.Tensor:
@@ -352,17 +379,16 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     _require(d_qk == 192 and d_v == 128, f"Only (d_qk, d_v) = (192, 128) is supported. Got ({d_qk}, {d_v}).")
 
     # Hard requirement: do not proceed without FA4 forward + FlashMLA backward.
-    # Environment contract: `third_party/flash_attn` is on PYTHONPATH (so `flash_attn.cute` is importable),
-    # and `nmoe.csrc.flashmla_sm100` is built.
-    from flash_attn.cute.interface import _flash_attn_fwd  # type: ignore
-    from nmoe.csrc import flashmla_sm100 as _flashmla  # type: ignore
+    # Environment contract: `third_party/flash_attn` is on PYTHONPATH (so
+    # `flash_attn.cute` is importable), and `nmoe.csrc.flashmla_sm100` is built.
+    _flash_attn_fwd, _flashmla = _get_fa4_flashmla_modules()
 
     total = bsz * seqlen
     q_ = q.reshape(total, n_heads, d_qk).contiguous()
     k_ = k.reshape(total, n_heads, d_qk).contiguous()
     v_ = v.reshape(total, n_heads, d_v).contiguous()
 
-    cu = torch.arange(0, (bsz + 1) * seqlen, step=seqlen, device=q.device, dtype=torch.int32)
+    cu = _get_uniform_cu(q.device, bsz, seqlen)
 
     with _nvtx("attn/fa4_fwd"):
       # Use m_block=128, n_block=64 for (d_qk=192, d_v=128) on SM100 (B200)
@@ -484,24 +510,40 @@ class MLA(nn.Module):
     # In-place partial RoPE: rotates q[..., nope_dim:] leaving q[..., :nope_dim] unchanged.
     # Eliminates split+cat overhead (3 kernels -> 1 kernel).
     rotate_pe_partial(q, cos, sin, nope_dim=self.qk_nope_head_dim)
+    # Rotate K rope slice in-place before split to avoid non-contiguous view copies.
     kv = self.wkv_a(x)
+    rotate_pe_partial(kv.unsqueeze(2), cos, sin, nope_dim=self.kv_lora_rank)
     kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-    k_pe = rotate_pe(k_pe.unsqueeze(2), cos, sin)
+    k_pe = k_pe.unsqueeze(2)
     kv = self.wkv_b(self.kv_norm(kv))
     kv = kv.view(bsz, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
     k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
     k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
     with record_function("attn.kernel[mla]"):
       if cu_seqlens is not None:
-        # Packed sequences: per-document SDPA with is_causal=True.
-        # Uses PyTorch's built-in flash-attention kernel — zero external deps,
-        # zero mask materialization (unlike FlexAttention's create_block_mask).
-        output = _mla_sdpa_packed_forward(q, k, v, self.softmax_scale, cu_seqlens)
+        if _PACKED_ATTN_BACKEND != "flashmla":
+          raise RuntimeError(
+            f"Invalid NMOE_PACKED_ATTN_BACKEND={_PACKED_ATTN_BACKEND!r}. "
+            "Production path requires: flashmla."
+          )
+        if not _FLASHMLA_VARLEN_AVAILABLE:
+          raise RuntimeError(
+            "Packed MLA requested FlashMLA backend but FlashMLA varlen is unavailable "
+            f"({_FLASHMLA_VARLEN_ERR})."
+          )
+        output = _mla_flashmla_packed_forward(q, k, v, self.softmax_scale, cu_seqlens)
       else:
         # Standard causal attention (no packing)
+        if _REQUIRE_FLASHMLA and _USE_SDPA:
+          raise RuntimeError(
+            "NMOE_REQUIRE_FLASHMLA=1 requires NMOE_USE_FA4=1."
+          )
         if _USE_SDPA:
-          output = _mla_sdpa_forward(q, k, v, self.softmax_scale)
+          raise RuntimeError(
+            "Non-packed SDPA fallback is disabled in production. "
+            "Set NMOE_USE_FA4=1 to force FA4+FlashMLA path."
+          )
         else:
           output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
-    output = output.contiguous().view(bsz, seqlen, self.n_heads * self.v_head_dim)
+    output = output.reshape(bsz, seqlen, self.n_heads * self.v_head_dim)
     return self.wo(output)
