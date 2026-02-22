@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import record_function
 
+from nmoe.attention.fa4_import import get_fa4_flashmla_modules
 from nmoe.attention.rope import rotate_pe, rotate_pe_partial
 from nmoe.config import Config
 from nmoe.norm import RMSNorm
@@ -75,18 +76,6 @@ _FLASHMLA_VARLEN_AVAILABLE, _FLASHMLA_VARLEN_ERR = _check_flashmla_varlen_availa
 # - Scratch-only: not part of module state / checkpoints
 _mla_workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
 _mla_uniform_cu_cache: dict[tuple[int, int, int], torch.Tensor] = {}
-_fa4_fwd = None
-_flashmla_mod = None
-
-
-def _get_fa4_flashmla_modules():
-  global _fa4_fwd, _flashmla_mod
-  if _fa4_fwd is None or _flashmla_mod is None:
-    from flash_attn.cute.interface import _flash_attn_fwd as _fa4_impl  # type: ignore
-    from nmoe.csrc import flashmla_sm100 as _flashmla_impl  # type: ignore
-    _fa4_fwd = _fa4_impl
-    _flashmla_mod = _flashmla_impl
-  return _fa4_fwd, _flashmla_mod
 
 
 def _get_mla_workspace(device: torch.device, workspace_bytes: int) -> torch.Tensor:

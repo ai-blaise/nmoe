@@ -27,6 +27,7 @@ from nmoe.data.sft_loader import build_sft_loader
 from nmoe.opt import build_optimizer, update_lr, step
 from nmoe.checkpoint import Checkpointer, load_checkpoint, save_checkpoint
 from nmoe.metrics import init_metrics, start_metrics, log_training_step, stop_metrics, register_model_timers, cuda_time
+from nmoe.attention.fa4_import import probe_fa4_flashmla_bindings
 from nmoe.experiments import ExperimentTracker
 from nmoe import runtime
 from nmoe.eval.hooks import maybe_schedule_eval
@@ -213,17 +214,7 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
       "NMOE_PACKED_ATTN_BACKEND=flashmla required when NMOE_REQUIRE_FLASHMLA=1"
     )
   if use_fa4:
-    attn_missing: list[str] = []
-    try:
-      from flash_attn.cute.interface import _flash_attn_fwd as _flash_attn_fwd  # noqa: F401
-    except Exception as e:
-      attn_missing.append(f"flash_attn.cute.interface._flash_attn_fwd ({e})")
-    try:
-      from nmoe.csrc import flashmla_sm100 as _flashmla
-      if not hasattr(_flashmla, 'dense_prefill_bwd'):
-        attn_missing.append('flashmla_sm100.dense_prefill_bwd')
-    except Exception as e:
-      attn_missing.append(f"nmoe.csrc.flashmla_sm100 ({e})")
+    attn_missing = probe_fa4_flashmla_bindings()
     if attn_missing:
       missing['attention'] = attn_missing
 
