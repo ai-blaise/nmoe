@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -707,9 +708,52 @@ class SFTLoader:
         _needed_cols = {"messages", "conversations", "instruction", "output",
                         "prompt", "completion"}
 
+        def _apply_local_split_slice(dataset, split_expr: str, split_base: str):
+            """Apply train[...]-style slicing for local files loaded via Dataset.from_*."""
+            split_expr = str(split_expr)
+            if split_expr == split_base:
+                return dataset
+
+            match = re.fullmatch(rf"{re.escape(split_base)}\[(.*)\]", split_expr)
+            if match is None:
+                raise ValueError(
+                    f"Unsupported local dataset split expression: {split_expr!r}. "
+                    f"Use '{split_base}' or '{split_base}[start:end]' (int or %)."
+                )
+
+            body = match.group(1)
+            if ":" not in body:
+                raise ValueError(
+                    f"Unsupported local dataset split expression: {split_expr!r}. "
+                    "Only range slicing is supported (start:end)."
+                )
+
+            start_tok, end_tok = body.split(":", 1)
+            total = len(dataset)
+
+            def _parse_index(tok: str, *, is_start: bool) -> int:
+                token = tok.strip()
+                if not token:
+                    return 0 if is_start else total
+                if token.endswith("%"):
+                    pct = float(token[:-1])
+                    return int((pct / 100.0) * total)
+                idx = int(token)
+                if idx < 0:
+                    idx += total
+                return idx
+
+            start = max(0, min(total, _parse_index(start_tok, is_start=True)))
+            end = max(0, min(total, _parse_index(end_tok, is_start=False)))
+            if end < start:
+                end = start
+            return dataset.select(range(start, end))
+
         if os.path.isdir(dataset_path):
             # Local directory: enumerate files explicitly to avoid
             # datasets/fsspec glob semantics drift across versions.
+            from datasets import Dataset as HFDataset
+
             root = Path(dataset_path)
             json_files = sorted(str(p) for p in root.rglob("*.json") if p.is_file())
             jsonl_files = sorted(str(p) for p in root.rglob("*.jsonl") if p.is_file())
@@ -728,17 +772,16 @@ class SFTLoader:
 
             split_name = str(split).split("[", 1)[0] or "train"
             if all_json_files:
-                dataset = load_dataset(
-                    "json",
-                    data_files={split_name: all_json_files},
-                    split=split,
+                dataset = HFDataset.from_json(
+                    all_json_files,
+                    split=split_name,
                 )
             else:
-                dataset = load_dataset(
-                    "parquet",
-                    data_files={split_name: parquet_files},
-                    split=split,
+                dataset = HFDataset.from_parquet(
+                    parquet_files,
+                    split=split_name,
                 )
+            dataset = _apply_local_split_slice(dataset, str(split), split_name)
         else:
             # HuggingFace Hub dataset — discover available columns first,
             # then load only the ones we actually need to avoid Arrow
