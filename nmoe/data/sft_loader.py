@@ -33,6 +33,7 @@ import logging
 import os
 import random
 import re
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -770,32 +771,59 @@ class SFTLoader:
                     "Use a single format per dataset path."
                 )
 
-            # Avoid cross-rank Arrow cache races when many local processes
-            # materialize the same JSON/Parquet files at once.
-            hf_cache_root = Path(
-                os.getenv(
-                    "HF_DATASETS_CACHE",
-                    str(Path.home() / ".cache" / "huggingface" / "datasets"),
+            records: list[dict[str, Any]] = []
+            if all_json_files:
+                for file_path in all_json_files:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        # Detect JSON array vs JSONL by peeking first non-whitespace byte.
+                        first_non_ws = ""
+                        while True:
+                            ch = f.read(1)
+                            if ch == "":
+                                break
+                            if not ch.isspace():
+                                first_non_ws = ch
+                                break
+                        f.seek(0)
+                        if first_non_ws == "[":
+                            payload = json.load(f)
+                            if not isinstance(payload, list):
+                                raise ValueError(
+                                    f"Expected JSON array in {file_path}, got {type(payload).__name__}"
+                                )
+                            for row in payload:
+                                if isinstance(row, dict):
+                                    keep = {k: v for k, v in row.items() if k in _needed_cols}
+                                    if keep:
+                                        records.append(keep)
+                        else:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                row = json.loads(line)
+                                if isinstance(row, dict):
+                                    keep = {k: v for k, v in row.items() if k in _needed_cols}
+                                    if keep:
+                                        records.append(keep)
+            else:
+                import pyarrow.parquet as pq
+
+                for file_path in parquet_files:
+                    table = pq.read_table(file_path)
+                    for row in table.to_pylist():
+                        if isinstance(row, dict):
+                            keep = {k: v for k, v in row.items() if k in _needed_cols}
+                            if keep:
+                                records.append(keep)
+
+            if not records:
+                raise ValueError(
+                    f"No records loaded from local dataset path: {dataset_path}"
                 )
-            ).expanduser()
-            rank_tag = os.getenv("RANK", "na")
-            local_rank_tag = os.getenv("LOCAL_RANK", "na")
-            cache_dir = hf_cache_root / f"nmoe_local_sft_r{rank_tag}_lr{local_rank_tag}"
-            cache_dir.mkdir(parents=True, exist_ok=True)
 
             split_name = str(split).split("[", 1)[0] or "train"
-            if all_json_files:
-                dataset = HFDataset.from_json(
-                    all_json_files,
-                    split=split_name,
-                    cache_dir=str(cache_dir),
-                )
-            else:
-                dataset = HFDataset.from_parquet(
-                    parquet_files,
-                    split=split_name,
-                    cache_dir=str(cache_dir),
-                )
+            dataset = HFDataset.from_list(records, split=split_name)
             dataset = _apply_local_split_slice(dataset, str(split), split_name)
         else:
             # HuggingFace Hub dataset — discover available columns first,
