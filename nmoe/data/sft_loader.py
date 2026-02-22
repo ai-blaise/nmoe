@@ -708,12 +708,37 @@ class SFTLoader:
                         "prompt", "completion"}
 
         if os.path.isdir(dataset_path):
-            # Local directory with JSON/JSONL/Parquet files
-            dataset = load_dataset(
-                "json",
-                data_dir=dataset_path,
-                split=split,
-            )
+            # Local directory: enumerate files explicitly to avoid
+            # datasets/fsspec glob semantics drift across versions.
+            root = Path(dataset_path)
+            json_files = sorted(str(p) for p in root.rglob("*.json") if p.is_file())
+            jsonl_files = sorted(str(p) for p in root.rglob("*.jsonl") if p.is_file())
+            parquet_files = sorted(str(p) for p in root.rglob("*.parquet") if p.is_file())
+
+            all_json_files = json_files + jsonl_files
+            if not all_json_files and not parquet_files:
+                raise FileNotFoundError(
+                    f"No JSON/JSONL/Parquet files found under local dataset path: {dataset_path}"
+                )
+            if all_json_files and parquet_files:
+                raise ValueError(
+                    "Local SFT dataset directory mixes JSON/JSONL and Parquet files. "
+                    "Use a single format per dataset path."
+                )
+
+            split_name = str(split).split("[", 1)[0] or "train"
+            if all_json_files:
+                dataset = load_dataset(
+                    "json",
+                    data_files={split_name: all_json_files},
+                    split=split,
+                )
+            else:
+                dataset = load_dataset(
+                    "parquet",
+                    data_files={split_name: parquet_files},
+                    split=split,
+                )
         else:
             # HuggingFace Hub dataset — discover available columns first,
             # then load only the ones we actually need to avoid Arrow
