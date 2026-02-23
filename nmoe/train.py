@@ -391,6 +391,21 @@ def train(cfg: Config):
   ep_size = getattr(cfg, 'ep_size', 1)
   rank, world = runtime.init(cfg.seed, ep_size=ep_size)
   _validate_training_config(cfg, world)
+  # RDEP IPC phase barriers require deterministic barrier-call ordering across ranks.
+  # PyTorch autograd worker-thread scheduling can reorder layer backward launches,
+  # which can deadlock distributed dispatch-meta barriers on large MoE graphs.
+  if (
+    world > 1
+    and str(getattr(cfg, "dtype", "bf16") or "bf16").lower() in {"fp8", "nvfp4"}
+    and os.getenv("NMOE_RDEP_AUTOGRAD_SINGLE_THREAD", "1") in ("1", "true", "True")
+    and hasattr(torch.autograd, "set_multithreading_enabled")
+  ):
+    torch.autograd.set_multithreading_enabled(False)
+    if rank == 0:
+      logger.info(
+        "Autograd multithreading disabled for deterministic distributed RDEP barrier ordering "
+        "(set NMOE_RDEP_AUTOGRAD_SINGLE_THREAD=0 to override)."
+      )
   timers_on = os.getenv('NMOE_TIMERS', '1') not in ('0', 'false', 'False')
   time_ctx = cuda_time if timers_on else (lambda _tag: nullcontext())
   nvtx_on = os.getenv('NMOE_NVTX', '0') in ('1', 'true', 'True')
