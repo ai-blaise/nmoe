@@ -80,6 +80,7 @@ _PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip()
 _VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
 _MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
 _MLA_STREAM_CACHE_LIMIT = max(1, int(os.getenv("NMOE_MLA_STREAM_CACHE_LIMIT", "8")))
+_MLA_SOFTMAX_SCALE_MULT = float(os.getenv("NMOE_MLA_SOFTMAX_SCALE_MULT", "1.0"))
 
 
 def _check_flashmla_varlen_available() -> tuple[bool, str]:
@@ -575,7 +576,7 @@ class MLA(nn.Module):
     self.kv_norm = RMSNorm(self.kv_lora_rank, config.rms_norm_eps)
     self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False, dtype=torch.bfloat16)
     self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False, dtype=torch.bfloat16)
-    self.softmax_scale = self.qk_head_dim ** -0.5
+    self.softmax_scale = (self.qk_head_dim ** -0.5) * _MLA_SOFTMAX_SCALE_MULT
 
   def init_weights(self, init_std: float = 0.02):
     for proj in [self.wq_a, self.wq_b, self.wkv_a, self.wkv_b]:
