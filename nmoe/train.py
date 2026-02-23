@@ -134,6 +134,62 @@ def _register_nan_debug_hooks(model: torch.nn.Module):
   return handles
 
 
+@torch.no_grad()
+def _prime_nvfp4_weight_caches_for_checkpointing(
+  model: torch.nn.Module,
+  cfg: Config,
+  rank: int,
+  world: int,
+) -> None:
+  """Build NVFP4 MoE weight caches before first checkpointed forward.
+
+  Lazy cache construction inside a checkpointed forward can make the recompute
+  graph differ from the original forward (first pass builds cache, recompute does
+  not), which triggers torch.utils.checkpoint.CheckpointError.
+  """
+  if not bool(getattr(cfg, "gradient_checkpointing", False)):
+    return
+  if str(getattr(cfg, "dtype", "bf16") or "bf16").lower() != "nvfp4":
+    return
+
+  targets: list[tuple[int, torch.nn.Module]] = []
+  for idx, block in enumerate(getattr(model, "blocks", [])):
+    moe = getattr(block, "ffn", None)
+    if moe is None or not hasattr(moe, "refresh_weight_cache"):
+      continue
+    if not bool(getattr(moe, "_nvfp4_primary", False)):
+      continue
+    targets.append((idx, moe))
+
+  if not targets:
+    return
+
+  if rank == 0:
+    logger.info(
+      "Priming NVFP4 MoE caches before first checkpointed step (%d layers)",
+      len(targets),
+    )
+
+  rebuilt = 0
+  for _, moe in targets:
+    if getattr(moe, "_W_cache", None) is None:
+      moe.refresh_weight_cache()
+      rebuilt += 1
+      # Flush transient allocations from cache-build kernels before next layer.
+      torch.cuda.synchronize()
+
+  if world > 1:
+    import torch.distributed as _dist
+    _dist.barrier()
+
+  if rank == 0:
+    logger.info(
+      "NVFP4 MoE cache priming complete: rebuilt %d/%d layers",
+      rebuilt,
+      len(targets),
+    )
+
+
 def _validate_training_config(cfg: Config, world: int) -> None:
   """Validate training configuration parameters.
 
@@ -552,6 +608,12 @@ def train(cfg: Config):
     fused_eco.attach(model)
     if rank == 0:
       logger.info("FusedBackwardECO attached: %d MoE modules", len(fused_eco._moes))
+
+  # Ensure first checkpointed forward and recompute see identical code paths.
+  # NVFP4 lazy MoE cache construction inside forward can otherwise trigger
+  # torch.utils.checkpoint tensor-count mismatch on backward.
+  _prime_nvfp4_weight_caches_for_checkpointing(model, cfg, rank, world)
+
   last_loss: torch.Tensor | None = None
   config_fingerprint = fingerprint(cfg)
   checkpoint_every = getattr(cfg, 'checkpoint_every', 100)
