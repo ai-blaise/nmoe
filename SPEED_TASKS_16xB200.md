@@ -578,6 +578,16 @@ Scope:
   - Acceptance: barrier spin-wait loops avoid tight continuous polling under stragglers while preserving timeout/fail-fast behavior.
   - Status note: added periodic `__nanosleep(64)` backoff in BF16/blockscaled phase barriers and NVSHMEM dynamic IPC barrier loops.
 
+- [x] B-097 Remove redundant pre-zero IPC barrier in distributed `dX` scatter paths.
+  - Files: `nmoe/csrc/rdep.cu`
+  - Acceptance: `scatter_dx_dist_bf16` and `scatter_dx_dist_from_pad_bf16` (BF16 + blockscaled IPC branches) launch with two cross-rank barriers instead of three, while keeping zero-before-send and send-before-reduce ordering.
+  - Status note: removed the leading pre-zero barrier in both distributed `dX` scatter entrypoints; kept the post-zero and post-send barriers to preserve correctness contracts.
+
+- [x] B-098 Collapse NVFP4 checkpoint missing-key warning spam to summary logging.
+  - Files: `nmoe/checkpoint.py`
+  - Acceptance: non-router checkpoint key mismatches no longer emit per-key warnings in the hot import loop; logs show one aggregated summary with bounded sample keys (with optional verbose override).
+  - Status note: added aggregated missing-key accounting with `NMOE_NVFP4_MISSING_PARAM_VERBOSE=1` override for full per-key diagnostics.
+
 ## C) Router + Dispatch Kernel Work
 
 - [x] C-001 Add 2-phase dispatch for blockscaled path (parity with BF16 fast path).
