@@ -460,15 +460,6 @@ class MoE(nn.Module):
         "NVFP4 primary no-fallback training requires distributed RDEP "
         "(mode in {'ipc','hybrid'}, world>1, profile='nvfp4')."
       )
-    if rdep_mode == "ipc":
-      local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
-      n_local = int(getattr(self._rdep, "n_local", 0))
-      if n_local != local_world:
-        raise RuntimeError(
-          "NVFP4 primary IPC mode requires node-local EP grouping "
-          "(rdep.n_local == LOCAL_WORLD_SIZE). "
-          f"Got n_local={n_local}, LOCAL_WORLD_SIZE={local_world}."
-        )
     self._nvfp4_rdep_contract_validated = True
 
   @torch.no_grad()
