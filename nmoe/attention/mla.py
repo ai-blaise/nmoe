@@ -75,7 +75,7 @@ def _nvtx(tag: str):
 # Production default is FlashMLA/FA4 only. SDPA is explicit debug fallback.
 _USE_SDPA = os.getenv('NMOE_USE_FA4', '1') not in ('1', 'true', 'True')
 _REQUIRE_FLASHMLA = _env_flag("NMOE_REQUIRE_FLASHMLA", "1")
-_USE_FA4_FORWARD = _env_flag("NMOE_MLA_USE_FA4_FORWARD", "0")
+_USE_FLASHMLA_VARLEN = _env_flag("NMOE_MLA_USE_FLASHMLA_VARLEN", "0")
 _PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
 _VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
 _MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
@@ -465,6 +465,26 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     _require(out.shape == (total, n_heads, d_v),
              f"FA4 output shape mismatch: expected {(total, n_heads, d_v)}, got {tuple(out.shape)}.")
     _require(lse.ndim == 2, f"FA4 lse must be 2D, got shape={tuple(lse.shape)}.")
+    if _nan_debug_active():
+      out_finite = torch.isfinite(out)
+      if not bool(out_finite.all().item()):
+        numel = int(out.numel())
+        finite = int(out_finite.sum().item())
+        nan = int(torch.isnan(out).sum().item())
+        inf = int(torch.isinf(out).sum().item())
+        q_abs = float(q_.abs().amax().item())
+        k_abs = float(k_.abs().amax().item())
+        v_abs = float(v_.abs().amax().item())
+        q_rms = float(q_.float().pow(2).mean().sqrt().item())
+        k_rms = float(k_.float().pow(2).mean().sqrt().item())
+        v_rms = float(v_.float().pow(2).mean().sqrt().item())
+        raise RuntimeError(
+          f"[NANDBG][mla] non-finite fa4.out shape={tuple(out.shape)} dtype={out.dtype} "
+          f"finite={finite}/{numel} nan={nan} inf={inf} "
+          f"q_abs_max={q_abs:.6g} k_abs_max={k_abs:.6g} v_abs_max={v_abs:.6g} "
+          f"q_rms={q_rms:.6g} k_rms={k_rms:.6g} v_rms={v_rms:.6g} "
+          f"softmax_scale={float(softmax_scale):.6g}"
+        )
     _require_finite("fa4.out", out)
     _require_finite("fa4.lse", lse)
 
@@ -629,15 +649,15 @@ class MLA(nn.Module):
             "Set NMOE_USE_FA4=1 to force FA4+FlashMLA path."
           )
         else:
-          if _USE_FA4_FORWARD:
-            output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
-          else:
+          if _USE_FLASHMLA_VARLEN:
             if not _FLASHMLA_VARLEN_AVAILABLE:
               raise RuntimeError(
                 "FlashMLA varlen kernel is unavailable for non-packed MLA "
                 f"({_FLASHMLA_VARLEN_ERR})."
               )
             output = _mla_flashmla_uniform_forward(q, k, v, self.softmax_scale)
+          else:
+            output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
     output = output.reshape(bsz, seqlen, self.n_heads * self.v_head_dim)
     _require_finite("mla.out_attn", output)
     out = self.wo(output)
