@@ -459,7 +459,8 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
         # FlashMLA forward uses a fixed-size workspace scratch buffer.
         fwd_workspace = _get_mla_workspace(q.device, 32 * 1024 * 1024)
         out = torch.empty((total, n_heads, d_v), device=q.device, dtype=q_.dtype)
-        lse = torch.empty((total, n_heads), device=q.device, dtype=torch.float32)
+        # FlashMLA forward requires lse stride(0) == 1.
+        lse = torch.empty((n_heads, total), device=q.device, dtype=torch.float32).transpose(0, 1)
         _flashmla.dense_prefill_fwd(
             fwd_workspace,
             q_,
