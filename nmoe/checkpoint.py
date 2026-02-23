@@ -1251,6 +1251,11 @@ def dequantize_nvfp4_to_model_gpu(
     result = {}
     consumed = set()
     gpu_count = 0
+    missing_non_router = 0
+    missing_non_router_samples: list[str] = []
+    missing_non_router_verbose = os.getenv("NMOE_NVFP4_MISSING_PARAM_VERBOSE", "0").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
     stream = torch.cuda.current_stream()
     legacy_remap_logged: set[str] = set()
 
@@ -1305,7 +1310,12 @@ def dequantize_nvfp4_to_model_gpu(
                     "Checkpoint key mapping is incompatible with the current fused router."
                 )
             # Non-router parameters may legitimately differ across model variants.
-            print_fn(f"[nvfp4] WARNING: No model parameter for {out_key}, skipping GPU dequant")
+            # Aggregate these warnings to avoid large launch-time log spam.
+            missing_non_router += 1
+            if missing_non_router_verbose:
+                print_fn(f"[nvfp4] WARNING: No model parameter for {out_key}, skipping GPU dequant")
+            elif len(missing_non_router_samples) < 8:
+                missing_non_router_samples.append(out_key)
             result[pk] = state_dict[pk]
             result[sk] = state_dict[sk]
             result[gk] = state_dict[gk]
@@ -1421,6 +1431,12 @@ def dequantize_nvfp4_to_model_gpu(
 
     if gpu_count > 0:
         print_fn(f"[nvfp4] GPU dequantized {gpu_count} NVFP4 triplets → BF16 (CUDA kernel, zero CPU intermediates)")
+    if missing_non_router > 0 and not missing_non_router_verbose:
+        sample = ", ".join(missing_non_router_samples)
+        print_fn(
+            f"[nvfp4] Skipped {missing_non_router} checkpoint tensors with no matching model parameter "
+            f"(non-router keys; sample: {sample})"
+        )
 
     return result
 
