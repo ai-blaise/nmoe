@@ -40,6 +40,68 @@ logging.basicConfig(level=logging.INFO)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+  return os.getenv(name, default) in ("1", "true", "True")
+
+
+def _iter_tensors(x):
+  if torch.is_tensor(x):
+    yield x
+  elif isinstance(x, (list, tuple)):
+    for v in x:
+      yield from _iter_tensors(v)
+  elif isinstance(x, dict):
+    for v in x.values():
+      yield from _iter_tensors(v)
+
+
+def _tensor_finite_stats(t: torch.Tensor) -> tuple[int, int, int, int]:
+  nan = int(torch.isnan(t).sum().item())
+  inf = int(torch.isinf(t).sum().item())
+  numel = int(t.numel())
+  finite = numel - nan - inf
+  return numel, finite, nan, inf
+
+
+def _register_nan_debug_hooks(model: torch.nn.Module):
+  """Register module forward hooks that fail fast on non-finite outputs.
+
+  Hooks are runtime-gated by NMOE_NAN_DEBUG_ACTIVE to keep overhead negligible
+  outside the scoped debug micro-step.
+  """
+  handles = []
+
+  def _hook(name: str):
+    def _fn(_module, _inputs, output):
+      if not _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0"):
+        return
+      rank = int(os.getenv("RANK", "0"))
+      for idx, tensor in enumerate(_iter_tensors(output)):
+        if not (torch.is_tensor(tensor) and (tensor.is_floating_point() or tensor.is_complex())):
+          continue
+        if torch.isfinite(tensor).all():
+          continue
+        numel, finite, nan, inf = _tensor_finite_stats(tensor)
+        raise RuntimeError(
+          f"[NANDBG][rank={rank}] first failing module={name}[{idx}] "
+          f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+          f"finite={finite}/{numel} nan={nan} inf={inf}"
+        )
+    return _fn
+
+  # Coarse and fine hooks: block outputs + attention/MoE submodule outputs.
+  for i, block in enumerate(getattr(model, "blocks", [])):
+    handles.append(block.register_forward_hook(_hook(f"transformer.blocks[{i}]")))
+    attn = getattr(block, "attn", None)
+    if attn is not None:
+      handles.append(attn.register_forward_hook(_hook(f"transformer.blocks[{i}].attn")))
+    ffn = getattr(block, "ffn", None)
+    if ffn is not None:
+      handles.append(ffn.register_forward_hook(_hook(f"transformer.blocks[{i}].ffn")))
+  handles.append(model.register_forward_hook(_hook("transformer")))
+  return handles
+
+
 def _validate_training_config(cfg: Config, world: int) -> None:
   """Validate training configuration parameters.
 
@@ -241,6 +303,14 @@ def train(cfg: Config):
   nvtx_on = os.getenv('NMOE_NVTX', '0') in ('1', 'true', 'True')
   nvtx_ok = bool(nvtx_on and torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'))
   nvtx_ctx = (torch.cuda.nvtx.range if nvtx_ok else (lambda _tag: nullcontext()))
+  nan_debug_enabled = _env_flag("NMOE_NAN_DEBUG", "0")
+  nan_debug_step = int(os.getenv("NMOE_NAN_DEBUG_STEP", "0"))
+  nan_debug_micro = int(os.getenv("NMOE_NAN_DEBUG_MICRO", "0"))
+  if nan_debug_enabled and rank == 0:
+    print(
+      f"[NANDBG] enabled for step={nan_debug_step}, micro={nan_debug_micro}",
+      flush=True,
+    )
 
   exp_tracker: ExperimentTracker | None = None
   run_id = os.getenv("NMOE_RUN", "")
@@ -303,6 +373,7 @@ def train(cfg: Config):
     model = Transformer(cfg, use_fused_router=use_fused_router).cuda()
     model.init_weights()
     model.train()
+  nan_debug_handles = _register_nan_debug_hooks(model) if nan_debug_enabled else []
 
   # Enable gradient checkpointing if configured (required for NVFP4 primary weights:
   # only 1 layer's BF16 scratch activations in GPU memory at a time)
@@ -573,8 +644,55 @@ def train(cfg: Config):
               inputs, targets = loader.next()
               loss_mask = None
 
+          nan_debug_scope = (
+            nan_debug_enabled
+            and step_num == nan_debug_step
+            and micro_step == nan_debug_micro
+          )
+          os.environ["NMOE_NAN_DEBUG_ACTIVE"] = "1" if nan_debug_scope else "0"
+          if nan_debug_scope:
+            tok_min = int(inputs.min().item())
+            tok_max = int(inputs.max().item())
+            bad_tok = int(((inputs < 0) | (inputs >= cfg.vocab_size)).sum().item())
+            mask_sum = float(loss_mask.sum().item()) if loss_mask is not None else -1.0
+            print(
+              f"[NANDBG][rank={rank}] step={step_num} micro={micro_step} "
+              f"inputs shape={tuple(inputs.shape)} dtype={inputs.dtype} "
+              f"min={tok_min} max={tok_max} bad_token_count={bad_tok} "
+              f"mask_sum={mask_sum:.1f}",
+              flush=True,
+            )
+
           with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
-            logits = model(inputs, cu_seqlens=cu_seqlens)
+            try:
+              logits = model(inputs, cu_seqlens=cu_seqlens)
+            except RuntimeError as e:
+              if nan_debug_scope:
+                raise RuntimeError(
+                  f"[NANDBG][rank={rank}] forward failed at step={step_num}, micro={micro_step}: {e}"
+                ) from e
+              raise
+
+          if nan_debug_scope:
+            numel, finite, nan, inf = _tensor_finite_stats(logits)
+            if finite == numel and numel > 0:
+              logits_f = logits.float()
+              lmin = float(logits_f.amin().item())
+              lmax = float(logits_f.amax().item())
+            else:
+              lmin = float("nan")
+              lmax = float("nan")
+            print(
+              f"[NANDBG][rank={rank}] step={step_num} micro={micro_step} "
+              f"logits shape={tuple(logits.shape)} dtype={logits.dtype} "
+              f"finite={finite}/{numel} nan={nan} inf={inf} min={lmin:.6g} max={lmax:.6g}",
+              flush=True,
+            )
+            if nan > 0 or inf > 0:
+              raise RuntimeError(
+                f"[NANDBG][rank={rank}] non-finite logits at step={step_num}, micro={micro_step}"
+              )
+          os.environ["NMOE_NAN_DEBUG_ACTIVE"] = "0"
 
           # Fail-fast on token drops (indicates expert load collapse)
           _dropped = getattr(model, 'total_dropped_tokens', 0)
