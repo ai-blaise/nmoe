@@ -272,6 +272,12 @@ def tokenize_with_loss_mask(
     targets = token_tensor[1:]
     loss_mask = mask_tensor[1:]  # Mask applies to prediction targets
 
+    # Drop examples that have too few supervised tokens after truncation.
+    # This prevents all-zero masks (no training signal) from entering the
+    # train/loss path and matches this function's return contract.
+    if mask_prompt_loss and int(loss_mask.sum().item()) < 4:
+        return None
+
     # Pad if needed (right-padding)
     pad_len = seq_len - inputs.shape[0]
     if pad_len > 0:

@@ -609,6 +609,20 @@ def train(cfg: Config):
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
+
+          # Fail-fast on non-finite loss before backward. With fused ECO enabled,
+          # expert optimizer updates happen inside backward, so we must abort first.
+          loss_finite = torch.isfinite(loss).to(dtype=torch.int32)
+          if world > 1:
+            import torch.distributed as _dist
+            if _dist.is_available() and _dist.is_initialized():
+              _dist.all_reduce(loss_finite, op=_dist.ReduceOp.MIN)
+          if loss_finite.item() == 0:
+            raise RuntimeError(
+              f"Non-finite loss detected at step={step_num}, micro_step={micro_step}. "
+              "Aborting before backward/optimizer update."
+            )
+
           # Zero gradients: on first micro-step, zero everything. On subsequent
           # micro-steps, only zero if no accumulation for dense params is needed.
           # With fused_eco, expert gradients are consumed in backward and don't
@@ -645,10 +659,10 @@ def train(cfg: Config):
         grad_norm = fused_grad_norm_(_grad_params) if _grad_params else torch.tensor(0.0, device='cuda')
         _grad_norm_bad = not torch.isfinite(grad_norm).item()
         if _grad_norm_bad:
-            if rank == 0:
-                print(f"[NAN-GUARD] Skipping optimizer step {step_num} due to NaN/Inf grad_norm={grad_norm}", flush=True)
-            # Zero out all gradients to prevent stale NaN from accumulating
-            model.zero_grad(set_to_none=True)
+            raise RuntimeError(
+              f"Non-finite dense grad_norm detected at step={step_num}: {float(grad_norm)}. "
+              "Aborting before optimizer step."
+            )
         else:
             # Only clip and step when gradients are clean
             # Gradient clipping (important for SFT stability with quantized training)
