@@ -63,6 +63,38 @@ def _tensor_finite_stats(t: torch.Tensor) -> tuple[int, int, int, int]:
   return numel, finite, nan, inf
 
 
+def _collect_nonfinite_grad_details(
+  named_params: list[tuple[str, torch.nn.Parameter]],
+  max_items: int = 8,
+) -> list[str]:
+  """Collect first non-finite gradient parameter summaries."""
+  details: list[str] = []
+  for name, p in named_params:
+    g = p.grad
+    if g is None or not (g.is_floating_point() or g.is_complex()):
+      continue
+    finite_mask = torch.isfinite(g)
+    if bool(finite_mask.all().item()):
+      continue
+    numel, finite, nan, inf = _tensor_finite_stats(g)
+    g_f = g.detach().float()
+    finite_vals = g_f[torch.isfinite(g_f)]
+    if finite_vals.numel() > 0:
+      abs_max = float(finite_vals.abs().amax().item())
+      rms = float(finite_vals.square().mean().sqrt().item())
+    else:
+      abs_max = float("nan")
+      rms = float("nan")
+    details.append(
+      f"{name} shape={tuple(g.shape)} dtype={g.dtype} "
+      f"finite={finite}/{numel} nan={nan} inf={inf} "
+      f"finite_absmax={abs_max:.6g} finite_rms={rms:.6g}"
+    )
+    if len(details) >= max_items:
+      break
+  return details
+
+
 def _register_nan_debug_hooks(model: torch.nn.Module):
   """Register module forward hooks that fail fast on non-finite outputs.
 
@@ -524,6 +556,7 @@ def train(cfg: Config):
   config_fingerprint = fingerprint(cfg)
   checkpoint_every = getattr(cfg, 'checkpoint_every', 100)
   grad_norm_params = [p for p in model.parameters() if p.requires_grad]
+  named_grad_params = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
   dense_clip_params: list[torch.nn.Parameter] = []
   if dense_groups:
     seen_dense: set[int] = set()
@@ -777,9 +810,11 @@ def train(cfg: Config):
         grad_norm = fused_grad_norm_(_grad_params) if _grad_params else torch.tensor(0.0, device='cuda')
         _grad_norm_bad = not torch.isfinite(grad_norm).item()
         if _grad_norm_bad:
+            bad_grad_details = _collect_nonfinite_grad_details(named_grad_params, max_items=8)
+            detail = "; ".join(bad_grad_details) if bad_grad_details else "none"
             raise RuntimeError(
               f"Non-finite dense grad_norm detected at step={step_num}: {float(grad_norm)}. "
-              "Aborting before optimizer step."
+              f"First non-finite grads: {detail}. Aborting before optimizer step."
             )
         else:
             # Only clip and step when gradients are clean
