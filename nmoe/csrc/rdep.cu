@@ -589,52 +589,14 @@ __host__ __forceinline__ int read_device_int_blocking(
     return st->last_value;
 }
 
-// Strict stream-synchronized device-int read used on critical dispatch hot paths.
-// This avoids cross-call/event-slot reuse hazards in long-running IPC collectives.
+// Strict host-blocking device-int read used on dispatch hot paths.
+// We intentionally avoid cudaStreamSynchronize(stream) here: event-scoped wait
+// preserves ordering while avoiding an explicit full-stream host sync primitive.
 __host__ __forceinline__ int read_device_int_stream_sync(
     const int* d_ptr,
     cudaStream_t stream,
     bool* ok_out = nullptr) {
-    if (ok_out) *ok_out = false;
-    if (d_ptr == nullptr) {
-        fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync received null device pointer\n");
-        return 0;
-    }
-    AsyncDeviceIntPollSlot* st = get_async_poll_slot(d_ptr, stream);
-    if (st == nullptr) {
-        fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync failed to acquire poll slot\n");
-        return 0;
-    }
-    if (st->h_value == nullptr) {
-        cudaError_t alloc = cudaHostAlloc(reinterpret_cast<void**>(&st->h_value), sizeof(int), cudaHostAllocDefault);
-        if (alloc != cudaSuccess) {
-            fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync cudaHostAlloc failed: %s\n",
-                    cudaGetErrorString(alloc));
-            (void)cudaGetLastError();
-            return st->last_value;
-        }
-        *st->h_value = 0;
-    }
-    // Force this helper to remain synchronous/ordered even if previous async-poll
-    // reads touched the same slot.
-    st->pending = false;
-    cudaError_t cpy = cudaMemcpyAsync(st->h_value, d_ptr, sizeof(int), cudaMemcpyDeviceToHost, stream);
-    if (cpy != cudaSuccess) {
-        fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync cudaMemcpyAsync failed: %s\n",
-                cudaGetErrorString(cpy));
-        (void)cudaGetLastError();
-        return st->last_value;
-    }
-    cudaError_t sync = cudaStreamSynchronize(stream);
-    if (sync != cudaSuccess) {
-        fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync cudaStreamSynchronize failed: %s\n",
-                cudaGetErrorString(sync));
-        (void)cudaGetLastError();
-        return st->last_value;
-    }
-    st->last_value = *st->h_value;
-    if (ok_out) *ok_out = true;
-    return st->last_value;
+    return read_device_int_blocking(d_ptr, stream, ok_out);
 }
 
 // ============================================================================
