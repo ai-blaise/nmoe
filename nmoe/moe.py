@@ -46,8 +46,12 @@ _HAS_BF16_WGRAD_HOST_OFFS = bool(getattr(_C, "bf16_wgrad_host_offs_supported", F
 _HAS_BF16_PREPARE_OFFS_PAD_HOST = bool(getattr(_C, "bf16_prepare_offs_pad_host_supported", False))
 _HAS_DEQUANT_FP8_TO_BF16_MMA_SF = hasattr(_C, "dequant_fp8_to_bf16_mma_sf")
 _HAS_DEQUANT_NVFP4_TO_BF16_MMA_SF = hasattr(_C, "dequant_nvfp4_to_bf16_mma_sf")
+_HAS_COPY_BLOCKSCALED_LAYOUT = hasattr(_C, "copy_blockscaled_layout")
+_HAS_RESTORE_LAYOUT_FROM_SAVED = hasattr(_C, "restore_layout_from_saved")
+_HAS_RDEP_LAYOUT_CACHE = bool(getattr(_C, "rdep_layout_cache_supported", False))
 _CT_NVFP4_TO_BF16_MAX_TRANSPOSE_MODE = int(getattr(_C, "ct_nvfp4_to_bf16_max_transpose_mode", 1))
 _FORCE_BF16_DISPATCH_META = _env_flag("NMOE_FORCE_BF16_DISPATCH_META", "0")
+_DISABLE_LAYOUT_REUSE = _env_flag("NMOE_DISABLE_LAYOUT_REUSE", "0")
 _NULL_NVTX_CTX = nullcontext()
 
 
@@ -140,6 +144,13 @@ def _validate_backward_runtime_contract_once(
         missing.append("bf16_wgrad_host_offs_supported")
     if not _HAS_BF16_PREPARE_OFFS_PAD_HOST:
         missing.append("bf16_prepare_offs_pad_host_supported")
+    if not _DISABLE_LAYOUT_REUSE:
+        if not _HAS_COPY_BLOCKSCALED_LAYOUT:
+            missing.append("copy_blockscaled_layout")
+        if not _HAS_RESTORE_LAYOUT_FROM_SAVED:
+            missing.append("restore_layout_from_saved")
+        if not _HAS_RDEP_LAYOUT_CACHE:
+            missing.append("rdep_layout_cache_supported")
 
     if is_dist:
         if not _HAS_SEND_DGATE_DIST_BF16_OUT_BF16:
@@ -327,6 +338,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       moe_ref._last_dropped_count = 0
 
     out_f32 = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
+    saved_dispatch_layout = None
     if M_recv < 0:
       raise RuntimeError(
         f"dispatch_meta_blockscaled failed with error code {int(M_recv)} "
@@ -343,6 +355,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       ctx.K = int(K)
       ctx.fused_eco = fused_eco
       ctx.moe_ref = moe_ref
+      ctx._saved_dispatch_layout = None
       if fused_eco is not None:
         # Save empty placeholders — backward will dequant from NVFP4 via moe_ref
         _dev = x.device
@@ -358,6 +371,36 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     max_pad = int(rdep.capacity) + int(E) * (align - 1)
     if M_pad > max_pad:
       M_pad = max_pad
+
+    # Save forward dispatch layout + sorted router metadata for backward reuse.
+    # This removes a second dispatch_meta_* pass per MoE layer in backward.
+    if torch.is_grad_enabled() and not _DISABLE_LAYOUT_REUSE:
+      with _nvtx("moe_bs/fwd_snapshot_layout"), cuda_error_context("copy_blockscaled_layout"):
+        saved_dest = torch.empty(int(M_recv), device=device, dtype=torch.int32)
+        saved_offsets = torch.empty(int(E) + 1, device=device, dtype=torch.int32)
+        _C.copy_blockscaled_layout(
+          saved_dest.data_ptr(),
+          saved_offsets.data_ptr(),
+          int(M_recv),
+          stream,
+        )
+      with _nvtx("moe_bs/fwd_snapshot_meta"), cuda_error_context("gather_meta_sorted_blockscaled"):
+        saved_row_id = torch.empty(int(M_recv), device=device, dtype=torch.int64)
+        saved_gate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
+        _C.gather_meta_sorted_blockscaled(
+          saved_row_id.data_ptr(),
+          saved_gate_sorted.data_ptr(),
+          int(M_recv),
+          stream,
+        )
+      saved_offs_pad = offs_pad.clone()
+      saved_dispatch_layout = (
+        saved_dest,
+        saved_offsets,
+        saved_offs_pad,
+        saved_row_id,
+        saved_gate_sorted,
+      )
 
     # Gather blockscaled activations into padded layout (quantized + packed SF)
     pack_factor = 2 if rdep.profile == 'fp8' else 4
@@ -387,6 +430,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     ctx.K = int(K)
     ctx.fused_eco = fused_eco
     ctx.moe_ref = moe_ref
+    ctx._saved_dispatch_layout = saved_dispatch_layout
     if fused_eco is not None:
       # Save empty placeholders — backward will dequant from NVFP4 via moe_ref
       _dev = x.device
@@ -475,9 +519,40 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     # Use per-stream pinned host scalar to avoid cross-stream metadata races.
     M_host = _get_cached_pinned_m_host(rdep)
     align = 128  # Required for blockscaled SF swizzle
+    saved_dispatch_layout = None
+    saved_row_id: torch.Tensor | None = None
+    saved_gate_sorted: torch.Tensor | None = None
+    use_saved_layout = False
+    if not _DISABLE_LAYOUT_REUSE:
+      candidate = getattr(ctx, "_saved_dispatch_layout", None)
+      if isinstance(candidate, tuple) and len(candidate) == 5:
+        saved_dispatch_layout = candidate
+        use_saved_layout = bool(
+          _HAS_COPY_BLOCKSCALED_LAYOUT
+          and _HAS_RESTORE_LAYOUT_FROM_SAVED
+          and _HAS_RDEP_LAYOUT_CACHE
+        )
 
     with _nvtx("moe_bs/bwd_dispatch_meta"):
-      if use_dist_blockscaled_meta:
+      if use_saved_layout:
+        saved_dest, saved_offsets, saved_offs_pad, saved_row_id, saved_gate_sorted = saved_dispatch_layout
+        if int(saved_offs_pad.numel()) != int(offs_pad.numel()):
+          raise RuntimeError(
+            f"Saved offs_pad size mismatch: expected {int(offs_pad.numel())}, got {int(saved_offs_pad.numel())}"
+          )
+        offs_pad.copy_(saved_offs_pad)
+        M_recv = int(saved_row_id.numel())
+        dispatch_fn = "restore_layout_from_saved"
+        if M_recv > 0:
+          with cuda_error_context("restore_layout_from_saved"):
+            _C.restore_layout_from_saved(
+              saved_dest.data_ptr(),
+              saved_offsets.data_ptr(),
+              offs_pad.data_ptr(),
+              int(M_recv),
+              stream,
+            )
+      elif use_dist_blockscaled_meta:
         dispatch_fn = "dispatch_meta_blockscaled"
         M_recv = _C.dispatch_meta_blockscaled(
           x.data_ptr(), eid.data_ptr(), gates_fp32.data_ptr(),
@@ -493,7 +568,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
           offs_pad.data_ptr(), M_host.data_ptr(),
           stream,
         )
-    if moe_ref is not None and moe_ref.training:
+    if moe_ref is not None and moe_ref.training and not use_saved_layout:
       mode = rdep._mode
       if mode == 'ipc':
         if use_dist_blockscaled_meta:
@@ -632,22 +707,28 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
     # Get row_id and gate_sorted for backward computation.
     # Keep metadata source aligned with the dispatch path.
-    row_id = torch.empty(int(M_recv), device=device, dtype=torch.int64)
-    gate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
-    if use_dist_blockscaled_meta:
-      _C.gather_meta_sorted_blockscaled(
-        row_id.data_ptr(),
-        gate_sorted.data_ptr(),
-        int(M_recv),
-        stream,
-      )
+    if use_saved_layout:
+      if saved_row_id is None or saved_gate_sorted is None:
+        raise RuntimeError("Saved dispatch metadata missing for backward layout reuse path.")
+      row_id = saved_row_id
+      gate_sorted = saved_gate_sorted
     else:
-      _C.gather_meta_sorted_bf16(
-        row_id.data_ptr(),
-        gate_sorted.data_ptr(),
-        int(M_recv),
-        stream,
-      )
+      row_id = torch.empty(int(M_recv), device=device, dtype=torch.int64)
+      gate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
+      if use_dist_blockscaled_meta:
+        _C.gather_meta_sorted_blockscaled(
+          row_id.data_ptr(),
+          gate_sorted.data_ptr(),
+          int(M_recv),
+          stream,
+        )
+      else:
+        _C.gather_meta_sorted_bf16(
+          row_id.data_ptr(),
+          gate_sorted.data_ptr(),
+          int(M_recv),
+          stream,
+        )
 
     dYe_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
     dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)

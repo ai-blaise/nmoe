@@ -62,6 +62,9 @@ extern "C" {
                                      int T, int K,
                                      int* offs_pad_out, int* M_pad_out,
                                      cudaStream_t stream);
+  void rdep_copy_blockscaled_layout(int* dest_out, int* offsets_out, int M_recv, cudaStream_t stream);
+  void rdep_restore_layout_from_saved(const int* dest_in, const int* offsets_in, const int* offs_pad_in,
+                                      int M_recv, cudaStream_t stream);
   void rdep_gather_xe_blockscaled(void* Xe_q_out, void* Xe_sf_out, int M_recv, int M_pad, cudaStream_t stream);
   void rdep_return_scatter(const void* Ye, void* out, int M_recv, int T, int K,
                            cudaStream_t stream);
@@ -789,6 +792,29 @@ PYBIND11_MODULE(rdep, m) {
      "Dispatch blockscaled tokens (meta only): quantized dispatch + sort + padded mapping. "
      "NOTE: `M_pad` is treated as a pinned host scratch (used to read back M_recv/M_pad).");
 
+  m.def("copy_blockscaled_layout", [](uintptr_t dest_out_ptr, uintptr_t offsets_out_ptr,
+                                      int M_recv, py::object stream) {
+    rdep_copy_blockscaled_layout(
+        reinterpret_cast<int*>(dest_out_ptr),
+        reinterpret_cast<int*>(offsets_out_ptr),
+        M_recv,
+        to_stream(stream));
+  }, py::arg("dest_out"), py::arg("offsets_out"),
+     py::arg("M_recv"), py::arg("stream") = py::none(),
+     "Snapshot current blockscaled dispatch layout into caller-provided device buffers.");
+
+  m.def("restore_layout_from_saved", [](uintptr_t dest_in_ptr, uintptr_t offsets_in_ptr,
+                                        uintptr_t offs_pad_in_ptr, int M_recv, py::object stream) {
+    rdep_restore_layout_from_saved(
+        reinterpret_cast<const int*>(dest_in_ptr),
+        reinterpret_cast<const int*>(offsets_in_ptr),
+        reinterpret_cast<const int*>(offs_pad_in_ptr),
+        M_recv,
+        to_stream(stream));
+  }, py::arg("dest_in"), py::arg("offsets_in"), py::arg("offs_pad_in"),
+     py::arg("M_recv"), py::arg("stream") = py::none(),
+     "Restore BF16/blockscaled internal dispatch layout from saved device buffers.");
+
   m.def("gather_xe_blockscaled", [](uintptr_t Xe_q_ptr, uintptr_t Xe_sf_ptr,
                                    int M_recv, int M_pad,
                                    py::object stream) {
@@ -1435,6 +1461,7 @@ PYBIND11_MODULE(rdep, m) {
   m.attr("bf16_wgrad_device_offs_supported") = py::bool_(true);
   m.attr("bf16_prepare_offs_pad_host_supported") = py::bool_(true);
   m.attr("bf16_wgrad_host_offs_supported") = py::bool_(true);
+  m.attr("rdep_layout_cache_supported") = py::bool_(true);
 
   m.def("bf16_prepare_offs_pad_host", [](uintptr_t offs_pad_ptr, int E, py::object stream) -> uintptr_t {
     const int32_t* host_ptr = nullptr;

@@ -3960,6 +3960,122 @@ extern "C" void rdep_gather_xe_blockscaled(
     g_block.M_pad = M_pad;
 }
 
+extern "C" void rdep_copy_blockscaled_layout(
+    int* dest_out,        // [M_recv] int32 (device)
+    int* offsets_out,     // [n_local + 1] int32 (device)
+    int M_recv,
+    cudaStream_t stream)
+{
+    if (!g_block.initialized) {
+        fprintf(stderr, "RDEP FATAL: rdep_copy_blockscaled_layout requires initialized blockscaled state\n");
+        abort();
+    }
+    if (M_recv < 0 || M_recv > static_cast<int>(g_block.capacity)) {
+        fprintf(stderr,
+                "RDEP FATAL: rdep_copy_blockscaled_layout invalid M_recv=%d (capacity=%zu)\n",
+                M_recv, g_block.capacity);
+        abort();
+    }
+    if (dest_out == nullptr || offsets_out == nullptr) {
+        fprintf(stderr, "RDEP FATAL: rdep_copy_blockscaled_layout received null output pointer(s)\n");
+        abort();
+    }
+    if (M_recv > 0) {
+        cudaError_t e = cudaMemcpyAsync(
+            dest_out, g_block.dest, static_cast<size_t>(M_recv) * sizeof(int),
+            cudaMemcpyDeviceToDevice, stream);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "RDEP FATAL: rdep_copy_blockscaled_layout dest memcpy failed: %s\n",
+                    cudaGetErrorString(e));
+            abort();
+        }
+    }
+    cudaError_t e = cudaMemcpyAsync(
+        offsets_out, g_block.offsets, static_cast<size_t>(g_block.n_local + 1) * sizeof(int),
+        cudaMemcpyDeviceToDevice, stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "RDEP FATAL: rdep_copy_blockscaled_layout offsets memcpy failed: %s\n",
+                cudaGetErrorString(e));
+        abort();
+    }
+}
+
+extern "C" void rdep_restore_layout_from_saved(
+    const int* dest_in,      // [M_recv] int32 (device)
+    const int* offsets_in,   // [n_local + 1] int32 (device)
+    const int* offs_pad_in,  // [n_local] int32 (device)
+    int M_recv,
+    cudaStream_t stream)
+{
+    if (M_recv < 0) {
+        fprintf(stderr, "RDEP FATAL: rdep_restore_layout_from_saved invalid M_recv=%d\n", M_recv);
+        abort();
+    }
+    if (offsets_in == nullptr || offs_pad_in == nullptr) {
+        fprintf(stderr, "RDEP FATAL: rdep_restore_layout_from_saved received null offsets/offs_pad pointer\n");
+        abort();
+    }
+    if (M_recv > 0 && dest_in == nullptr) {
+        fprintf(stderr, "RDEP FATAL: rdep_restore_layout_from_saved received null dest pointer for M_recv=%d\n", M_recv);
+        abort();
+    }
+
+    const bool has_bf16 = g_bf16.initialized;
+    const bool has_block = g_block.initialized;
+    if (!has_bf16 && !has_block) {
+        fprintf(stderr, "RDEP FATAL: rdep_restore_layout_from_saved requires initialized BF16 or blockscaled state\n");
+        abort();
+    }
+    if (has_bf16 && M_recv > static_cast<int>(g_bf16.capacity)) {
+        fprintf(stderr,
+                "RDEP FATAL: rdep_restore_layout_from_saved BF16 M_recv=%d exceeds capacity=%zu\n",
+                M_recv, g_bf16.capacity);
+        abort();
+    }
+    if (has_block && M_recv > static_cast<int>(g_block.capacity)) {
+        fprintf(stderr,
+                "RDEP FATAL: rdep_restore_layout_from_saved blockscaled M_recv=%d exceeds capacity=%zu\n",
+                M_recv, g_block.capacity);
+        abort();
+    }
+    if (has_bf16 && has_block && g_bf16.n_local != g_block.n_local) {
+        fprintf(stderr,
+                "RDEP FATAL: rdep_restore_layout_from_saved n_local mismatch bf16=%d blockscaled=%d\n",
+                g_bf16.n_local, g_block.n_local);
+        abort();
+    }
+
+    auto copy_layout = [&](int* dest_dst, int* offsets_dst, int n_local) {
+        if (M_recv > 0) {
+            cudaError_t e = cudaMemcpyAsync(
+                dest_dst, dest_in, static_cast<size_t>(M_recv) * sizeof(int),
+                cudaMemcpyDeviceToDevice, stream);
+            if (e != cudaSuccess) {
+                fprintf(stderr, "RDEP FATAL: rdep_restore_layout_from_saved dest memcpy failed: %s\n",
+                        cudaGetErrorString(e));
+                abort();
+            }
+        }
+        cudaError_t e = cudaMemcpyAsync(
+            offsets_dst, offsets_in, static_cast<size_t>(n_local + 1) * sizeof(int),
+            cudaMemcpyDeviceToDevice, stream);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "RDEP FATAL: rdep_restore_layout_from_saved offsets memcpy failed: %s\n",
+                    cudaGetErrorString(e));
+            abort();
+        }
+    };
+
+    if (has_bf16) {
+        copy_layout(g_bf16.dest, g_bf16.offsets, g_bf16.n_local);
+        g_bf16.offs_pad_last = const_cast<int*>(offs_pad_in);
+    }
+    if (has_block) {
+        copy_layout(g_block.dest, g_block.offsets, g_block.n_local);
+        g_block.offs_pad_last = const_cast<int*>(offs_pad_in);
+    }
+}
+
 extern "C" int rdep_dispatch_blockscaled(
     const void* x,          // [T, H] BF16 - NOT expanded
     const int* eids,        // [T, K] expert IDs
