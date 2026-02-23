@@ -119,6 +119,8 @@ MUON_CUDA_SRCS := muon.cu
 MUON_OBJS := $(MUON_CUDA_SRCS:.cu=.o) bindings_muon.o
 
 # FlashMLA SM100 dense prefill backward (CUDA)
+FLASHMLA_FWD_SRC := $(FLASHMLA_CSRC)/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu
+FLASHMLA_FWD_OBJ := flashmla_fwd_sm100.cuda.o
 FLASHMLA_BWD_SRC := $(FLASHMLA_CSRC)/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu
 FLASHMLA_BWD_OBJ := flashmla_bwd_sm100.cuda.o
 FLASHMLA_CPP_OBJS := flashmla_sm100_bindings.o
@@ -211,7 +213,7 @@ $(MUON_TARGET): $(MUON_LINK_OBJS)
 
 # ========== FlashMLA SM100 dense prefill bwd (CUDA) ==========
 
-$(FLASHMLA_TARGET): $(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS)
+$(FLASHMLA_TARGET): $(FLASHMLA_FWD_OBJ) $(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS)
 	$(CXX) -o $@ $^ $(FLASHMLA_LDFLAGS)
 	@echo ""
 	@echo "Built $(FLASHMLA_TARGET)"
@@ -231,6 +233,9 @@ ptx.o: ptx.cu
 
 rdep_nvshmem.o: rdep_nvshmem.cu rdep_nvshmem.cuh ptx.cu
 	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(FLASHMLA_FWD_OBJ): $(FLASHMLA_FWD_SRC)
+	$(NVCC) $(FLASHMLA_NVCC_FLAGS) -c $< -o $@
 
 $(FLASHMLA_BWD_OBJ): $(FLASHMLA_BWD_SRC)
 	$(NVCC) $(FLASHMLA_NVCC_FLAGS) -c $< -o $@
@@ -254,7 +259,7 @@ clean:
 	rm -f $(RDEP_CUDA_OBJS) $(DLINK_OBJ) $(RDEP_CPP_OBJS) $(RDEP_TARGET) \
 		$(GPU_OBJS) $(GPU_TARGET) \
 		$(MUON_TARGET) $(MUON_CUDA_SRCS:.cu=.o) bindings_rdep.o bindings_muon.o $(MUON_DLINK_OBJ) \
-		$(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS) $(FLASHMLA_TARGET)
+		$(FLASHMLA_FWD_OBJ) $(FLASHMLA_BWD_OBJ) $(FLASHMLA_CPP_OBJS) $(FLASHMLA_TARGET)
 
 # Debug build
 debug: NVCC_FLAGS += -g -G -DDEBUG
