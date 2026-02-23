@@ -443,6 +443,36 @@ __host__ __forceinline__ int read_device_int_blocking(
     return st->last_value;
 }
 
+// Strict stream-synchronized device-int read used on critical dispatch hot paths.
+// This avoids cross-call/event-slot reuse hazards in long-running IPC collectives.
+__host__ __forceinline__ int read_device_int_stream_sync(
+    const int* d_ptr,
+    cudaStream_t stream,
+    bool* ok_out = nullptr) {
+    if (ok_out) *ok_out = false;
+    if (d_ptr == nullptr) {
+        fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync received null device pointer\n");
+        return 0;
+    }
+    int h_value = 0;
+    cudaError_t cpy = cudaMemcpyAsync(&h_value, d_ptr, sizeof(int), cudaMemcpyDeviceToHost, stream);
+    if (cpy != cudaSuccess) {
+        fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync cudaMemcpyAsync failed: %s\n",
+                cudaGetErrorString(cpy));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    cudaError_t sync = cudaStreamSynchronize(stream);
+    if (sync != cudaSuccess) {
+        fprintf(stderr, "RDEP ERROR: read_device_int_stream_sync cudaStreamSynchronize failed: %s\n",
+                cudaGetErrorString(sync));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (ok_out) *ok_out = true;
+    return h_value;
+}
+
 // ============================================================================
 // FP8 E4M3 / FP4 E2M1 Conversion - use ptx.cu versions
 // ============================================================================
@@ -2772,7 +2802,7 @@ extern "C" int rdep_dispatch_meta_bf16(
             return -3;
         }
         bool recv_ok = false;
-        M_recv = read_device_int_blocking(local_counter, stream, &recv_ok);
+        M_recv = read_device_int_stream_sync(local_counter, stream, &recv_ok);
         if (!recv_ok) {
             return -3;
         }
@@ -3225,7 +3255,7 @@ static int dispatch_2phase_bf16(
         return -3;
     }
     bool recv_ok = false;
-    int M_recv = read_device_int_blocking(local_counter, stream, &recv_ok);
+    int M_recv = read_device_int_stream_sync(local_counter, stream, &recv_ok);
     if (!recv_ok) {
         return -3;
     }
@@ -3297,7 +3327,7 @@ static int dispatch_2phase_blockscaled(
         return -3;
     }
     bool recv_ok = false;
-    int M_recv = read_device_int_blocking(local_counter, stream, &recv_ok);
+    int M_recv = read_device_int_stream_sync(local_counter, stream, &recv_ok);
     if (!recv_ok) {
         return -3;
     }
@@ -3422,7 +3452,7 @@ extern "C" int rdep_dispatch(
             return -3;
         }
         bool recv_ok = false;
-        M_recv = read_device_int_blocking(local_counter, stream, &recv_ok);
+        M_recv = read_device_int_stream_sync(local_counter, stream, &recv_ok);
         if (!recv_ok) {
             return -3;
         }
@@ -3628,7 +3658,7 @@ extern "C" int rdep_dispatch_meta_blockscaled(
 	            return -3;
         }
         bool recv_ok = false;
-        M_recv = read_device_int_blocking(local_counter, stream, &recv_ok);
+        M_recv = read_device_int_stream_sync(local_counter, stream, &recv_ok);
         if (!recv_ok) {
             return -3;
         }
@@ -3891,7 +3921,7 @@ extern "C" int rdep_dispatch_blockscaled(
 	            return -3;
         }
         bool recv_ok = false;
-        M_recv = read_device_int_blocking(local_counter, stream, &recv_ok);
+        M_recv = read_device_int_stream_sync(local_counter, stream, &recv_ok);
         if (!recv_ok) {
             return -3;
         }
