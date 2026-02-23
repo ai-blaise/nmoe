@@ -7045,7 +7045,9 @@ extern "C" void rdep_scatter_dx_dist_bf16(
         int blocks_by_work = std::max(1, (M * 32 + threads - 1) / threads);
         int blocks = cap_warp_stride_blocks(blocks_by_work);
         const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
-        ipc_barrier_bf16(stream);
+        // Previous iteration already synchronized remote writers before local reduce.
+        // We only need: (1) zero complete on all ranks before send, and
+        // (2) send complete on all ranks before local reduce.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
         ipc_barrier_bf16(stream);
 
@@ -7120,7 +7122,7 @@ extern "C" void rdep_scatter_dx_dist_bf16(
         int blocks_by_work = std::max(1, (M * 32 + threads - 1) / threads);
         int blocks = cap_warp_stride_blocks(blocks_by_work);
         const char* local_buf = static_cast<const char*>(g_block.buffer_ptrs[g_block.rank]);
-        ipc_barrier_block(stream);
+        // Mirror BF16 path: drop redundant pre-zero barrier in steady-state.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
         ipc_barrier_block(stream);
         if (M > 0) {
@@ -7230,7 +7232,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
         int blocks_by_work = std::max(1, (M * 32 + threads - 1) / threads);
         int blocks = cap_warp_stride_blocks(blocks_by_work);
         const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
-        ipc_barrier_bf16(stream);
+        // Same ordering contract as scatter_dx_dist_bf16(): pre-zero barrier is redundant.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
         ipc_barrier_bf16(stream);
 
@@ -7304,7 +7306,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
         int blocks_by_work = std::max(1, (M * 32 + threads - 1) / threads);
         int blocks = cap_warp_stride_blocks(blocks_by_work);
         const char* local_buf = static_cast<const char*>(g_block.buffer_ptrs[g_block.rank]);
-        ipc_barrier_block(stream);
+        // Same ordering contract as BF16 branch.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
         ipc_barrier_block(stream);
 
