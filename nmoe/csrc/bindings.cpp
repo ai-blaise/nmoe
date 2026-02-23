@@ -54,6 +54,7 @@ extern "C" {
                                cudaStream_t stream);
   void rdep_gather_xe_bf16(void* Xe_out, int M_recv, int M_pad, cudaStream_t stream);
   void rdep_gather_meta_sorted_bf16(int64_t* row_id_out, float* gate_out, int M_recv, cudaStream_t stream);
+  void rdep_gather_meta_sorted_blockscaled(int64_t* row_id_out, float* gate_out, int M_recv, cudaStream_t stream);
   void rdep_gather_from_pad_bf16(const void* in_pad, void* out_sorted, int M_recv, int H, cudaStream_t stream);
   void rdep_scatter_sorted_to_pad_bf16(const void* in_sorted, void* out_pad, int M_recv, int H, cudaStream_t stream);
   void rdep_zero_padding_rows_bf16(void* out_pad, const int* offs_pad, int M_recv, int M_pad, int H, cudaStream_t stream);
@@ -517,6 +518,16 @@ PYBIND11_MODULE(rdep, m) {
   }, py::arg("row_id"), py::arg("gate_sorted"), py::arg("M_recv"),
      py::arg("stream") = py::none(),
      "Gather sorted row_id and gate (requires prior dispatch_meta_bf16)");
+
+  m.def("gather_meta_sorted_blockscaled", [](uintptr_t row_id_ptr, uintptr_t gate_sorted_ptr, int M_recv, py::object stream) {
+    rdep_gather_meta_sorted_blockscaled(
+        reinterpret_cast<int64_t*>(row_id_ptr),
+        reinterpret_cast<float*>(gate_sorted_ptr),
+        M_recv,
+        to_stream(stream));
+  }, py::arg("row_id"), py::arg("gate_sorted"), py::arg("M_recv"),
+     py::arg("stream") = py::none(),
+     "Gather sorted row_id and gate (requires prior dispatch_meta_blockscaled).");
 
   m.def("gather_from_pad_bf16", [](uintptr_t in_pad_ptr, uintptr_t out_sorted_ptr, int M_recv, int H, py::object stream) {
     rdep_gather_from_pad_bf16(

@@ -431,7 +431,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     mode = getattr(rdep, "_mode", "ipc")
     rdep_profile = str(getattr(rdep, "profile", "")).lower()
     use_dist_blockscaled_meta = bool(
-      is_dist and mode == "hybrid" and rdep_profile in ("fp8", "nvfp4")
+      is_dist and mode in ("ipc", "hybrid") and rdep_profile in ("fp8", "nvfp4")
     )
     nvfp4_mode_ok = bool(mode in {"ipc", "hybrid"})
     if rdep_profile == "nvfp4" and not nvfp4_mode_ok:
@@ -629,10 +629,24 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       Xe_pad = torch.empty(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
       _C.gather_xe_bf16(Xe_pad.data_ptr(), int(M_recv), int(max_pad), stream)
 
-    # Get row_id and gate_sorted for backward computation
+    # Get row_id and gate_sorted for backward computation.
+    # Keep metadata source aligned with the dispatch path.
     row_id = torch.empty(int(M_recv), device=device, dtype=torch.int64)
     gate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)
-    _C.gather_meta_sorted_bf16(row_id.data_ptr(), gate_sorted.data_ptr(), int(M_recv), stream)
+    if use_dist_blockscaled_meta:
+      _C.gather_meta_sorted_blockscaled(
+        row_id.data_ptr(),
+        gate_sorted.data_ptr(),
+        int(M_recv),
+        stream,
+      )
+    else:
+      _C.gather_meta_sorted_bf16(
+        row_id.data_ptr(),
+        gate_sorted.data_ptr(),
+        int(M_recv),
+        stream,
+      )
 
     dYe_sorted = torch.empty(int(M_recv), int(H), device=device, dtype=torch.bfloat16)
     dGate_sorted = torch.empty(int(M_recv), device=device, dtype=torch.float32)

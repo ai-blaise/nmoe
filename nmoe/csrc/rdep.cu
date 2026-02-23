@@ -2971,6 +2971,50 @@ extern "C" void rdep_gather_meta_sorted_bf16(
         meta_buf, g_bf16.order, row_id_out, gate_out, M_recv);
 }
 
+extern "C" void rdep_gather_meta_sorted_blockscaled(
+    int64_t* row_id_out,     // [M_recv] int64 (device)
+    float* gate_out,         // [M_recv] float32 (device)
+    int M_recv,
+    cudaStream_t stream)
+{
+#ifdef WITH_NVSHMEM
+    if (g_mode == MODE_HYBRID) {
+        if (!nvshmem::g_nvshmem.initialized) {
+            fprintf(stderr, "RDEP ERROR: NVSHMEM not initialized for hybrid mode\n");
+            return;
+        }
+        if (M_recv <= 0) return;
+
+        char* local_ipc_buf = static_cast<char*>(nvshmem::g_nvshmem.ipc_buffer_ptrs[nvshmem::g_nvshmem.nvl_rank]);
+        Meta* meta_buf = reinterpret_cast<Meta*>(local_ipc_buf + nvshmem::g_nvshmem.ipc_meta_off);
+
+        int t = 256;
+        int b_by_work = std::max(1, (M_recv + t - 1) / t);
+        int b = cap_warp_stride_blocks(b_by_work);
+        k_gather_meta_sorted<<<b, t, 0, stream>>>(
+            meta_buf, nvshmem::g_nvshmem.order, row_id_out, gate_out, M_recv);
+        return;
+    }
+#endif
+    if (!g_block.initialized) return;
+    if (M_recv <= 0) return;
+
+    size_t x_off, sfa_off, y_off, meta_off, counter_off, dropped_off, barrier_off, buf_ptrs_off, sig_ptrs_off, tok_y_off, tok_gate_off, total_size;
+    blockscaled_buffer_offsets(g_block.capacity, g_block.H, g_block.Hp, g_block.Hsf, g_block.world,
+                               &x_off, &sfa_off, &y_off, &meta_off, &counter_off, &dropped_off,
+                               &barrier_off, &buf_ptrs_off, &sig_ptrs_off,
+                               &tok_y_off, &tok_gate_off,
+                               &total_size);
+    char* local_buf = static_cast<char*>(g_block.buffer_ptrs[g_block.rank]);
+    Meta* meta_buf = reinterpret_cast<Meta*>(local_buf + meta_off);
+
+    int t = 256;
+    int b_by_work = std::max(1, (M_recv + t - 1) / t);
+    int b = cap_warp_stride_blocks(b_by_work);
+    k_gather_meta_sorted<<<b, t, 0, stream>>>(
+        meta_buf, g_block.order, row_id_out, gate_out, M_recv);
+}
+
 extern "C" void rdep_gather_from_pad_bf16(
     const void* in_pad,      // [M_pad, H] BF16
     void* out_sorted,        // [M_recv, H] BF16

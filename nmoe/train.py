@@ -288,6 +288,7 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
     'init',
     'dispatch_meta_bf16',
     'dispatch_meta_blockscaled',
+    'gather_meta_sorted_blockscaled',
     'gather_xe_blockscaled',
     'return_scatter_from_pad_blockscaled',
     'gather_dy_nogate_dist_bf16',
