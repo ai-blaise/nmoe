@@ -641,6 +641,10 @@ class TransformerBlock(nn.Module):
     self.layer_id = layer_id
     self._use_gradient_checkpointing = False  # Enable via gradient_checkpointing_enable()
     self._gradient_checkpointing_kwargs = {"use_reentrant": False}  # Default kwargs
+    # Distributed MoE dispatch is collective/stateful (RDEP). Replaying FFN/MoE
+    # forward inside activation-checkpoint recompute can deadlock multi-node
+    # runs; keep FFN checkpointing opt-in.
+    self._checkpoint_ffn = bool(getattr(config, "checkpoint_moe_ffn", False))
     self.attn_norm = RMSNorm(config.dim, config.rms_norm_eps)
     self.ffn_norm = RMSNorm(config.dim, config.rms_norm_eps)
 
@@ -721,9 +725,14 @@ class TransformerBlock(nn.Module):
             self.attn, self.attn_norm(x), cos, sin, **self._gradient_checkpointing_kwargs
           )
       with _nvtx("block/ffn"):
-        x = x + torch.utils.checkpoint.checkpoint(
-          self.ffn, self.ffn_norm(x), **self._gradient_checkpointing_kwargs
-        )
+        if self._checkpoint_ffn:
+          x = x + torch.utils.checkpoint.checkpoint(
+            self.ffn, self.ffn_norm(x), **self._gradient_checkpointing_kwargs
+          )
+        else:
+          # Production default: avoid checkpoint recompute through distributed
+          # MoE dispatch collectives (can deadlock in backward replay).
+          x = x + self.ffn(self.ffn_norm(x))
     else:
       # No checkpointing - use fused residual add helpers
       # torch.compile fuses: RMSNorm output consumed immediately + layer + residual add

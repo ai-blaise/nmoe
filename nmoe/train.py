@@ -473,6 +473,11 @@ def train(cfg: Config):
     model.gradient_checkpointing_enable()
     if rank == 0:
       logger.info("Gradient checkpointing enabled")
+      if not bool(getattr(cfg, "checkpoint_moe_ffn", False)):
+        logger.info(
+          "Gradient checkpointing mode: attention-only (checkpoint_moe_ffn=false). "
+          "MoE FFN checkpoint replay is disabled to avoid distributed RDEP recompute deadlocks."
+        )
 
   register_model_timers(model)
   optimizer, dense_groups = build_optimizer(model, cfg)
