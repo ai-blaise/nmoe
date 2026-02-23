@@ -29,6 +29,30 @@ def _require(cond: bool, msg: str) -> None:
     raise RuntimeError(msg)
 
 
+def _nan_debug_active() -> bool:
+  # Scoped by train.py to a specific failing step/micro-step.
+  return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_MLA_FINITE_DEBUG", "0")
+
+
+def _require_finite(tag: str, tensor: torch.Tensor) -> None:
+  if not _nan_debug_active():
+    return
+  if not (tensor.is_floating_point() or tensor.is_complex()):
+    return
+  finite_mask = torch.isfinite(tensor)
+  if bool(finite_mask.all().item()):
+    return
+  numel = int(tensor.numel())
+  finite = int(finite_mask.sum().item())
+  nan = int(torch.isnan(tensor).sum().item())
+  inf = int(torch.isinf(tensor).sum().item())
+  raise RuntimeError(
+    f"[NANDBG][mla] non-finite {tag} "
+    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+    f"finite={finite}/{numel} nan={nan} inf={inf}"
+  )
+
+
 _sm100_validated_devices: set[int] = set()
 
 
@@ -357,6 +381,10 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
   def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float) -> torch.Tensor:
     _sm100_only(q.device)
     _require(q.is_cuda and k.is_cuda and v.is_cuda, "MLA FA4+FlashMLA requires CUDA tensors.")
+    _require(
+      q.device == k.device and q.device == v.device,
+      f"MLA FA4+FlashMLA requires q/k/v on same device, got {q.device}, {k.device}, {v.device}.",
+    )
     _require(q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16,
              "MLA FA4+FlashMLA requires BF16 inputs.")
     _require(q.ndim == 4 and k.ndim == 4 and v.ndim == 4, "Expected q/k/v with shape [B, S, H, D].")
@@ -376,6 +404,9 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     q_ = q.reshape(total, n_heads, d_qk).contiguous()
     k_ = k.reshape(total, n_heads, d_qk).contiguous()
     v_ = v.reshape(total, n_heads, d_v).contiguous()
+    _require_finite("fa4.q", q_)
+    _require_finite("fa4.k", k_)
+    _require_finite("fa4.v", v_)
 
     cu = _get_uniform_cu(q.device, bsz, seqlen)
 
@@ -394,9 +425,26 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
           m_block_size=128,
           n_block_size=64,
       )
+    _require(out.shape == (total, n_heads, d_v),
+             f"FA4 output shape mismatch: expected {(total, n_heads, d_v)}, got {tuple(out.shape)}.")
+    _require(lse.ndim == 2, f"FA4 lse must be 2D, got shape={tuple(lse.shape)}.")
+    _require_finite("fa4.out", out)
+    _require_finite("fa4.lse", lse)
 
     # FlashMLA expects lse as [total, H] float32 with stride(0) == 1.
-    lse_t = lse.T
+    if lse.shape == (n_heads, total):
+      lse_t = lse.transpose(0, 1)
+    elif lse.shape == (total, n_heads):
+      lse_t = lse
+    else:
+      raise RuntimeError(
+        f"Unexpected FA4 lse shape {tuple(lse.shape)}; expected {(n_heads, total)} or {(total, n_heads)}."
+      )
+    if lse_t.stride(0) != 1:
+      lse_t = lse_t.transpose(0, 1).contiguous().transpose(0, 1)
+    _require(lse_t.shape == (total, n_heads),
+             f"FlashMLA lse shape mismatch: expected {(total, n_heads)}, got {tuple(lse_t.shape)}.")
+    _require(lse_t.stride(0) == 1, f"FlashMLA lse stride(0) must be 1, got {lse_t.stride(0)}.")
 
     ctx.save_for_backward(q_, k_, v_, out, lse_t, cu)
     ctx.softmax_scale = float(softmax_scale)
@@ -494,20 +542,31 @@ class MLA(nn.Module):
                   When None, standard causal attention is used.
     """
     bsz, seqlen, _ = x.size()
+    _require_finite("mla.x", x)
+    _require_finite("mla.cos", cos)
+    _require_finite("mla.sin", sin)
+
     q = self.wq_b(self.q_norm(self.wq_a(x)))
+    _require_finite("mla.q_pre_rope", q)
     q = q.view(bsz, seqlen, self.n_heads, self.qk_head_dim)
     # In-place partial RoPE: rotates q[..., nope_dim:] leaving q[..., :nope_dim] unchanged.
     # Eliminates split+cat overhead (3 kernels -> 1 kernel).
     rotate_pe_partial(q, cos, sin, nope_dim=self.qk_nope_head_dim)
+    _require_finite("mla.q", q)
     # Rotate K rope slice in-place before split to avoid non-contiguous view copies.
     kv = self.wkv_a(x)
+    _require_finite("mla.kv_pre_rope", kv)
     rotate_pe_partial(kv.unsqueeze(2), cos, sin, nope_dim=self.kv_lora_rank)
+    _require_finite("mla.kv_post_rope", kv)
     kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
     k_pe = k_pe.unsqueeze(2)
     kv = self.wkv_b(self.kv_norm(kv))
+    _require_finite("mla.kv_proj", kv)
     kv = kv.view(bsz, seqlen, self.n_heads, self.qk_nope_head_dim + self.v_head_dim)
     k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
     k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
+    _require_finite("mla.k", k)
+    _require_finite("mla.v", v)
     with record_function("attn.kernel[mla]"):
       if cu_seqlens is not None:
         if _PACKED_ATTN_BACKEND != "flashmla":
@@ -535,4 +594,7 @@ class MLA(nn.Module):
         else:
           output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
     output = output.reshape(bsz, seqlen, self.n_heads * self.v_head_dim)
-    return self.wo(output)
+    _require_finite("mla.out_attn", output)
+    out = self.wo(output)
+    _require_finite("mla.out_wo", out)
+    return out
