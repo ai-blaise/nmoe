@@ -1252,6 +1252,7 @@ def dequantize_nvfp4_to_model_gpu(
     consumed = set()
     gpu_count = 0
     stream = torch.cuda.current_stream()
+    legacy_remap_logged: set[str] = set()
 
     for pk in packed_keys:
         base = pk[:-len('.weight_packed')]
@@ -1278,10 +1279,32 @@ def dequantize_nvfp4_to_model_gpu(
             out_key = base + '.weight'
             need_transpose = False
 
-        # Get target device from model parameter
+        # Get target device from model parameter.
+        # Legacy imported checkpoints may use pre-fused-router key names.
         target_param = param_map.get(out_key)
+        if target_param is None and ".ffn.router.gate.weight" in out_key:
+            legacy_router_key = out_key.replace(
+                ".ffn.router.gate.weight",
+                ".ffn.router.router_weight",
+            )
+            target_param = param_map.get(legacy_router_key)
+            if target_param is not None:
+                if out_key not in legacy_remap_logged:
+                    print_fn(
+                        f"[nvfp4] Remapped legacy router key {out_key} -> {legacy_router_key}"
+                    )
+                    legacy_remap_logged.add(out_key)
+                out_key = legacy_router_key
+
         if target_param is None:
-            # Parameter not found in model — skip (might be pruned or renamed)
+            # Router weights are required for stable MoE routing. Do not
+            # silently continue with random-initialized router params.
+            if ".ffn.router." in out_key:
+                raise RuntimeError(
+                    f"[nvfp4] Missing router parameter for {out_key}. "
+                    "Checkpoint key mapping is incompatible with the current fused router."
+                )
+            # Non-router parameters may legitimately differ across model variants.
             print_fn(f"[nvfp4] WARNING: No model parameter for {out_key}, skipping GPU dequant")
             result[pk] = state_dict[pk]
             result[sk] = state_dict[sk]

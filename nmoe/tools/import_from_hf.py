@@ -164,7 +164,7 @@ def build_hf_to_nmoe_base_mapping(
 
         if is_moe_layer:
             # Router (BF16)
-            mapping[f"{hf}.mlp.gate.weight"] = f"{nm}.ffn.router.gate.weight"
+            mapping[f"{hf}.mlp.gate.weight"] = f"{nm}.ffn.router.router_weight"
             mapping[f"{hf}.mlp.gate.e_score_correction_bias"] = f"{nm}.ffn.router.bias"
 
             # Shared expert (NVFP4 triplets -- map base names)
