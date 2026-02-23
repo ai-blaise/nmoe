@@ -76,6 +76,7 @@ def _nvtx(tag: str):
 _USE_SDPA = os.getenv('NMOE_USE_FA4', '1') not in ('1', 'true', 'True')
 _REQUIRE_FLASHMLA = _env_flag("NMOE_REQUIRE_FLASHMLA", "1")
 _USE_FLASHMLA_VARLEN = _env_flag("NMOE_MLA_USE_FLASHMLA_VARLEN", "0")
+_USE_FLASHMLA_SM100_FWD = _env_flag("NMOE_MLA_USE_FLASHMLA_SM100_FWD", "0")
 _PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
 _VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
 _MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
@@ -411,9 +412,10 @@ def _mla_flashmla_uniform_forward(
 
 
 class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
-  """MLA attention using FA4 forward + FlashMLA backward.
+  """MLA attention using FA4 or FlashMLA-SM100 forward + FlashMLA backward.
 
-  Production path uses FA4+FlashMLA only; SDPA exists only as explicit debug fallback.
+  Production path uses CUDA kernels only (FA4 or FlashMLA-SM100 + FlashMLA backward);
+  SDPA exists only as explicit debug fallback.
   """
   @staticmethod
   def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softmax_scale: float) -> torch.Tensor:
@@ -448,21 +450,47 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
 
     cu = _get_uniform_cu(q.device, bsz, seqlen)
 
-    with _nvtx("attn/fa4_fwd"):
-      # Use m_block=128, n_block=64 for (d_qk=192, d_v=128) on SM100 (B200)
-      # The default n_block=128 triggers a TMEM layout mismatch in cute-dsl
-      out, lse = _flash_attn_fwd(
-          q_,
-          k_,
-          v_,
-          cu_seqlens_q=cu,
-          cu_seqlens_k=cu,
-          softmax_scale=float(softmax_scale),
-          causal=True,
-          return_lse=True,
-          m_block_size=128,
-          n_block_size=64,
+    if _USE_FLASHMLA_SM100_FWD:
+      _require(
+        hasattr(_flashmla, "dense_prefill_fwd"),
+        "NMOE_MLA_USE_FLASHMLA_SM100_FWD=1 requires nmoe.csrc.flashmla_sm100.dense_prefill_fwd; rebuild nmoe/csrc.",
       )
+      with _nvtx("attn/flashmla_sm100_fwd"):
+        # FlashMLA forward uses a fixed-size workspace scratch buffer.
+        fwd_workspace = _get_mla_workspace(q.device, 32 * 1024 * 1024)
+        out = torch.empty((total, n_heads, d_v), device=q.device, dtype=q_.dtype)
+        lse = torch.empty((total, n_heads), device=q.device, dtype=torch.float32)
+        _flashmla.dense_prefill_fwd(
+            fwd_workspace,
+            q_,
+            k_,
+            v_,
+            cu,
+            cu,
+            out,
+            lse,
+            1,  # causal
+            float(softmax_scale),
+            seqlen,
+            seqlen,
+            True,  # is_varlen
+        )
+    else:
+      with _nvtx("attn/fa4_fwd"):
+        # Use m_block=128, n_block=64 for (d_qk=192, d_v=128) on SM100 (B200)
+        # The default n_block=128 triggers a TMEM layout mismatch in cute-dsl
+        out, lse = _flash_attn_fwd(
+            q_,
+            k_,
+            v_,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            softmax_scale=float(softmax_scale),
+            causal=True,
+            return_lse=True,
+            m_block_size=128,
+            n_block_size=64,
+        )
     _require(out.shape == (total, n_heads, d_v),
              f"FA4 output shape mismatch: expected {(total, n_heads, d_v)}, got {tuple(out.shape)}.")
     _require(lse.ndim == 2, f"FA4 lse must be 2D, got shape={tuple(lse.shape)}.")
