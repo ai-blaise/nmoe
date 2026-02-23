@@ -47,6 +47,7 @@ _HAS_BF16_PREPARE_OFFS_PAD_HOST = bool(getattr(_C, "bf16_prepare_offs_pad_host_s
 _HAS_DEQUANT_FP8_TO_BF16_MMA_SF = hasattr(_C, "dequant_fp8_to_bf16_mma_sf")
 _HAS_DEQUANT_NVFP4_TO_BF16_MMA_SF = hasattr(_C, "dequant_nvfp4_to_bf16_mma_sf")
 _CT_NVFP4_TO_BF16_MAX_TRANSPOSE_MODE = int(getattr(_C, "ct_nvfp4_to_bf16_max_transpose_mode", 1))
+_FORCE_BF16_DISPATCH_META = _env_flag("NMOE_FORCE_BF16_DISPATCH_META", "0")
 _NULL_NVTX_CTX = nullcontext()
 
 
@@ -431,7 +432,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     mode = getattr(rdep, "_mode", "ipc")
     rdep_profile = str(getattr(rdep, "profile", "")).lower()
     use_dist_blockscaled_meta = bool(
-      is_dist and mode in ("ipc", "hybrid") and rdep_profile in ("fp8", "nvfp4")
+      is_dist and mode in ("ipc", "hybrid") and rdep_profile in ("fp8", "nvfp4") and not _FORCE_BF16_DISPATCH_META
     )
     nvfp4_mode_ok = bool(mode in {"ipc", "hybrid"})
     if rdep_profile == "nvfp4" and not nvfp4_mode_ok:

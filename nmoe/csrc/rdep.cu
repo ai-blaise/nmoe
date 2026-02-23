@@ -22,6 +22,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <type_traits>
 #include <vector>
 #include "swizzle.cuh"
@@ -44,6 +46,150 @@ constexpr int MAX_RANKS = 8;      // Max NVLink peers (like DeepEP)
 constexpr int BUFFER_ALIGNMENT = 128;  // DeepEP's NUM_BUFFER_ALIGNMENT_BYTES
 constexpr int BARRIER_TAG = 1024;      // DeepEP's FINISHED_SUM_TAG
 constexpr uint64_t TIMEOUT_CYCLES = 200000000000ull;  // ~100s at 2GHz
+
+__host__ __forceinline__ bool env_truthy(const char* value) {
+    if (value == nullptr || value[0] == '\0') return false;
+    return
+        value[0] == '1' ||
+        value[0] == 'y' || value[0] == 'Y' ||
+        value[0] == 't' || value[0] == 'T';
+}
+
+__host__ __forceinline__ bool rdep_barrier_trace_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = env_truthy(std::getenv("NMOE_RDEP_BARRIER_TRACE")) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+__host__ __forceinline__ int rdep_barrier_watchdog_ms() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* raw = std::getenv("NMOE_RDEP_BARRIER_WATCHDOG_MS");
+        int parsed = 0;
+        if (raw && raw[0] != '\0') {
+            parsed = std::atoi(raw);
+            if (parsed < 0) parsed = 0;
+        }
+        cached = parsed;
+    }
+    return cached;
+}
+
+__host__ __forceinline__ int rdep_env_global_rank() {
+    static bool initialized = false;
+    static int rank = -1;
+    if (!initialized) {
+        const char* raw = std::getenv("RANK");
+        rank = (raw && raw[0] != '\0') ? std::atoi(raw) : -1;
+        initialized = true;
+    }
+    return rank;
+}
+
+__host__ __forceinline__ void rdep_trace_barrier_launch(
+    const char* kind,
+    const char* site,
+    int ep_rank,
+    int world,
+    int phase) {
+    if (!rdep_barrier_trace_enabled()) return;
+    const int global_rank = rdep_env_global_rank();
+    fprintf(
+        stderr,
+        "RDEP TRACE barrier launch kind=%s site=%s global_rank=%d ep_rank=%d world=%d phase=%d\n",
+        kind,
+        site ? site : "-",
+        global_rank,
+        ep_rank,
+        world,
+        phase
+    );
+    fflush(stderr);
+}
+
+__host__ __forceinline__ void rdep_watch_barrier_completion(
+    cudaStream_t stream,
+    const char* kind,
+    const char* site,
+    int ep_rank,
+    int world,
+    int phase) {
+    const int timeout_ms = rdep_barrier_watchdog_ms();
+    if (timeout_ms <= 0) return;
+
+    cudaEvent_t done = nullptr;
+    cudaError_t create = cudaEventCreateWithFlags(&done, cudaEventDisableTiming);
+    if (create != cudaSuccess) {
+        fprintf(
+            stderr,
+            "RDEP ERROR: barrier watchdog create failed kind=%s site=%s err=%s\n",
+            kind,
+            site ? site : "-",
+            cudaGetErrorString(create)
+        );
+        (void)cudaGetLastError();
+        return;
+    }
+
+    cudaError_t rec = cudaEventRecord(done, stream);
+    if (rec != cudaSuccess) {
+        fprintf(
+            stderr,
+            "RDEP ERROR: barrier watchdog event record failed kind=%s site=%s err=%s\n",
+            kind,
+            site ? site : "-",
+            cudaGetErrorString(rec)
+        );
+        (void)cudaGetLastError();
+        (void)cudaEventDestroy(done);
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    while (true) {
+        cudaError_t q = cudaEventQuery(done);
+        if (q == cudaSuccess) break;
+        if (q != cudaErrorNotReady) {
+            fprintf(
+                stderr,
+                "RDEP ERROR: barrier watchdog query failed kind=%s site=%s err=%s\n",
+                kind,
+                site ? site : "-",
+                cudaGetErrorString(q)
+            );
+            (void)cudaGetLastError();
+            (void)cudaEventDestroy(done);
+            abort();
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (elapsed_ms > timeout_ms) {
+            const int global_rank = rdep_env_global_rank();
+            fprintf(
+                stderr,
+                "RDEP WATCHDOG timeout kind=%s site=%s global_rank=%d ep_rank=%d world=%d phase=%d timeout_ms=%d\n",
+                kind,
+                site ? site : "-",
+                global_rank,
+                ep_rank,
+                world,
+                phase,
+                timeout_ms
+            );
+            fflush(stderr);
+            (void)cudaEventDestroy(done);
+            abort();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    (void)cudaEventDestroy(done);
+}
 
 // ============================================================================
 // PTX Primitives - imported from ptx.cu
@@ -1345,7 +1491,7 @@ __host__ __forceinline__ void enforce_single_ipc_stream(
     }
 }
 
-__host__ __forceinline__ void ipc_barrier_bf16(cudaStream_t stream) {
+__host__ __forceinline__ void ipc_barrier_bf16_site(cudaStream_t stream, const char* site) {
     if (g_mode != MODE_IPC) return;
     if (g_bf16.world <= 1) return;
     if (!g_ipc_handles_opened) {
@@ -1354,15 +1500,21 @@ __host__ __forceinline__ void ipc_barrier_bf16(cudaStream_t stream) {
     }
     enforce_single_ipc_stream(g_ipc_stream_bf16, stream, "ipc_barrier_bf16");
     const int phase = g_ipc_phase_bf16.fetch_add(1, std::memory_order_relaxed) + 1;
+    rdep_trace_barrier_launch("bf16", site, g_bf16.rank, g_bf16.world, phase);
     k_ipc_barrier_phase_bf16<<<1, ipc_barrier_threads_cached(g_bf16.world), 0, stream>>>(phase);
     cudaError_t err = cudaPeekAtLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "RDEP FATAL: ipc_barrier_bf16 launch failed: %s\n", cudaGetErrorString(err));
         abort();
     }
+    rdep_watch_barrier_completion(stream, "bf16", site, g_bf16.rank, g_bf16.world, phase);
 }
 
-__host__ __forceinline__ void ipc_barrier_block(cudaStream_t stream) {
+__host__ __forceinline__ void ipc_barrier_bf16(cudaStream_t stream) {
+    ipc_barrier_bf16_site(stream, nullptr);
+}
+
+__host__ __forceinline__ void ipc_barrier_block_site(cudaStream_t stream, const char* site) {
     if (g_mode != MODE_IPC) return;
     if (g_block.world <= 1) return;
     if (!g_ipc_handles_opened) {
@@ -1371,12 +1523,18 @@ __host__ __forceinline__ void ipc_barrier_block(cudaStream_t stream) {
     }
     enforce_single_ipc_stream(g_ipc_stream_block, stream, "ipc_barrier_block");
     const int phase = g_ipc_phase_block.fetch_add(1, std::memory_order_relaxed) + 1;
+    rdep_trace_barrier_launch("block", site, g_block.rank, g_block.world, phase);
     k_ipc_barrier_phase_block<<<1, ipc_barrier_threads_cached(g_block.world), 0, stream>>>(phase);
     cudaError_t err = cudaPeekAtLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "RDEP FATAL: ipc_barrier_block launch failed: %s\n", cudaGetErrorString(err));
         abort();
     }
+    rdep_watch_barrier_completion(stream, "block", site, g_block.rank, g_block.world, phase);
+}
+
+__host__ __forceinline__ void ipc_barrier_block(cudaStream_t stream) {
+    ipc_barrier_block_site(stream, nullptr);
 }
 
 __host__ __forceinline__ void maybe_zero_tokslot_buffers(
@@ -3237,14 +3395,14 @@ static int dispatch_2phase_bf16(
     k_write_counts_to_dests_bf16<<<1, MAX_RANKS, 0, stream>>>(g_bf16.local_counters, recv_counts_off);
 
     // Barrier: ensure all counts are visible
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "dispatch_2phase_bf16/counts");
 
     // Phase 2: Compute prefix sums and exchange offsets
     k_compute_and_write_offsets_bf16<<<1, 32, 0, stream>>>(
         recv_counts_off, recv_offsets_off, counter_off);
 
     // Barrier: ensure all offsets are visible
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "dispatch_2phase_bf16/offsets");
     const int* local_counter = reinterpret_cast<const int*>(local_buf + counter_off);
     // Prime async D2H now; phase-3 dispatch/barrier latency overlaps this copy.
     (void)poll_device_int_async(local_counter, stream);
@@ -3265,7 +3423,7 @@ static int dispatch_2phase_bf16(
         meta_off, dropped_off, recv_offsets_off);
 
     // Barrier: ensure all data writes are visible
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "dispatch_2phase_bf16/writes");
 
     // Read M_recv (single int) produced by k_compute_and_write_offsets_bf16.
     if (recv_out_host == nullptr) {
@@ -3304,11 +3462,11 @@ static int dispatch_2phase_blockscaled(
         eids, M, g_block.n_local, g_block.local_counters);
 
     k_write_counts_to_dests_block<<<1, MAX_RANKS, 0, stream>>>(g_block.local_counters, recv_counts_off);
-    ipc_barrier_block(stream);
+    ipc_barrier_block_site(stream, "dispatch_2phase_blockscaled/counts");
 
     k_compute_and_write_offsets_block<<<1, 32, 0, stream>>>(
         recv_counts_off, recv_offsets_off, counter_off);
-    ipc_barrier_block(stream);
+    ipc_barrier_block_site(stream, "dispatch_2phase_blockscaled/offsets");
     const int* local_counter = reinterpret_cast<const int*>(local_buf + counter_off);
     // Prime async D2H now; phase-3 dispatch/barrier latency overlaps this copy.
     (void)poll_device_int_async(local_counter, stream);
@@ -3338,7 +3496,7 @@ static int dispatch_2phase_blockscaled(
         return -3;
     }
 
-    ipc_barrier_block(stream);
+    ipc_barrier_block_site(stream, "dispatch_2phase_blockscaled/writes");
 
     if (recv_out_host == nullptr) {
         fprintf(stderr, "RDEP ERROR: recv_out_host (host scratch) is null\n");
@@ -3442,7 +3600,7 @@ extern "C" int rdep_dispatch(
         // all ranks must reset their receive counters before any rank begins
         // remote atomicAdd() into those counters.
         if (g_bf16.world > 1) {
-            ipc_barrier_bf16(stream);
+            ipc_barrier_bf16_site(stream, "dispatch_meta_bf16/pre");
         }
 
         // Launch fused dispatch kernel (reads [T,H] directly)
@@ -3462,7 +3620,7 @@ extern "C" int rdep_dispatch(
         // IPC mode requires a global barrier to ensure all remote writes are
         // complete before reading the local counter and sorting.
 	        if (g_bf16.world > 1) {
-	            ipc_barrier_bf16(stream);
+	            ipc_barrier_bf16_site(stream, "dispatch_meta_bf16/post_dispatch");
 	        }
 	        const int* local_counter = reinterpret_cast<const int*>(local_buf + counter_off);
 	        if (M_pad_out == nullptr) {
@@ -3647,7 +3805,7 @@ extern "C" int rdep_dispatch_meta_blockscaled(
         cudaMemsetAsync(local_buf + counter_off, 0, sizeof(int), stream);
         cudaMemsetAsync(local_buf + dropped_off, 0, sizeof(int), stream);
         if (g_block.world > 1) {
-            ipc_barrier_block(stream);
+            ipc_barrier_block_site(stream, "dispatch_meta_blockscaled/pre");
         }
 
         int threads = 256;
@@ -3671,9 +3829,9 @@ extern "C" int rdep_dispatch_meta_blockscaled(
             return -3;
         }
 
-	        if (g_block.world > 1) {
-	            ipc_barrier_block(stream);
-	        }
+		        if (g_block.world > 1) {
+		            ipc_barrier_block_site(stream, "dispatch_meta_blockscaled/post_dispatch");
+		        }
 	        const int* local_counter = reinterpret_cast<const int*>(local_buf + counter_off);
 	        if (M_pad_out == nullptr) {
 	            fprintf(stderr, "RDEP ERROR: M_pad_out (host scratch) is null\n");
