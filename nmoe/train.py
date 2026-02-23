@@ -659,6 +659,9 @@ def train(cfg: Config):
 
   # Gradient accumulation configuration
   accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
+  step_heartbeat = _env_flag("NMOE_STEP_HEARTBEAT", "1")
+  if step_heartbeat and rank == 0:
+    logger.info("Step heartbeat enabled (NMOE_STEP_HEARTBEAT=1): per-micro-step stage markers will be printed")
   if accum_steps > 1 and rank == 0:
     logger.info("Gradient accumulation: %d micro-steps per optimizer step", accum_steps)
     logger.info("Effective batch size: %d (micro_batch=%d x %d)", cfg.batch_size, cfg.batch_size // accum_steps, accum_steps)
@@ -764,6 +767,8 @@ def train(cfg: Config):
               inputs, targets = loader.next()
               loss_mask = None
 
+          if step_heartbeat and rank == 0:
+            print(f"[HB] step={step_num} micro={micro_step} stage=fwd_start", flush=True)
           nan_debug_scope = (
             nan_debug_enabled
             and step_num == nan_debug_step
@@ -792,6 +797,8 @@ def train(cfg: Config):
                   f"[NANDBG][rank={rank}] forward failed at step={step_num}, micro={micro_step}: {e}"
                 ) from e
               raise
+          if step_heartbeat and rank == 0:
+            print(f"[HB] step={step_num} micro={micro_step} stage=fwd_done", flush=True)
 
           if nan_debug_scope:
             numel, finite, nan, inf = _tensor_finite_stats(logits)
@@ -847,6 +854,8 @@ def train(cfg: Config):
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
+          if step_heartbeat and rank == 0:
+            print(f"[HB] step={step_num} micro={micro_step} stage=loss_done", flush=True)
 
           # Fail-fast on non-finite loss before backward. With fused ECO enabled,
           # expert optimizer updates happen inside backward, so we must abort first.
@@ -877,8 +886,12 @@ def train(cfg: Config):
             fused_eco.set_lr(lr_expert)
             fused_eco.set_microstep(micro_step, accum_steps)
             fused_eco.pre_backward(step_num)
+          if step_heartbeat and rank == 0:
+            print(f"[HB] step={step_num} micro={micro_step} stage=bwd_start", flush=True)
           with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
             loss.backward()
+          if step_heartbeat and rank == 0:
+            print(f"[HB] step={step_num} micro={micro_step} stage=bwd_done", flush=True)
           if fused_eco is not None and fused_eco.is_final_microstep:
             # Drain async ECO comm/update queue only once per optimizer step.
             # Non-final micro-steps only accumulate optimizer state (no weight update),
@@ -931,6 +944,8 @@ def train(cfg: Config):
         last_loss = (accumulated_loss_gpu / loss_scale).detach()
 
         s = step_num + 1
+        if step_heartbeat and rank == 0:
+          print(f"[HB] step={step_num} stage=opt_done", flush=True)
         log_training_step(
           s,
           model=model,
