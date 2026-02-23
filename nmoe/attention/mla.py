@@ -370,7 +370,7 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     # Hard requirement: do not proceed without FA4 forward + FlashMLA backward.
     # Environment contract: `third_party/flash_attn` is on PYTHONPATH (so
     # `flash_attn.cute` is importable), and `nmoe.csrc.flashmla_sm100` is built.
-    _flash_attn_fwd, _flashmla = _get_fa4_flashmla_modules()
+    _flash_attn_fwd, _flashmla = get_fa4_flashmla_modules()
 
     total = bsz * seqlen
     q_ = q.reshape(total, n_heads, d_qk).contiguous()
