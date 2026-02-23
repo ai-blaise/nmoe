@@ -373,6 +373,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       Ye_pad = expert_blockscaled(Xe_q, Xe_sf, W_cache, offs_pad, capacity_rows=int(rdep.capacity))
 
     with _nvtx("moe_bs/fwd_combine"):
+      _require_contiguous(Ye_pad, "Ye_pad", dtype=torch.bfloat16)
       _C.return_scatter_from_pad_blockscaled(
         Ye_pad.data_ptr(),
         out_f32.data_ptr(),
@@ -576,14 +577,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     if not _nvfp4_stagger:
       W1, W3, W2 = _W1, _W3, _W2
 
-    # Compute max_pad and extend last expert's padded region
-    max_pad = (int(M_recv) + E * (align - 1) + (align - 1)) // align * align
+    # Keep backward padding bound in lockstep with dispatch_meta_{bf16,blockscaled}
+    # so blockscaled SF swizzle never sees a non-128-aligned M_pad.
+    max_pad = ((int(M_recv) + E * (align - 1)) // align) * align
     max_pad_limit = int(rdep.capacity) + E * (align - 1)
-    if max_pad > max_pad_limit:
-      max_pad = max_pad_limit
-    if max_pad < int(M_recv):
+    if max_pad < int(M_recv) or max_pad > max_pad_limit or (max_pad % align) != 0:
       raise RuntimeError(
-        f"Invalid max_pad={max_pad} < M_recv={int(M_recv)} for backward gather path."
+        f"Invalid max_pad={max_pad} for backward gather path "
+        f"(M_recv={int(M_recv)}, align={align}, limit={max_pad_limit})."
       )
     offs_pad[-1] = int(max_pad)
     _require_contiguous(offs_pad, "offs_pad", dtype=torch.int32)
@@ -862,6 +863,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
     with _nvtx("moe_bs/bwd_input_grad"):
       dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
+      _require_contiguous(dX_pad, "dX_pad", dtype=torch.bfloat16)
       if is_dist:
         if mode in ("ipc", "hybrid"):
           _C.scatter_dx_dist_from_pad_bf16(

@@ -3655,6 +3655,12 @@ extern "C" void rdep_gather_xe_blockscaled(
             fprintf(stderr, "RDEP FATAL: NVSHMEM not initialized for hybrid mode\n");
             abort();
         }
+        if (M_recv > 0 && (M_pad % nvshmem::g_nvshmem.align) != 0) {
+            fprintf(stderr,
+                    "RDEP FATAL: gather_xe_blockscaled requires M_pad aligned to %d (got M_pad=%d)\n",
+                    nvshmem::g_nvshmem.align, M_pad);
+            abort();
+        }
         nvshmem::gather_xe_hybrid_blockscaled(
             Xe_q_out,
             Xe_sf_out,
@@ -3670,6 +3676,18 @@ extern "C" void rdep_gather_xe_blockscaled(
         abort();
     }
     if (M_recv <= 0 || M_pad <= 0) return;
+    if ((M_pad % g_block.align) != 0) {
+        fprintf(stderr,
+                "RDEP FATAL: gather_xe_blockscaled requires M_pad aligned to %d (got M_pad=%d)\n",
+                g_block.align, M_pad);
+        abort();
+    }
+    if (M_pad < M_recv) {
+        fprintf(stderr,
+                "RDEP FATAL: gather_xe_blockscaled requires M_pad >= M_recv (M_pad=%d M_recv=%d)\n",
+                M_pad, M_recv);
+        abort();
+    }
     const int capacity = static_cast<int>(g_block.capacity);
     if (M_recv > capacity) {
         fprintf(stderr, "RDEP FATAL: gather_xe_blockscaled M_recv=%d exceeds capacity=%d\n", M_recv, capacity);
@@ -4411,7 +4429,7 @@ __global__ void k_return_write_tokslot_from_pad_bf16(
     const int* __restrict__ order,                 // [M_recv] sorted_i -> orig_i
     const Meta* __restrict__ meta_buf,             // [capacity]
     int M_recv, int H, int Ha, int T, int K,
-    int world, int capacity,
+    int world, int capacity, int M_pad_cap,
     size_t tok_y_off, size_t tok_gate_off)
 {
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -4439,7 +4457,7 @@ __global__ void k_return_write_tokslot_from_pad_bf16(
         if (tok < 0 || tok >= T || slot < 0 || slot >= K) continue;
 
         const int pad_i = dest[sorted_i];
-        if (pad_i < 0) continue;
+        if (pad_i < 0 || pad_i >= M_pad_cap) continue;
 
         const int64_t idx = (int64_t)tok * K + slot;
         char* dst_buf = static_cast<char*>(d_buffer_ptrs_bf16[src_rank]);
@@ -4470,7 +4488,7 @@ __global__ void k_return_write_tokslot_from_pad_blockscaled(
     const int* __restrict__ order,                 // [M_recv] sorted_i -> orig_i
     const Meta* __restrict__ meta_buf,             // [capacity]
     int M_recv, int H, int Ha, int T, int K,
-    int world, int capacity,
+    int world, int capacity, int M_pad_cap,
     size_t tok_y_off, size_t tok_gate_off)
 {
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -4498,7 +4516,7 @@ __global__ void k_return_write_tokslot_from_pad_blockscaled(
         if (tok < 0 || tok >= T || slot < 0 || slot >= K) continue;
 
         const int pad_i = dest[sorted_i];
-        if (pad_i < 0) continue;
+        if (pad_i < 0 || pad_i >= M_pad_cap) continue;
 
         const int64_t idx = (int64_t)tok * K + slot;
         char* dst_buf = static_cast<char*>(d_buffer_ptrs_block[src_rank]);
@@ -4530,7 +4548,8 @@ __global__ void k_return_scatter_from_pad_atomic(
     const Meta* __restrict__ meta_buf,         // [capacity]
     float* __restrict__ out,                   // [T, H]
     int M_recv, int H, int T, int K,
-    int capacity)
+    int capacity,
+    int M_pad_cap)
 {
     int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     int lane = threadIdx.x % 32;
@@ -4555,7 +4574,7 @@ __global__ void k_return_scatter_from_pad_atomic(
         if (tok < 0 || tok >= T || slot < 0 || slot >= K) continue;
 
         const int pad_i = dest[sorted_i];
-        if (pad_i < 0) continue;
+        if (pad_i < 0 || pad_i >= M_pad_cap) continue;
 
         const uint16_t* y_u16 = reinterpret_cast<const uint16_t*>(Ye_pad + (int64_t)pad_i * H);
         float* out_row = out + (int64_t)tok * H;
@@ -4734,7 +4753,7 @@ __global__ void k_send_dx_tokslot_from_pad_bf16(
     const int* __restrict__ dest,
     const int64_t* __restrict__ row_id,
     int M, int T, int H, int Ha, int K,
-    int world,
+    int world, int M_pad_cap,
     size_t tok_y_off,
     size_t tok_gate_off)
 {
@@ -4753,6 +4772,7 @@ __global__ void k_send_dx_tokslot_from_pad_bf16(
         if (tok < 0 || tok >= T || slot < 0 || slot >= K) continue;
 
         const int pad_i = dest[i];
+        if (pad_i < 0 || pad_i >= M_pad_cap) continue;
         const int64_t idx = (int64_t)tok * K + slot;
         char* dst_buf = static_cast<char*>(d_buffer_ptrs_bf16[src_rank]);
         uint16_t* tok_y = reinterpret_cast<uint16_t*>(dst_buf + tok_y_off);
@@ -4778,7 +4798,7 @@ __global__ void k_send_dx_tokslot_from_pad_blockscaled(
     const int* __restrict__ dest,
     const int64_t* __restrict__ row_id,
     int M, int T, int H, int Ha, int K,
-    int world,
+    int world, int M_pad_cap,
     size_t tok_y_off,
     size_t tok_gate_off)
 {
@@ -4797,6 +4817,7 @@ __global__ void k_send_dx_tokslot_from_pad_blockscaled(
         if (tok < 0 || tok >= T || slot < 0 || slot >= K) continue;
 
         const int pad_i = dest[i];
+        if (pad_i < 0 || pad_i >= M_pad_cap) continue;
         const int64_t idx = (int64_t)tok * K + slot;
         char* dst_buf = static_cast<char*>(d_buffer_ptrs_block[src_rank]);
         uint16_t* tok_y = reinterpret_cast<uint16_t*>(dst_buf + tok_y_off);
@@ -5036,6 +5057,13 @@ extern "C" void rdep_return_scatter_from_pad_bf16(
                         &barrier_off, &buf_ptrs_off, &sig_ptrs_off,
                         &tok_y_off, &tok_gate_off,
                         &total_size);
+    const int capacity = static_cast<int>(g_bf16.capacity);
+    if (M_recv < 0 || M_recv > capacity) {
+        fprintf(stderr,
+                "RDEP FATAL: rdep_return_scatter_from_pad_bf16 requires 0 <= M_recv <= capacity (M_recv=%d capacity=%d)\n",
+                M_recv, capacity);
+        abort();
+    }
 
     char* local_buf = static_cast<char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
     Meta* meta_buf = reinterpret_cast<Meta*>(local_buf + meta_off);
@@ -5044,6 +5072,7 @@ extern "C" void rdep_return_scatter_from_pad_bf16(
     if (g_mode == MODE_IPC && g_bf16.world > 1) {
         const int H = g_bf16.H;
         const int Ha = g_bf16.Ha;
+        const int M_pad_cap = static_cast<int>(g_bf16.capacity + g_bf16.n_local * (g_bf16.align - 1));
         const int tok_slots = T * K;
         const size_t tok_cap = g_bf16.capacity / static_cast<size_t>(g_bf16.world);
         if (static_cast<size_t>(tok_slots) > tok_cap) {
@@ -5071,7 +5100,7 @@ extern "C" void rdep_return_scatter_from_pad_bf16(
                 g_bf16.order,
                 meta_buf,
                 M_recv, H, Ha, T, K,
-                g_bf16.world, static_cast<int>(g_bf16.capacity),
+                g_bf16.world, capacity, M_pad_cap,
                 tok_y_off, tok_gate_off);
         }
 
@@ -5102,7 +5131,8 @@ extern "C" void rdep_return_scatter_from_pad_bf16(
         meta_buf,
         static_cast<float*>(out),
         M_recv, g_bf16.H, T, K,
-        static_cast<int>(g_bf16.capacity));
+        capacity,
+        static_cast<int>(g_bf16.capacity + g_bf16.n_local * (g_bf16.align - 1)));
 }
 
 extern "C" void rdep_return_scatter_from_pad_blockscaled(
@@ -5139,6 +5169,13 @@ extern "C" void rdep_return_scatter_from_pad_blockscaled(
                                &barrier_off, &buf_ptrs_off, &sig_ptrs_off,
                                &tok_y_off, &tok_gate_off,
                                &total_size);
+    const int capacity = static_cast<int>(g_block.capacity);
+    if (M_recv < 0 || M_recv > capacity) {
+        fprintf(stderr,
+                "RDEP FATAL: rdep_return_scatter_from_pad_blockscaled requires 0 <= M_recv <= capacity (M_recv=%d capacity=%d)\n",
+                M_recv, capacity);
+        abort();
+    }
 
     char* local_buf = static_cast<char*>(g_block.buffer_ptrs[g_block.rank]);
     Meta* meta_buf = reinterpret_cast<Meta*>(local_buf + meta_off);
@@ -5147,6 +5184,7 @@ extern "C" void rdep_return_scatter_from_pad_blockscaled(
     if (g_mode == MODE_IPC && g_block.world > 1) {
         const int H = g_block.H;
         const int Ha = g_block.Ha;
+        const int M_pad_cap = static_cast<int>(g_block.capacity + g_block.n_local * (g_block.align - 1));
         const int tok_slots = T * K;
         const size_t tok_cap = g_block.capacity / static_cast<size_t>(g_block.world);
         if (static_cast<size_t>(tok_slots) > tok_cap) {
@@ -5174,7 +5212,7 @@ extern "C" void rdep_return_scatter_from_pad_blockscaled(
                 g_block.order,
                 meta_buf,
                 M_recv, H, Ha, T, K,
-                g_block.world, static_cast<int>(g_block.capacity),
+                g_block.world, capacity, M_pad_cap,
                 tok_y_off, tok_gate_off);
         }
 
@@ -5205,7 +5243,8 @@ extern "C" void rdep_return_scatter_from_pad_blockscaled(
         meta_buf,
         static_cast<float*>(out),
         M_recv, g_block.H, T, K,
-        static_cast<int>(g_block.capacity));
+        capacity,
+        static_cast<int>(g_block.capacity + g_block.n_local * (g_block.align - 1)));
 }
 
 __global__ void k_gather_dy_bf16(
@@ -6893,6 +6932,12 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                     H, g_bf16.H);
             abort();
         }
+        if (M < 0 || M > static_cast<int>(g_bf16.capacity)) {
+            fprintf(stderr,
+                    "RDEP FATAL: BF16 scatter_dx_dist_from_pad_bf16 requires 0 <= M <= capacity (M=%d capacity=%zu)\n",
+                    M, g_bf16.capacity);
+            abort();
+        }
         if (g_bf16.world > MAX_RANKS) {
             fprintf(stderr, "RDEP ERROR: world=%d exceeds MAX_RANKS=%d\n", g_bf16.world, MAX_RANKS);
             abort();
@@ -6905,6 +6950,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                             &total_size);
 
         const int Ha = g_bf16.Ha;
+        const int M_pad_cap = static_cast<int>(g_bf16.capacity + g_bf16.n_local * (g_bf16.align - 1));
         const int tok_slots = T * K;
         const size_t tok_cap = g_bf16.capacity / static_cast<size_t>(g_bf16.world);
         if (static_cast<size_t>(tok_slots) > tok_cap) {
@@ -6940,7 +6986,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                 g_bf16.dest,
                 row_id,
                 M, T, H, Ha, K,
-                g_bf16.world,
+                g_bf16.world, M_pad_cap,
                 tok_y_off,
                 tok_gate_off);
         }
@@ -6967,6 +7013,12 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                     H, g_block.H);
             abort();
         }
+        if (M < 0 || M > static_cast<int>(g_block.capacity)) {
+            fprintf(stderr,
+                    "RDEP FATAL: blockscaled scatter_dx_dist_from_pad_bf16 requires 0 <= M <= capacity (M=%d capacity=%zu)\n",
+                    M, g_block.capacity);
+            abort();
+        }
         if (g_block.world > MAX_RANKS) {
             fprintf(stderr, "RDEP ERROR: world=%d exceeds MAX_RANKS=%d\n", g_block.world, MAX_RANKS);
             abort();
@@ -6980,6 +7032,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                                    &total_size);
 
         const int Ha = g_block.Ha;
+        const int M_pad_cap = static_cast<int>(g_block.capacity + g_block.n_local * (g_block.align - 1));
         const int tok_slots = T * K;
         const size_t tok_cap = g_block.capacity / static_cast<size_t>(g_block.world);
         if (static_cast<size_t>(tok_slots) > tok_cap) {
@@ -7007,7 +7060,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                 g_block.dest,
                 row_id,
                 M, T, H, Ha, K,
-                g_block.world,
+                g_block.world, M_pad_cap,
                 tok_y_off,
                 tok_gate_off);
         }

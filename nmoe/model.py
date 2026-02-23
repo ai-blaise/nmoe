@@ -321,6 +321,12 @@ class MoE(nn.Module):
     self._use_fused_router = True
     self.aux_loss_alpha = getattr(cfg, 'aux_loss_alpha', 0.0)
     self._aux_loss_enabled = float(self.aux_loss_alpha) > 0.0
+    # Non-reentrant activation checkpointing requires checkpointed forward
+    # functions to avoid grad-carrying side-effect tensors.
+    # `last_aux_loss` is stored as module state (not returned by forward), so
+    # keep it detached when checkpointing is enabled to preserve graph parity
+    # between original forward and recomputation.
+    self._aux_loss_detached_for_checkpoint = bool(getattr(cfg, 'gradient_checkpointing', False))
     self._track_expert_loads = float(getattr(cfg, "router_bias_update_rate", 0.0)) > 0.0
 
     # Use fused Triton kernel for router + TopK + dispatch metadata.
@@ -550,7 +556,11 @@ class MoE(nn.Module):
 
     with _nvtx("moe/aux_loss"):
       if self._aux_loss_enabled:
-        self.last_aux_loss = self._compute_aux_loss(g, eid, T)
+        if self._aux_loss_detached_for_checkpoint:
+          with torch.no_grad():
+            self.last_aux_loss = self._compute_aux_loss(g.detach(), eid, T)
+        else:
+          self.last_aux_loss = self._compute_aux_loss(g, eid, T)
       else:
         self.last_aux_loss = None
       if self._track_expert_loads:

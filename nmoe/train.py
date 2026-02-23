@@ -108,17 +108,21 @@ def _register_nan_debug_hooks(model: torch.nn.Module):
       if not _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0"):
         return
       rank = int(os.getenv("RANK", "0"))
-      for idx, tensor in enumerate(_iter_tensors(output)):
-        if not (torch.is_tensor(tensor) and (tensor.is_floating_point() or tensor.is_complex())):
-          continue
-        if torch.isfinite(tensor).all():
-          continue
-        numel, finite, nan, inf = _tensor_finite_stats(tensor)
-        raise RuntimeError(
-          f"[NANDBG][rank={rank}] first failing module={name}[{idx}] "
-          f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-          f"finite={finite}/{numel} nan={nan} inf={inf}"
-        )
+      # Keep hook diagnostics out of autograd graph so checkpoint recomputation
+      # sees identical saved-tensor structure.
+      with torch.no_grad():
+        for idx, tensor in enumerate(_iter_tensors(output)):
+          if not (torch.is_tensor(tensor) and (tensor.is_floating_point() or tensor.is_complex())):
+            continue
+          t = tensor.detach()
+          if torch.isfinite(t).all():
+            continue
+          numel, finite, nan, inf = _tensor_finite_stats(t)
+          raise RuntimeError(
+            f"[NANDBG][rank={rank}] first failing module={name}[{idx}] "
+            f"shape={tuple(t.shape)} dtype={t.dtype} "
+            f"finite={finite}/{numel} nan={nan} inf={inf}"
+          )
     return _fn
 
   # Coarse and fine hooks: block outputs + attention/MoE submodule outputs.
