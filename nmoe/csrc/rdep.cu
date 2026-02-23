@@ -3632,7 +3632,11 @@ extern "C" int rdep_dispatch_meta_blockscaled(
     int capacity = static_cast<int>(g_block.capacity);
 
     int M_recv = 0;
-    if (k_use_2phase_dispatch && g_block.world > 1) {
+    // Backward dispatch-meta is latency-sensitive but correctness-critical.
+    // Keep it on the direct single-phase IPC path to avoid 2-phase barrier
+    // ordering deadlocks under large distributed autograd graphs.
+    constexpr bool k_use_2phase_dispatch_meta_blockscaled = false;
+    if (k_use_2phase_dispatch_meta_blockscaled && k_use_2phase_dispatch && g_block.world > 1) {
         M_recv = dispatch_2phase_blockscaled(
             static_cast<const __nv_bfloat16*>(x), eids, gates,
             T, K, M,
