@@ -75,6 +75,7 @@ def _nvtx(tag: str):
 # Production default is FlashMLA/FA4 only. SDPA is explicit debug fallback.
 _USE_SDPA = os.getenv('NMOE_USE_FA4', '1') not in ('1', 'true', 'True')
 _REQUIRE_FLASHMLA = _env_flag("NMOE_REQUIRE_FLASHMLA", "1")
+_USE_FA4_FORWARD = _env_flag("NMOE_MLA_USE_FA4_FORWARD", "0")
 _PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
 _VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
 _MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
@@ -372,6 +373,42 @@ def _mla_flashmla_packed_forward(
   return out
 
 
+def _mla_flashmla_uniform_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+  """FlashMLA forward for non-packed causal attention (uniform sequence lengths)."""
+  from flash_mla import flash_attn_varlen_func
+
+  bsz, seqlen, n_heads, d_qk = q.shape
+  d_v = v.shape[-1]
+  total = bsz * seqlen
+  q_ = q.reshape(total, n_heads, d_qk).contiguous()
+  k_ = k.reshape(total, n_heads, d_qk).contiguous()
+  v_ = v.reshape(total, n_heads, d_v).contiguous()
+  _require_finite("flashmla_uniform.q", q_)
+  _require_finite("flashmla_uniform.k", k_)
+  _require_finite("flashmla_uniform.v", v_)
+
+  cu = _get_uniform_cu(q.device, bsz, seqlen)
+  out, _ = flash_attn_varlen_func(
+      q_,
+      k_,
+      v_,
+      cu_seqlens_qo=cu,
+      cu_seqlens_kv=cu,
+      max_seqlen_qo=int(seqlen),
+      max_seqlen_kv=int(seqlen),
+      causal=True,
+      softmax_scale=softmax_scale,
+      is_varlen=True,
+  )
+  _require_finite("flashmla_uniform.out", out)
+  return out.reshape(bsz, seqlen, n_heads, d_v)
+
+
 class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
   """MLA attention using FA4 forward + FlashMLA backward.
 
@@ -592,7 +629,15 @@ class MLA(nn.Module):
             "Set NMOE_USE_FA4=1 to force FA4+FlashMLA path."
           )
         else:
-          output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
+          if _USE_FA4_FORWARD:
+            output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
+          else:
+            if not _FLASHMLA_VARLEN_AVAILABLE:
+              raise RuntimeError(
+                "FlashMLA varlen kernel is unavailable for non-packed MLA "
+                f"({_FLASHMLA_VARLEN_ERR})."
+              )
+            output = _mla_flashmla_uniform_forward(q, k, v, self.softmax_scale)
     output = output.reshape(bsz, seqlen, self.n_heads * self.v_head_dim)
     _require_finite("mla.out_attn", output)
     out = self.wo(output)
