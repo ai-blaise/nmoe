@@ -2523,8 +2523,28 @@ def load_checkpoint(
 
     eco_fused = getattr(cfg, 'eco_fused_backward', False)
     if getattr(cfg, 'resume', True):
-        local_step, _ = checkpointer.find_latest()
-        step = _consensus_resume_step(local_step)
+        resume_step = int(getattr(cfg, 'resume_step', -1))
+        if resume_step >= 0:
+            step = resume_step
+            has_local = 1 if checkpointer.path_for_step(step) is not None else 0
+            if _is_dist():
+                device = (
+                    torch.device("cuda", torch.cuda.current_device())
+                    if torch.cuda.is_available()
+                    else torch.device("cpu")
+                )
+                has_tensor = torch.tensor([has_local], device=device, dtype=torch.int64)
+                dist.all_reduce(has_tensor, op=dist.ReduceOp.MIN)
+                has_local = int(has_tensor.item())
+            if has_local != 1:
+                raise FileNotFoundError(
+                    f"Forced resume_step={step} requested, but checkpoint shard is missing on one or more ranks."
+                )
+            if rank == 0:
+                print_fn(f"[checkpoint] Using forced resume_step={step}")
+        else:
+            local_step, _ = checkpointer.find_latest()
+            step = _consensus_resume_step(local_step)
         path = checkpointer.path_for_step(step) if step >= 0 else None
         if step >= 0 and path is None:
             raise FileNotFoundError(

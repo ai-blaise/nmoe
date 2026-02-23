@@ -114,6 +114,7 @@ class Config:
   checkpoint_every: int = 1000
   checkpoint_keep_last_n: int = 3
   resume: bool = True
+  resume_step: int = -1  # -1: latest common step, >=0: force exact step
 
   # =============================================================================
   # Data

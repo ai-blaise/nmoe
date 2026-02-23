@@ -115,6 +115,7 @@ batch_size = 64                   # Global batch size — reduced from 128 to pr
 seq_len = 1024                   # Reduced from 2048 to further reduce activation memory (OOM fix)
 gradient_accumulation_steps = 4  # 64 global / 16 DP / 4 accum = 1 micro-batch per GPU
 resume = true
+resume_step = 0                  # Force clean import checkpoint (iter_0000000); avoid unstable latest local step drift
 grad_clip = 1.0
 log_every = 1                    # Log every step (default=10 is too coarse for short runs)
 
