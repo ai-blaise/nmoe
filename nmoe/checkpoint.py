@@ -2662,6 +2662,13 @@ def load_checkpoint(
             print_fn(f"[checkpoint] No checkpoint found at {checkpointer.base}")
             if eco_fused:
                 print_fn(f"[checkpoint] WARNING: eco_fused_backward=True requires a valid NVFP4 checkpoint!")
+        if path is None:
+            run_dtype = str(getattr(cfg, 'dtype', 'bf16') or 'bf16').lower()
+            if run_dtype == 'nvfp4':
+                raise FileNotFoundError(
+                    "dtype=nvfp4 requires a valid imported checkpoint shard on every rank, "
+                    f"but no checkpoint was found under {checkpointer.base}."
+                )
     elif rank == 0:
         print_fn(f"[checkpoint] resume=False, starting fresh")
 

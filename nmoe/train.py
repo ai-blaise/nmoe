@@ -387,6 +387,12 @@ def train(cfg: Config):
   # in log files (Python defaults to block-buffering when stdout is redirected)
   sys.stdout.reconfigure(line_buffering=True)
   _validate_required_cuda_bindings(cfg)
+  run_dtype = str(getattr(cfg, 'dtype', 'bf16') or 'bf16').lower()
+  if run_dtype == 'nvfp4' and not bool(getattr(cfg, 'resume', True)):
+    raise RuntimeError(
+      "dtype=nvfp4 requires resume=true with an imported NVFP4 checkpoint "
+      "(no scratch/no BF16 fallback path)."
+    )
 
   ep_size = getattr(cfg, 'ep_size', 1)
   rank, world = runtime.init(cfg.seed, ep_size=ep_size)
@@ -854,8 +860,15 @@ def train(cfg: Config):
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
+          micro_loss_unscaled = float(
+            (loss.detach() * (accum_steps if accum_steps > 1 else 1)).item()
+          )
           if step_heartbeat and rank == 0:
-            print(f"[HB] step={step_num} micro={micro_step} stage=loss_done", flush=True)
+            print(
+              f"[HB] step={step_num} micro={micro_step} stage=loss_done "
+              f"loss={micro_loss_unscaled:.6f}",
+              flush=True,
+            )
 
           # Fail-fast on non-finite loss before backward. With fused ECO enabled,
           # expert optimizer updates happen inside backward, so we must abort first.
