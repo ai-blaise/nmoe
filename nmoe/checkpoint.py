@@ -35,6 +35,11 @@ def _is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def _allow_config_fingerprint_mismatch() -> bool:
+    raw = os.getenv("NMOE_ALLOW_CONFIG_FINGERPRINT_MISMATCH", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _rank() -> int:
     return dist.get_rank() if _is_dist() else 0
 
@@ -1838,10 +1843,17 @@ def load_state(
             from nmoe.config import fingerprint as _fingerprint
             current_fp = _fingerprint(getattr(model, 'config', None))
             if current_fp and saved_fp != current_fp:
-                raise RuntimeError(
-                    f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
-                    "Refusing to resume with a different config."
-                )
+                if _allow_config_fingerprint_mismatch():
+                    print_fn(
+                        "[checkpoint] WARNING: config_fingerprint mismatch on resume "
+                        f"(saved={saved_fp[:8]} current={current_fp[:8]}), "
+                        "continuing because NMOE_ALLOW_CONFIG_FINGERPRINT_MISMATCH=1"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
+                        "Refusing to resume with a different config."
+                    )
         except RuntimeError:
             raise
         except Exception:
@@ -2024,10 +2036,17 @@ def load_state_with_ep_check(
             from nmoe.config import fingerprint as _fingerprint
             current_fp = _fingerprint(getattr(model, 'config', None))
             if current_fp and saved_fp != current_fp:
-                raise RuntimeError(
-                    f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
-                    "Refusing to resume with a different config."
-                )
+                if _allow_config_fingerprint_mismatch():
+                    print_fn(
+                        "[checkpoint] WARNING: config_fingerprint mismatch on resume "
+                        f"(saved={saved_fp[:8]} current={current_fp[:8]}), "
+                        "continuing because NMOE_ALLOW_CONFIG_FINGERPRINT_MISMATCH=1"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
+                        "Refusing to resume with a different config."
+                    )
         except RuntimeError:
             raise
         except Exception:
@@ -2289,10 +2308,17 @@ def load_with_resharding(
             from nmoe.config import fingerprint as _fingerprint
             current_fp = _fingerprint(getattr(model, 'config', None))
             if current_fp and saved_fp != current_fp:
-                raise RuntimeError(
-                    f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
-                    "Refusing to resume with a different config."
-                )
+                if _allow_config_fingerprint_mismatch():
+                    print_fn(
+                        "[checkpoint] WARNING: config_fingerprint mismatch on resume "
+                        f"(saved={saved_fp[:8]} current={current_fp[:8]}), "
+                        "continuing because NMOE_ALLOW_CONFIG_FINGERPRINT_MISMATCH=1"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"config_fingerprint mismatch on resume (saved={saved_fp[:8]} current={current_fp[:8]}). "
+                        "Refusing to resume with a different config."
+                    )
         except RuntimeError:
             raise
         except Exception:
