@@ -33,6 +33,7 @@ _NVTX_ENABLED = (
 )
 _VALIDATE_CU_SEQLENS = _env_flag("NMOE_VALIDATE_CU_SEQLENS", "0")
 _ROUTER_LOADS_EP_ALLREDUCE = _env_flag("NMOE_ROUTER_LOADS_EP_ALLREDUCE", "0")
+_COMPILE_RESIDUAL_ATTN = _env_flag("NMOE_COMPILE_RESIDUAL_ATTN", "0")
 _COMPILE_RESIDUAL_FFN = _env_flag("NMOE_COMPILE_RESIDUAL_FFN", "0")
 _NULL_NVTX_CTX = nullcontext()
 
@@ -59,20 +60,34 @@ def _nvtx(tag: str):
 
 def _make_fused_residual_attn():
     """Create compiled fused residual + attention function."""
-    @torch.compile(fullgraph=False, dynamic=True)
-    def _fused_residual_attn(x, normed_x, attn, cos, sin):
+    def _fused_residual_attn_eager(x, normed_x, attn, cos, sin):
         # x: residual input, normed_x: pre-computed RMSNorm(x)
-        # Compiler fuses: attn output + residual add into single kernel
         return x + attn(normed_x, cos, sin)
-    return _fused_residual_attn
+
+    if not _COMPILE_RESIDUAL_ATTN:
+        return _fused_residual_attn_eager
+
+    @torch.compile(fullgraph=False, dynamic=True)
+    def _fused_residual_attn_compiled(x, normed_x, attn, cos, sin):
+        # Compiler fuses: attn output + residual add into single kernel.
+        return x + attn(normed_x, cos, sin)
+
+    return _fused_residual_attn_compiled
 
 
 def _make_fused_residual_attn_cu():
     """Create compiled fused residual + attention function with cu_seqlens."""
-    @torch.compile(fullgraph=False, dynamic=True)
-    def _fused_residual_attn_cu(x, normed_x, attn, cos, sin, cu_seqlens):
+    def _fused_residual_attn_cu_eager(x, normed_x, attn, cos, sin, cu_seqlens):
         return x + attn(normed_x, cos, sin, cu_seqlens=cu_seqlens)
-    return _fused_residual_attn_cu
+
+    if not _COMPILE_RESIDUAL_ATTN:
+        return _fused_residual_attn_cu_eager
+
+    @torch.compile(fullgraph=False, dynamic=True)
+    def _fused_residual_attn_cu_compiled(x, normed_x, attn, cos, sin, cu_seqlens):
+        return x + attn(normed_x, cos, sin, cu_seqlens=cu_seqlens)
+
+    return _fused_residual_attn_cu_compiled
 
 
 def _make_fused_residual_ffn():
