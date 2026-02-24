@@ -151,6 +151,9 @@ class Config:
   sft_packing_enabled: bool = False
   sft_packing_efficiency_target: float = 0.95  # Target bin fill ratio for FFD packing
   sft_packing_max_docs_per_bin: int = 16       # Safety limit on documents per packed sequence
+  sft_prefetch_depth: int = 2                  # Number of CPU-prepared micro-batches to queue ahead
+  sft_pin_memory: bool = True                  # Pin host batches before H2D copy for non_blocking transfers
+  sft_token_cache_size: int = 16384            # LRU cache size for tokenized examples (0 disables cache)
   sft_data_path: Optional[str] = None
 
   # =============================================================================
@@ -278,6 +281,14 @@ class Config:
       raise ValueError(
         "Config error: `adam_beta2_expert` must be in (0, 1), "
         f"got {self.adam_beta2_expert}."
+      )
+    if int(self.sft_prefetch_depth) < 0:
+      raise ValueError(
+        f"Config error: `sft_prefetch_depth` must be >= 0, got {self.sft_prefetch_depth}."
+      )
+    if int(self.sft_token_cache_size) < 0:
+      raise ValueError(
+        f"Config error: `sft_token_cache_size` must be >= 0, got {self.sft_token_cache_size}."
       )
 
 # =============================================================================

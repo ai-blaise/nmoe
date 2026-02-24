@@ -459,7 +459,7 @@ def train(cfg: Config):
         "Autograd multithreading disabled for deterministic distributed RDEP barrier ordering "
         "(set NMOE_RDEP_AUTOGRAD_SINGLE_THREAD=0 to override)."
       )
-  timers_on = os.getenv('NMOE_TIMERS', '1') not in ('0', 'false', 'False')
+  timers_on = os.getenv('NMOE_TIMERS', '0') not in ('0', 'false', 'False')
   time_ctx = cuda_time if timers_on else (lambda _tag: nullcontext())
   nvtx_on = os.getenv('NMOE_NVTX', '0') in ('1', 'true', 'True')
   nvtx_ok = bool(nvtx_on and torch.cuda.is_available() and hasattr(torch.cuda, 'nvtx') and hasattr(torch.cuda.nvtx, 'range'))
@@ -577,7 +577,8 @@ def train(cfg: Config):
           "MoE FFN checkpoint replay is disabled to avoid distributed RDEP recompute deadlocks."
         )
 
-  register_model_timers(model)
+  if timers_on:
+    register_model_timers(model)
   optimizer, dense_groups = build_optimizer(model, cfg)
   metrics_state = init_metrics(model, cfg.seq_len)
   metrics_ctx = start_metrics(run_id=run_id, metrics_dir=cfg.metrics_dir)
@@ -942,6 +943,9 @@ def train(cfg: Config):
             # Token-weight loss across DP ranks when supervised token counts differ.
             # Per-rank CE is normalized by local mask sum, while gradients are reduced
             # with DP AVG. Without this correction, sparse ranks are overweighted.
+            rank_loss_scale = torch.ones((), device=loss.device, dtype=torch.float32)
+            global_token_count = torch.ones((), device=loss.device, dtype=torch.float32)
+            rank_loss_scale_finite = torch.ones((), device=loss.device, dtype=torch.bool)
             if world > 1 and dp_group is not None and dp_world_size > 1:
               import torch.distributed as _dist
               if loss_mask is not None:
@@ -957,50 +961,61 @@ def train(cfg: Config):
                 )
               global_token_count = local_token_count.clone()
               _dist.all_reduce(global_token_count, op=_dist.ReduceOp.SUM, group=dp_group)
-              if global_token_count.item() <= 0:
-                raise RuntimeError(
-                  "Non-positive supervised token count across DP group during loss scaling."
-                )
               rank_loss_scale = (float(dp_world_size) * local_token_count) / global_token_count
-              if not torch.isfinite(rank_loss_scale).item():
-                raise RuntimeError(
-                  f"Non-finite DP token-weight loss scale: {float(rank_loss_scale)}"
-                )
+              rank_loss_scale_finite = torch.isfinite(rank_loss_scale)
               loss = loss * rank_loss_scale.to(dtype=loss.dtype)
             aux_loss = model.get_router_aux_loss()
             if aux_loss.device != loss.device:
               aux_loss = aux_loss.to(device=loss.device)
-            if not torch.isfinite(aux_loss).item():
-              raise RuntimeError(
-                f"Non-finite router aux loss detected at step={step_num}, micro_step={micro_step}: "
-                f"{float(aux_loss)}"
-              )
+            aux_loss_finite = torch.isfinite(aux_loss)
             loss = loss + aux_loss.to(dtype=loss.dtype)
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
-            aux_loss_unscaled = float(aux_loss.detach().item())
-          micro_loss_unscaled = float(
-            (loss.detach() * (accum_steps if accum_steps > 1 else 1)).item()
-          )
+            # Fail-fast on non-finite loss before backward. With fused ECO enabled,
+            # expert optimizer updates happen inside backward, so we must abort first.
+            loss_finite = torch.isfinite(loss).to(dtype=torch.int32)
+            if world > 1:
+              import torch.distributed as _dist
+              if _dist.is_available() and _dist.is_initialized():
+                _dist.all_reduce(loss_finite, op=_dist.ReduceOp.MIN)
+
+            micro_diag = torch.stack((
+              (global_token_count <= 0).to(dtype=torch.float32),
+              (~rank_loss_scale_finite).to(dtype=torch.float32),
+              (~aux_loss_finite).to(dtype=torch.float32),
+              (loss_finite == 0).to(dtype=torch.float32),
+              global_token_count.to(dtype=torch.float32),
+              rank_loss_scale.to(dtype=torch.float32),
+              aux_loss.detach().to(dtype=torch.float32),
+              (loss.detach() * (accum_steps if accum_steps > 1 else 1)).to(dtype=torch.float32),
+            ))
+          micro_diag_vals = micro_diag.detach().cpu().tolist()
+          if int(micro_diag_vals[0]) != 0:
+            raise RuntimeError(
+              "Non-positive supervised token count across DP group during loss scaling."
+            )
+          if int(micro_diag_vals[1]) != 0:
+            raise RuntimeError(
+              f"Non-finite DP token-weight loss scale: {float(micro_diag_vals[5])}"
+            )
+          if int(micro_diag_vals[2]) != 0:
+            raise RuntimeError(
+              f"Non-finite router aux loss detected at step={step_num}, micro_step={micro_step}: "
+              f"{float(micro_diag_vals[6])}"
+            )
+          if int(micro_diag_vals[3]) != 0:
+            raise RuntimeError(
+              f"Non-finite loss detected at step={step_num}, micro_step={micro_step}. "
+              "Aborting before backward/optimizer update."
+            )
+          aux_loss_unscaled = float(micro_diag_vals[6])
+          micro_loss_unscaled = float(micro_diag_vals[7])
           if step_heartbeat and rank == 0:
             print(
               f"[HB] step={step_num} micro={micro_step} stage=loss_done "
               f"loss={micro_loss_unscaled:.6f} aux={aux_loss_unscaled:.6f}",
               flush=True,
-            )
-
-          # Fail-fast on non-finite loss before backward. With fused ECO enabled,
-          # expert optimizer updates happen inside backward, so we must abort first.
-          loss_finite = torch.isfinite(loss).to(dtype=torch.int32)
-          if world > 1:
-            import torch.distributed as _dist
-            if _dist.is_available() and _dist.is_initialized():
-              _dist.all_reduce(loss_finite, op=_dist.ReduceOp.MIN)
-          if loss_finite.item() == 0:
-            raise RuntimeError(
-              f"Non-finite loss detected at step={step_num}, micro_step={micro_step}. "
-              "Aborting before backward/optimizer update."
             )
 
           # Zero gradients: on first micro-step, zero everything. On subsequent
@@ -1080,13 +1095,20 @@ def train(cfg: Config):
         # Uses fused foreach op (1 kernel) instead of per-param norm computation (~N kernels)
         _grad_params = [p for p in grad_norm_params if p.grad is not None]
         grad_norm = fused_grad_norm_(_grad_params) if _grad_params else torch.tensor(0.0, device='cuda')
-        local_grad_norm_bad = not torch.isfinite(grad_norm).item()
-        grad_norm_finite = torch.isfinite(grad_norm).to(dtype=torch.int32)
+        local_grad_norm_finite = torch.isfinite(grad_norm).to(dtype=torch.int32)
+        grad_norm_finite = local_grad_norm_finite.clone()
         if world > 1:
           import torch.distributed as _dist
           if _dist.is_available() and _dist.is_initialized():
             _dist.all_reduce(grad_norm_finite, op=_dist.ReduceOp.MIN)
-        _grad_norm_bad = grad_norm_finite.item() == 0
+        grad_norm_diag = torch.stack((
+          grad_norm.detach().to(dtype=torch.float32),
+          local_grad_norm_finite.to(dtype=torch.float32),
+          grad_norm_finite.to(dtype=torch.float32),
+        ))
+        grad_norm_value, local_grad_norm_finite_v, grad_norm_finite_v = grad_norm_diag.detach().cpu().tolist()
+        local_grad_norm_bad = int(local_grad_norm_finite_v) == 0
+        _grad_norm_bad = int(grad_norm_finite_v) == 0
         if _grad_norm_bad:
             bad_ranks: list[int] = []
             if world > 1:
@@ -1099,7 +1121,8 @@ def train(cfg: Config):
                 )
                 gathered = [torch.zeros_like(local_bad_t) for _ in range(_dist.get_world_size())]
                 _dist.all_gather(gathered, local_bad_t)
-                bad_ranks = [i for i, t in enumerate(gathered) if int(t.item()) == 1]
+                gathered_host = torch.stack(gathered).detach().cpu().tolist()
+                bad_ranks = [i for i, t in enumerate(gathered_host) if int(t) == 1]
 
             bad_grad_details = _collect_nonfinite_grad_details(named_grad_params, max_items=8)
             detail = "; ".join(bad_grad_details) if bad_grad_details else "none"
@@ -1114,12 +1137,12 @@ def train(cfg: Config):
               )
             if not local_grad_norm_bad:
               detail = (
-                f"remote rank reported non-finite dense grad_norm; local_grad_norm={float(grad_norm):.6g}; "
+                f"remote rank reported non-finite dense grad_norm; local_grad_norm={float(grad_norm_value):.6g}; "
                 f"local_non_finite_grads={detail}"
               )
             rank_detail = f"bad_ranks={bad_ranks}" if bad_ranks else "bad_ranks=unknown"
             raise RuntimeError(
-              f"Non-finite dense grad_norm detected at step={step_num}: {float(grad_norm)}. "
+              f"Non-finite dense grad_norm detected at step={step_num}: {float(grad_norm_value)}. "
               f"First non-finite grads: {detail}. {rank_detail}. Aborting before optimizer step."
             )
         else:
@@ -1275,6 +1298,11 @@ def train(cfg: Config):
       exp_tracker.end_run(run_id, "failed")
     raise
   finally:
+    if 'loader' in locals() and hasattr(loader, 'close'):
+      try:
+        loader.close()
+      except Exception:
+        logger.debug("loader close failed", exc_info=True)
     checkpointer.close()
     stop_metrics(metrics_ctx)
     if exp_tracker is not None:

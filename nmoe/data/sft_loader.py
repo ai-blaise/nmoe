@@ -35,6 +35,9 @@ import random
 import re
 import json
 import time
+import queue
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,6 +46,8 @@ import torch
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_CACHE_MISS = object()
 
 
 # ============================================================================
@@ -620,6 +625,9 @@ class SFTLoader:
         dataset_split: str = "train",
         packing_enabled: bool = False,
         packing_max_docs_per_bin: int = 16,
+        prefetch_depth: int = 2,
+        pin_memory: bool = True,
+        token_cache_size: int = 16384,
     ):
         """Initialize SFT loader.
 
@@ -639,6 +647,9 @@ class SFTLoader:
             dataset_split: Dataset split to load.
             packing_enabled: If True, pack multiple examples per sequence.
             packing_max_docs_per_bin: Maximum documents per packed sequence.
+            prefetch_depth: Number of CPU-prepared micro-batches to prefetch.
+            pin_memory: If True, pin host tensors before async H2D copies.
+            token_cache_size: LRU cache size for tokenized examples (0 disables).
         """
         self.seq_len = seq_len
         self.global_batch_size = batch_size
@@ -652,6 +663,9 @@ class SFTLoader:
         self.device = device
         self.packing_enabled = packing_enabled
         self.packing_max_docs_per_bin = packing_max_docs_per_bin
+        self.prefetch_depth = max(0, int(prefetch_depth))
+        self.pin_memory = bool(pin_memory)
+        self.token_cache_size = max(0, int(token_cache_size))
 
         if prompt_format not in CHAT_FORMATTERS:
             raise ValueError(
@@ -693,6 +707,127 @@ class SFTLoader:
         self._bin_index = 0
         if self.packing_enabled:
             self._build_packed_bins()
+
+        # Tokenization cache avoids repeated CPU tokenize work across epochs.
+        self._token_cache: "OrderedDict[int, Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]" = OrderedDict()
+        self._state_lock = threading.Lock()
+
+        # Optional asynchronous batch prefetch.
+        self._prefetch_q: "queue.Queue[Tuple[Tuple[Any, ...], Dict[str, int]]]" = queue.Queue(
+            maxsize=max(1, self.prefetch_depth)
+        )
+        self._prefetch_stop = threading.Event()
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetch_error: Optional[Exception] = None
+        if self.prefetch_depth > 0:
+            self._start_prefetch()
+
+    def _uses_cuda_device(self) -> bool:
+        if isinstance(self.device, str):
+            return self.device.startswith("cuda")
+        return getattr(self.device, "type", "") == "cuda"
+
+    def _pin_if_needed(self, t: torch.Tensor) -> torch.Tensor:
+        if self.pin_memory and self._uses_cuda_device() and t.device.type == "cpu":
+            return t.pin_memory()
+        return t
+
+    def _snapshot_state_unlocked(self) -> Dict[str, int]:
+        return {
+            "index": int(self._index),
+            "epoch": int(self._epoch),
+            "step": int(self._step),
+            "total_tokens": int(self._total_tokens),
+            "bin_index": int(self._bin_index),
+        }
+
+    def _apply_state_unlocked(self, state: Dict[str, Any]) -> None:
+        self._index = int(state.get("index", self._index))
+        self._epoch = int(state.get("epoch", self._epoch))
+        self._step = int(state.get("step", self._step))
+        self._total_tokens = int(state.get("total_tokens", self._total_tokens))
+        self._bin_index = int(state.get("bin_index", self._bin_index))
+
+    def _start_prefetch(self) -> None:
+        if self.prefetch_depth <= 0 or self._prefetch_thread is not None:
+            return
+        self._prefetch_q = queue.Queue(maxsize=max(1, self.prefetch_depth))
+        self._prefetch_stop.clear()
+        self._prefetch_error = None
+        with self._state_lock:
+            start_state = self._snapshot_state_unlocked()
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop,
+            args=(start_state,),
+            name=f"sft-prefetch-r{self.dp_rank}",
+            daemon=True,
+        )
+        self._prefetch_thread.start()
+
+    def _stop_prefetch(self) -> None:
+        if self._prefetch_thread is None:
+            return
+        self._prefetch_stop.set()
+        self._prefetch_thread.join()
+        self._prefetch_thread = None
+        while True:
+            try:
+                self._prefetch_q.get_nowait()
+            except queue.Empty:
+                break
+
+    def _prefetch_loop(self, state: Dict[str, int]) -> None:
+        next_state = dict(state)
+        try:
+            while not self._prefetch_stop.is_set():
+                batch_cpu, next_state = self._build_next_batch_cpu(next_state)
+                while not self._prefetch_stop.is_set():
+                    try:
+                        self._prefetch_q.put((batch_cpu, next_state), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:
+            self._prefetch_error = RuntimeError(
+                f"SFT prefetch failed on DP rank {self.dp_rank}: {e}"
+            )
+            logger.exception("SFT prefetch thread failed on DP rank %s", self.dp_rank)
+            self._prefetch_stop.set()
+
+    def _build_next_batch_cpu(
+        self,
+        state: Dict[str, int],
+    ) -> Tuple[Tuple[Any, ...], Dict[str, int]]:
+        if self.packing_enabled and self._packed_bins is not None:
+            return self._next_packed_cpu(state)
+        return self._next_unpacked_cpu(state)
+
+    def _move_batch_to_device(self, batch_cpu: Tuple[Any, ...]):
+        if len(batch_cpu) == 3:
+            inputs, targets, loss_mask = batch_cpu
+            return (
+                inputs.to(self.device, non_blocking=True),
+                targets.to(self.device, non_blocking=True),
+                loss_mask.to(self.device, non_blocking=True),
+            )
+        if len(batch_cpu) == 4:
+            inputs, targets, loss_mask, cu_seqlens = batch_cpu
+            return (
+                inputs.to(self.device, non_blocking=True),
+                targets.to(self.device, non_blocking=True),
+                loss_mask.to(self.device, non_blocking=True),
+                [cs.to(self.device, non_blocking=True) for cs in cu_seqlens],
+            )
+        raise RuntimeError(f"Unexpected SFT batch structure (len={len(batch_cpu)})")
+
+    def close(self) -> None:
+        self._stop_prefetch()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _load_dataset(
         self,
@@ -1020,6 +1155,24 @@ class SFTLoader:
 
         return result
 
+    def _process_example_cached(self, idx: int) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Tokenize with optional LRU cache keyed by global dataset index."""
+        if self.token_cache_size <= 0:
+            return self._process_example(idx)
+
+        sample_idx = int(self._indices[idx])
+        cached = self._token_cache.get(sample_idx, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            self._token_cache.move_to_end(sample_idx)
+            return cached
+
+        result = self._process_example(idx)
+        self._token_cache[sample_idx] = result
+        self._token_cache.move_to_end(sample_idx)
+        while len(self._token_cache) > self.token_cache_size:
+            self._token_cache.popitem(last=False)
+        return result
+
     def next(self):
         """Get next batch.
 
@@ -1037,26 +1190,51 @@ class SFTLoader:
             loss_mask: [local_batch_size, seq_len] float tensor
             cu_seqlens: list of [num_docs_i + 1] int32 tensors (packing only)
         """
-        if self.packing_enabled and self._packed_bins is not None:
-            return self._next_packed()
-        return self._next_unpacked()
+        if self.prefetch_depth > 0:
+            if self._prefetch_error is not None:
+                raise RuntimeError("SFT prefetch worker failed") from self._prefetch_error
+            while True:
+                try:
+                    batch_cpu, next_state = self._prefetch_q.get(timeout=1.0)
+                    break
+                except queue.Empty:
+                    if self._prefetch_error is not None:
+                        raise RuntimeError("SFT prefetch worker failed") from self._prefetch_error
+                    if self._prefetch_stop.is_set():
+                        raise RuntimeError("SFT prefetch worker stopped unexpectedly.")
+            with self._state_lock:
+                self._apply_state_unlocked(next_state)
+            return self._move_batch_to_device(batch_cpu)
 
-    def _next_unpacked(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Original unpacked batch loading."""
+        with self._state_lock:
+            state = self._snapshot_state_unlocked()
+        batch_cpu, next_state = self._build_next_batch_cpu(state)
+        with self._state_lock:
+            self._apply_state_unlocked(next_state)
+        return self._move_batch_to_device(batch_cpu)
+
+    def _next_unpacked_cpu(
+        self,
+        state: Dict[str, int],
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, int]]:
+        """CPU-side unpacked batch materialization."""
+        index = int(state.get("index", 0))
+        epoch = int(state.get("epoch", 0))
+        step = int(state.get("step", 0))
+        total_tokens = int(state.get("total_tokens", 0))
+
         batch_inputs = []
         batch_targets = []
         batch_masks = []
 
         while len(batch_inputs) < self.local_batch_size:
-            if self._index >= len(self._indices):
-                # Wrap around (new epoch)
-                self._epoch += 1
-                self._index = 0
-                logger.info(f"SFT loader: starting epoch {self._epoch}")
+            if index >= len(self._indices):
+                epoch += 1
+                index = 0
+                logger.info(f"SFT loader: starting epoch {epoch}")
 
-            result = self._process_example(self._index)
-            self._index += 1
-
+            result = self._process_example_cached(index)
+            index += 1
             if result is None:
                 continue
 
@@ -1065,69 +1243,109 @@ class SFTLoader:
             batch_targets.append(targets)
             batch_masks.append(loss_mask)
 
-        self._step += 1
-        self._total_tokens += self.local_batch_size * self.seq_len
+        step += 1
+        total_tokens += self.local_batch_size * self.seq_len
 
-        inputs = torch.stack(batch_inputs).to(self.device, non_blocking=True)
-        targets = torch.stack(batch_targets).to(self.device, non_blocking=True)
-        loss_mask = torch.stack(batch_masks).to(self.device, non_blocking=True)
+        inputs = self._pin_if_needed(torch.stack(batch_inputs))
+        targets = self._pin_if_needed(torch.stack(batch_targets))
+        loss_mask = self._pin_if_needed(torch.stack(batch_masks))
 
-        return inputs, targets, loss_mask
+        next_state = {
+            "index": index,
+            "epoch": epoch,
+            "step": step,
+            "total_tokens": total_tokens,
+            "bin_index": int(state.get("bin_index", 0)),
+        }
+        return (inputs, targets, loss_mask), next_state
 
-    def _next_packed(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
-        """Packed batch loading with cu_seqlens for document-isolated attention."""
+    def _next_packed_cpu(
+        self,
+        state: Dict[str, int],
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]], Dict[str, int]]:
+        """CPU-side packed batch materialization with cu_seqlens."""
+        if self._packed_bins is None:
+            raise RuntimeError("Packed SFT loader is missing precomputed bins.")
+
+        bin_index = int(state.get("bin_index", 0))
+        epoch = int(state.get("epoch", 0))
+        step = int(state.get("step", 0))
+        total_tokens = int(state.get("total_tokens", 0))
+
         batch_inputs = []
         batch_targets = []
         batch_masks = []
         batch_cu_seqlens = []
 
         while len(batch_inputs) < self.local_batch_size:
-            if self._bin_index >= len(self._packed_bins):
-                # Wrap around (new epoch)
-                self._epoch += 1
-                self._bin_index = 0
-                logger.info(f"SFT loader (packed): starting epoch {self._epoch}")
+            if bin_index >= len(self._packed_bins):
+                epoch += 1
+                bin_index = 0
+                logger.info(f"SFT loader (packed): starting epoch {epoch}")
 
-            pbin = self._packed_bins[self._bin_index]
-            self._bin_index += 1
+            pbin = self._packed_bins[bin_index]
+            bin_index += 1
 
             batch_inputs.append(pbin.inputs)
             batch_targets.append(pbin.targets)
             batch_masks.append(pbin.loss_mask)
-            batch_cu_seqlens.append(pbin.cu_seqlens)
+            batch_cu_seqlens.append(self._pin_if_needed(pbin.cu_seqlens))
 
-        self._step += 1
-        self._total_tokens += self.local_batch_size * self.seq_len
+        step += 1
+        total_tokens += self.local_batch_size * self.seq_len
 
-        inputs = torch.stack(batch_inputs).to(self.device, non_blocking=True)
-        targets = torch.stack(batch_targets).to(self.device, non_blocking=True)
-        loss_mask = torch.stack(batch_masks).to(self.device, non_blocking=True)
-        # cu_seqlens are moved to device individually (variable length per batch element)
-        cu_seqlens = [cs.to(self.device, non_blocking=True) for cs in batch_cu_seqlens]
+        inputs = self._pin_if_needed(torch.stack(batch_inputs))
+        targets = self._pin_if_needed(torch.stack(batch_targets))
+        loss_mask = self._pin_if_needed(torch.stack(batch_masks))
 
-        return inputs, targets, loss_mask, cu_seqlens
+        next_state = {
+            "index": int(state.get("index", 0)),
+            "epoch": epoch,
+            "step": step,
+            "total_tokens": total_tokens,
+            "bin_index": bin_index,
+        }
+        return (inputs, targets, loss_mask, batch_cu_seqlens), next_state
+
+    def _next_unpacked(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with self._state_lock:
+            state = self._snapshot_state_unlocked()
+        batch_cpu, next_state = self._next_unpacked_cpu(state)
+        with self._state_lock:
+            self._apply_state_unlocked(next_state)
+        out = self._move_batch_to_device(batch_cpu)
+        return out
+
+    def _next_packed(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        with self._state_lock:
+            state = self._snapshot_state_unlocked()
+        batch_cpu, next_state = self._next_packed_cpu(state)
+        with self._state_lock:
+            self._apply_state_unlocked(next_state)
+        out = self._move_batch_to_device(batch_cpu)
+        return out
 
     def state_dict(self) -> Dict[str, Any]:
         """Save loader state for checkpointing."""
-        state = {
-            "index": self._index,
-            "epoch": self._epoch,
-            "step": self._step,
-            "total_tokens": self._total_tokens,
-            "packing_enabled": self.packing_enabled,
-        }
-        if self.packing_enabled:
-            state["bin_index"] = self._bin_index
+        self._stop_prefetch()
+        with self._state_lock:
+            state = self._snapshot_state_unlocked()
+        state["packing_enabled"] = self.packing_enabled
+        if not self.packing_enabled:
+            state.pop("bin_index", None)
+        if self.prefetch_depth > 0:
+            self._start_prefetch()
         return state
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         """Restore loader state from checkpoint."""
-        self._index = state.get("index", 0)
-        self._epoch = state.get("epoch", 0)
-        self._step = state.get("step", 0)
-        self._total_tokens = state.get("total_tokens", 0)
-        if self.packing_enabled:
-            self._bin_index = state.get("bin_index", 0)
+        self._stop_prefetch()
+        with self._state_lock:
+            self._apply_state_unlocked(state)
+            if not self.packing_enabled:
+                self._bin_index = 0
+        if self.prefetch_depth > 0:
+            self._start_prefetch()
 
 
 # ============================================================================
@@ -1191,6 +1409,9 @@ def build_sft_loader(
     mask_prompt_loss = getattr(cfg, "sft_mask_prompt_loss", True)
     packing_enabled = getattr(cfg, "sft_packing_enabled", False)
     packing_max_docs = getattr(cfg, "sft_packing_max_docs_per_bin", 16)
+    prefetch_depth = int(getattr(cfg, "sft_prefetch_depth", 2))
+    pin_memory = bool(getattr(cfg, "sft_pin_memory", True))
+    token_cache_size = int(getattr(cfg, "sft_token_cache_size", 16384))
     accum_steps = int(getattr(cfg, "gradient_accumulation_steps", 1))
 
     # Compute micro-batch size for logging
@@ -1204,6 +1425,9 @@ def build_sft_loader(
         print_fn(f"[SFT] packing: {'ENABLED' if packing_enabled else 'disabled'}")
         if packing_enabled:
             print_fn(f"[SFT] packing_max_docs_per_bin: {packing_max_docs}")
+        print_fn(f"[SFT] prefetch_depth: {prefetch_depth}")
+        print_fn(f"[SFT] pin_memory: {pin_memory}")
+        print_fn(f"[SFT] token_cache_size: {token_cache_size}")
         print_fn(f"[SFT] dp_world_size: {dp_world_size} (each rank sees 1/{dp_world_size} of data)")
         print_fn(f"[SFT] gradient_accumulation_steps: {accum_steps}")
         print_fn(f"[SFT] micro_batch_size: {micro_batch_size} (T per fwd = {micro_batch_size * cfg.seq_len})")
@@ -1223,6 +1447,9 @@ def build_sft_loader(
         device="cuda" if torch.cuda.is_available() else "cpu",
         packing_enabled=packing_enabled,
         packing_max_docs_per_bin=packing_max_docs,
+        prefetch_depth=prefetch_depth,
+        pin_memory=pin_memory,
+        token_cache_size=token_cache_size,
     )
 
     return loader
