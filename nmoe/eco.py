@@ -236,6 +236,11 @@ class FusedBackwardECO:
                 f"eco_allreduce_mode must be 'async' or 'sync', got {self._allreduce_mode!r}"
             )
         self._async_accumulation = bool(getattr(cfg, 'eco_async_accumulation', False))
+        self._sync_bootstrap_steps = int(getattr(cfg, 'eco_sync_bootstrap_steps', 1))
+        if self._sync_bootstrap_steps < 0:
+            raise ValueError(
+                f"eco_sync_bootstrap_steps must be >= 0, got {self._sync_bootstrap_steps}"
+            )
         self._allreduce_dtype = str(getattr(cfg, 'eco_allreduce_dtype', 'bf16')).lower()
         if self._allreduce_dtype not in {'fp32', 'bf16'}:
             raise ValueError(
@@ -328,6 +333,7 @@ class FusedBackwardECO:
             f"require_cuda={self._require_cuda}, "
             f"allreduce_mode={self._allreduce_mode}, "
             f"async_accumulation={self._async_accumulation}, "
+            f"sync_bootstrap_steps={self._sync_bootstrap_steps}, "
             f"allreduce_dtype={self._allreduce_dtype}, "
             f"allreduce_chunk_mb={chunk_mb}, "
             f"allreduce_chunk_threshold_mb={threshold_mb}, "
@@ -1113,7 +1119,7 @@ class FusedBackwardECO:
                 if (
                     use_async_allreduce
                     and self._dp_size >= 16
-                    and self._step_count <= 1
+                    and self._step_count <= self._sync_bootstrap_steps
                 ):
                     # Bootstrap guard: keep first optimizer step fully synchronous
                     # on large DP jobs to avoid early async queue instability.

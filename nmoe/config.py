@@ -170,6 +170,7 @@ class Config:
   eco_factored_v: bool = False         # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
   eco_allreduce_mode: str = "async"    # async | sync DP all-reduce mode inside fused ECO
   eco_async_accumulation: bool = False # If false, use sync DP all-reduce on non-final accumulation micro-steps
+  eco_sync_bootstrap_steps: int = 1    # Force sync all-reduce for first N optimizer steps (0 disables bootstrap sync)
   eco_allreduce_dtype: str = "bf16"    # fp32 | bf16 payload dtype for DP all-reduce
   eco_allreduce_chunk_mb: int = 0      # Per-chunk size in MB (0 => async default chunk size)
   eco_allreduce_chunk_threshold_mb: int = 0  # Payload threshold MB (<= threshold => single all-reduce)

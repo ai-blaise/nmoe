@@ -97,12 +97,13 @@ eco_fused_backward = true        # Fuse optimizer into backward — CUDA kernel 
 eco_require_cuda = true          # Hard-fail if ECO CUDA bindings are missing (no Python fallback)
 eco_factored_v = true            # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
 eco_allreduce_mode = "async"     # Async overlap with bounded in-flight queue for 16-node TCP stability
-eco_async_accumulation = false   # Use sync DP all-reduce on non-final micro-steps to avoid async queue buildup
+eco_async_accumulation = true    # Keep all accumulation micro-steps on async DP all-reduce path
+eco_sync_bootstrap_steps = 0     # Disable forced sync bootstrap; avoid step-0 backward stall on 16-node TCP
 eco_allreduce_dtype = "bf16"     # Socket-mode speed path: halve DP all-reduce wire bytes vs FP32
 eco_allreduce_chunk_mb = 64      # Reduce collective launch count for large expert gradient payloads
 eco_allreduce_chunk_threshold_mb = 64  # Single all-reduce below 64MB; chunk only large payloads
 eco_max_pending_allreduce_mb = 1024
-eco_max_pending_allreduce_ops = 0      # Auto-size queue depth from payload + byte budget
+eco_max_pending_allreduce_ops = 1      # Tight queue depth cap for deterministic async behavior on TCP fabric
 eco_comm_stall_warn_s = 15.0
 eco_comm_debug = false
 gradient_checkpointing = false   # B200 memory headroom at seq_len=1024; avoids checkpoint replay overhead/instability

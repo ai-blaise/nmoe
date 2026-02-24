@@ -1038,6 +1038,11 @@ Scope:
 - [~] E-003 Collapse factored-v prepass kernels and remove `v_rms` atomic hotspot.
   - Files: `nmoe/csrc/eco_adam.cu`
   - Acceptance: reduced launch count and atomic stalls; parity maintained.
+
+- [x] E-081 Make ECO sync-bootstrap all-reduce policy configurable and tune 16-node profile.
+  - Files: `nmoe/eco.py`, `nmoe/config.py`, `configs/dsv3_reap_sft_16node.toml`
+  - Acceptance: first-step synchronous bootstrap can be disabled without code edits, and 16-node TCP profile uses bounded async accumulation to avoid backward step-0 stalls.
+  - Status note: added `eco_sync_bootstrap_steps` (default `1`) and set 16-node NVFP4 profile to `eco_async_accumulation=true`, `eco_sync_bootstrap_steps=0`, `eco_max_pending_allreduce_ops=1`.
   - Status note: `k_factored_v_row` now does one `atomicAdd` per row block for `v_rms` accumulation (removed per-warp shuffle/atomic overhead); factored-v finalize kernel (`k_factored_v_rms_finalize`) was removed by accumulating normalized contributions in-row (one fewer launch per factored-v update). Full prepass collapse remains.
 
 - [ ] E-004 Remove triple gradient reread in factored-v path.
