@@ -48,6 +48,7 @@ _NVTX_ENABLED = (
     and hasattr(torch.cuda, "nvtx")
     and hasattr(torch.cuda.nvtx, "range")
 )
+_ECO_WAIT_DEBUG = _env_flag("NMOE_ECO_WAIT_DEBUG", "0")
 
 
 def _nvtx(tag: str):
@@ -863,6 +864,15 @@ class FusedBackwardECO:
             with _nvtx("eco/drain_one_wait_allreduce"):
                 tail = pending.tail_work
                 if tail is not None and not tail.is_completed():
+                    if _ECO_WAIT_DEBUG:
+                        logger.warning(
+                            "[eco] waiting on DP all-reduce: step=%s seq=%s param=%s pending=%s pending_mb=%.1f",
+                            self._current_step,
+                            pending.seq,
+                            pending.param_name,
+                            len(self._pending_queue),
+                            self._pending_bytes / (1024 * 1024),
+                        )
                     tail.wait()
             wait_s = time.monotonic() - wait_t0
             self._pending_bytes = max(0, self._pending_bytes - pending.nbytes)

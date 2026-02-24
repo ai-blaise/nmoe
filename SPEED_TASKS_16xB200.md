@@ -558,6 +558,16 @@ Scope:
   - Acceptance: hybrid IPC scatter-after-forward kernels are not launched at raw `capacity` when `T*K` is smaller.
   - Status note: `k_scatter_received_hybrid_bf16_dynamic` launch sizing in both return paths now uses `min(capacity, T*K)` upper bound.
 
+- [x] B-093 Disable distributed layout-reuse restore path by default in MoE backward.
+  - Files: `nmoe/moe.py`
+  - Acceptance: distributed backward does not enter saved-layout restore/consensus path unless explicitly enabled; collective scope remains EP-consistent when enabled.
+  - Status note: added `NMOE_ENABLE_LAYOUT_REUSE_DIST` (default `0`), gated distributed layout-reuse on this flag, and scoped consensus all-reduces to `rdep.ep_group`.
+
+- [x] B-094 Add explicit ECO async all-reduce wait diagnostics.
+  - Files: `nmoe/eco.py`
+  - Acceptance: when enabled, stalls in pending DP all-reduce drain path emit actionable step/sequence/param queue context before blocking wait.
+  - Status note: added `NMOE_ECO_WAIT_DEBUG` and a pre-wait diagnostic log in `_drain_one()` before `tail.wait()`.
+
 - [x] B-093 Optimize quantized CT->MMA scale handling and expert lookup hint path.
   - Files: `nmoe/csrc/quant.cu`
   - Acceptance: strided quant expert lookup uses fast stride hint with safe fallback; CT->MMA kernels remove redundant per-lane global-scale decode/divide and use fast group-scale leader path for pow2 groups.

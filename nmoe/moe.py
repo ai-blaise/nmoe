@@ -77,6 +77,7 @@ _HAS_RDEP_LAYOUT_CACHE = bool(getattr(_C, "rdep_layout_cache_supported", False))
 _CT_NVFP4_TO_BF16_MAX_TRANSPOSE_MODE = int(getattr(_C, "ct_nvfp4_to_bf16_max_transpose_mode", 1))
 _FORCE_BF16_DISPATCH_META = _env_flag("NMOE_FORCE_BF16_DISPATCH_META", "0")
 _DISABLE_LAYOUT_REUSE = _env_flag("NMOE_DISABLE_LAYOUT_REUSE", "0")
+_ENABLE_LAYOUT_REUSE_DIST = _env_flag("NMOE_ENABLE_LAYOUT_REUSE_DIST", "0")
 _NULL_NVTX_CTX = nullcontext()
 
 
@@ -169,7 +170,11 @@ def _validate_backward_runtime_contract_once(
         missing.append("bf16_wgrad_host_offs_supported")
     if not _HAS_BF16_PREPARE_OFFS_PAD_HOST:
         missing.append("bf16_prepare_offs_pad_host_supported")
-    if not _DISABLE_LAYOUT_REUSE:
+    layout_reuse_enabled = bool(
+      not _DISABLE_LAYOUT_REUSE
+      and (not is_dist or _ENABLE_LAYOUT_REUSE_DIST)
+    )
+    if layout_reuse_enabled:
         if not _HAS_COPY_BLOCKSCALED_LAYOUT:
             missing.append("copy_blockscaled_layout")
         if not _HAS_RESTORE_LAYOUT_FROM_SAVED:
@@ -583,6 +588,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       and _HAS_COPY_BLOCKSCALED_LAYOUT
       and _HAS_RESTORE_LAYOUT_FROM_SAVED
       and _HAS_RDEP_LAYOUT_CACHE
+      and (not is_dist or _ENABLE_LAYOUT_REUSE_DIST)
     )
     if layout_reuse_enabled:
       candidate = getattr(ctx, "_saved_dispatch_layout", None)
@@ -590,12 +596,13 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       # Keep collective participation deterministic across ranks:
       # only use saved-layout restore when every rank can do so.
       if is_dist and dist.is_available() and dist.is_initialized():
+        consensus_group = getattr(rdep, "ep_group", None)
         with _nvtx("moe_bs/bwd_layout_reuse_consensus"):
           flag = torch.tensor([1 if candidate_ok else 0], device=device, dtype=torch.int32)
           flag_min = flag.clone()
           flag_max = flag.clone()
-          dist.all_reduce(flag_min, op=dist.ReduceOp.MIN)
-          dist.all_reduce(flag_max, op=dist.ReduceOp.MAX)
+          dist.all_reduce(flag_min, op=dist.ReduceOp.MIN, group=consensus_group)
+          dist.all_reduce(flag_max, op=dist.ReduceOp.MAX, group=consensus_group)
           candidate_ok = bool(int(flag_min.item()) == 1 and int(flag_max.item()) == 1)
       if candidate_ok:
         saved_dispatch_layout = candidate
