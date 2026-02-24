@@ -40,13 +40,14 @@ def _require_finite(tag: str, tensor: torch.Tensor) -> None:
     return
   if not (tensor.is_floating_point() or tensor.is_complex()):
     return
-  finite_mask = torch.isfinite(tensor)
-  if bool(finite_mask.all().item()):
-    return
-  numel = int(tensor.numel())
-  finite = int(finite_mask.sum().item())
-  nan = int(torch.isnan(tensor).sum().item())
-  inf = int(torch.isinf(tensor).sum().item())
+  with torch.no_grad():
+    finite_mask = torch.isfinite(tensor)
+    if bool(finite_mask.all().item()):
+      return
+    numel = int(tensor.numel())
+    finite = int(finite_mask.sum().item())
+    nan = int(torch.isnan(tensor).sum().item())
+    inf = int(torch.isinf(tensor).sum().item())
   raise RuntimeError(
     f"[NANDBG][mla] non-finite {tag} "
     f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
