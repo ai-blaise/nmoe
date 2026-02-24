@@ -33,6 +33,7 @@ _NVTX_ENABLED = (
 )
 _VALIDATE_CU_SEQLENS = _env_flag("NMOE_VALIDATE_CU_SEQLENS", "0")
 _ROUTER_LOADS_EP_ALLREDUCE = _env_flag("NMOE_ROUTER_LOADS_EP_ALLREDUCE", "0")
+_COMPILE_RESIDUAL_FFN = _env_flag("NMOE_COMPILE_RESIDUAL_FFN", "0")
 _NULL_NVTX_CTX = nullcontext()
 
 
@@ -76,12 +77,19 @@ def _make_fused_residual_attn_cu():
 
 def _make_fused_residual_ffn():
     """Create compiled fused residual + FFN/MoE function."""
-    @torch.compile(fullgraph=False, dynamic=True)
-    def _fused_residual_ffn(x, normed_x, ffn):
+    def _fused_residual_ffn_eager(x, normed_x, ffn):
         # x: residual input, normed_x: pre-computed RMSNorm(x)
-        # Compiler fuses: ffn output + residual add into single kernel
         return x + ffn(normed_x)
-    return _fused_residual_ffn
+
+    if not _COMPILE_RESIDUAL_FFN:
+        return _fused_residual_ffn_eager
+
+    @torch.compile(fullgraph=False, dynamic=True)
+    def _fused_residual_ffn_compiled(x, normed_x, ffn):
+        # Compiler fuses: ffn output + residual add into single kernel.
+        return x + ffn(normed_x)
+
+    return _fused_residual_ffn_compiled
 
 
 # Lazy initialization of compiled functions to avoid import-time compilation
