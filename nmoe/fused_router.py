@@ -31,6 +31,7 @@ Fused Bias Update (Performance Optimization):
 """
 
 import os
+import math
 import ctypes
 import stat
 from contextlib import nullcontext
@@ -62,6 +63,29 @@ def _nvtx(name: str):
     if _NVTX_ENABLED:
         return torch.cuda.nvtx.range(name)
     return _NULL_NVTX_CTX
+
+
+def _nan_debug_active() -> bool:
+    return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_ROUTER_FINITE_DEBUG", "0")
+
+
+def _require_finite(tag: str, tensor: torch.Tensor) -> None:
+    if not _nan_debug_active():
+        return
+    if not (tensor.is_floating_point() or tensor.is_complex()):
+        return
+    finite_mask = torch.isfinite(tensor)
+    if bool(finite_mask.all().item()):
+        return
+    numel = int(tensor.numel())
+    finite = int(finite_mask.sum().item())
+    nan = int(torch.isnan(tensor).sum().item())
+    inf = int(torch.isinf(tensor).sum().item())
+    raise RuntimeError(
+        f"[NANDBG][router] non-finite {tag} "
+        f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"finite={finite}/{numel} nan={nan} inf={inf}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +874,12 @@ class _FusedRouterFunction(torch.autograd.Function):
             T, D = hidden.shape
             E = router_weight.shape[1]
             K = topk
+            if not isinstance(route_scale, float):
+                route_scale = float(route_scale)
+            if not math.isfinite(route_scale):
+                raise RuntimeError(f"route_scale must be finite, got {route_scale}.")
+            if route_scale <= 0.0:
+                raise RuntimeError(f"route_scale must be > 0, got {route_scale}.")
 
             # Ensure inputs are contiguous
             if not hidden.is_contiguous():
@@ -893,6 +923,8 @@ class _FusedRouterFunction(torch.autograd.Function):
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
+            _require_finite("forward.pre_probs", pre_probs)
+            _require_finite("forward.gates", gates)
 
             # Save for backward
             ctx.save_for_backward(hidden, router_weight, expert_ids, pre_probs, gates)
@@ -922,6 +954,7 @@ class _FusedRouterFunction(torch.autograd.Function):
             if grad_gates is not None and (need_hidden or need_w):
                 if not grad_gates.is_contiguous():
                     raise RuntimeError("grad_gates must be contiguous on production no-fallback path.")
+                _require_finite("backward.grad_gates", grad_gates)
                 grad_router_weight, grad_hidden = _call_fused_router_backward(
                     hidden,
                     router_weight,
@@ -933,6 +966,10 @@ class _FusedRouterFunction(torch.autograd.Function):
                     need_hidden_grad=need_hidden,
                     need_wgrad=need_w,
                 )
+                if grad_hidden is not None:
+                    _require_finite("backward.grad_hidden", grad_hidden)
+                if grad_router_weight is not None:
+                    _require_finite("backward.grad_router_weight", grad_router_weight)
 
             # Return gradients for all inputs (None for non-differentiable ones)
             return grad_hidden, grad_router_weight, None, None, None, None, None
@@ -982,7 +1019,11 @@ class FusedRouterTopKDispatch(torch.nn.Module):
         self.hidden_dim = hidden_dim
         self.n_experts = n_experts
         self.topk = topk
-        self.route_scale = route_scale
+        self.route_scale = float(route_scale)
+        if not math.isfinite(self.route_scale) or self.route_scale <= 0.0:
+            raise RuntimeError(
+                f"FusedRouterTopKDispatch requires finite route_scale > 0, got {route_scale}."
+            )
         self.dtype = dtype
         _validate_router_contract_once(n_experts, topk)
 

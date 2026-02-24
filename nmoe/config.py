@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any
 import dataclasses
 import hashlib
 import json
+import math
 
 
 def fingerprint(cfg: "Config") -> str:
@@ -242,6 +243,40 @@ class Config:
       raise ValueError(f"Config error: `epochs` must be >= 1, got {self.epochs}.")
     if self.steps is not None and self.steps < 1:
       raise ValueError(f"Config error: `steps` must be >= 1, got {self.steps}.")
+
+    def _require_finite_positive(name: str, value: float) -> None:
+      v = float(value)
+      if not math.isfinite(v) or v <= 0.0:
+        raise ValueError(f"Config error: `{name}` must be finite and > 0, got {value}.")
+
+    def _require_finite_nonnegative(name: str, value: float) -> None:
+      v = float(value)
+      if not math.isfinite(v) or v < 0.0:
+        raise ValueError(f"Config error: `{name}` must be finite and >= 0, got {value}.")
+
+    # Optimizer scalar guardrails: fail fast before fused kernels see invalid math.
+    _require_finite_positive("lr_dense", self.lr_dense)
+    _require_finite_positive("lr_router", self.lr_router)
+    _require_finite_positive("lr_expert", self.lr_expert)
+    _require_finite_positive("adam_eps", self.adam_eps)
+    _require_finite_positive("rms_norm_eps", self.rms_norm_eps)
+    _require_finite_positive("route_scale", self.route_scale)
+    _require_finite_nonnegative("weight_decay", self.weight_decay)
+    _require_finite_nonnegative("grad_clip", self.grad_clip)
+
+    if not (0.0 < float(self.adam_beta1) < 1.0):
+      raise ValueError(
+        f"Config error: `adam_beta1` must be in (0, 1), got {self.adam_beta1}."
+      )
+    if not (0.0 < float(self.adam_beta2) < 1.0):
+      raise ValueError(
+        f"Config error: `adam_beta2` must be in (0, 1), got {self.adam_beta2}."
+      )
+    if not (0.0 < float(self.adam_beta2_expert) < 1.0):
+      raise ValueError(
+        "Config error: `adam_beta2_expert` must be in (0, 1), "
+        f"got {self.adam_beta2_expert}."
+      )
 
 # =============================================================================
 # Config attributes used by nmoe.attention.*

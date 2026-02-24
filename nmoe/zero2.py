@@ -366,10 +366,31 @@ def step_dense_adamw(
       # Bias correction
       bias_correction1 = 1 - beta1 ** s['step']
       bias_correction2 = 1 - beta2 ** s['step']
+      if not math.isfinite(bias_correction1) or bias_correction1 <= 0.0:
+        raise RuntimeError(
+          f"Zero2 invalid bias_correction1={bias_correction1} at step={s['step']} "
+          f"(beta1={beta1})."
+        )
+      if not math.isfinite(bias_correction2) or bias_correction2 <= 0.0:
+        raise RuntimeError(
+          f"Zero2 invalid bias_correction2={bias_correction2} at step={s['step']} "
+          f"(beta2={beta2})."
+        )
       lr = float(group['lr'])
       wd = float(group.get('weight_decay', 0.0))
+      if not math.isfinite(lr) or lr <= 0.0:
+        raise RuntimeError(f"Zero2 requires finite lr>0, got lr={lr}.")
+      if not math.isfinite(wd) or wd < 0.0:
+        raise RuntimeError(f"Zero2 requires finite weight_decay>=0, got weight_decay={wd}.")
+      if not math.isfinite(eps) or eps <= 0.0:
+        raise RuntimeError(f"Zero2 requires finite eps>0, got eps={eps}.")
       step_size = lr / bias_correction1
       inv_bc2_sqrt = 1.0 / math.sqrt(bias_correction2)
+      if not math.isfinite(step_size) or not math.isfinite(inv_bc2_sqrt):
+        raise RuntimeError(
+          "Zero2 bias-correction scalars became non-finite: "
+          f"step_size={step_size}, inv_bc2_sqrt={inv_bc2_sqrt}."
+        )
 
       # Local helper: apply AdamW on a single completed RS chunk.
       # Defined once to avoid duplicating the update logic for the

@@ -26,6 +26,29 @@ def _env_flag(name: str, default: str = "0") -> bool:
   return os.getenv(name, default) in ("1", "true", "True")
 
 
+def _nan_debug_active() -> bool:
+  return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_MOE_FINITE_DEBUG", "0")
+
+
+def _require_finite(tag: str, tensor: torch.Tensor) -> None:
+  if not _nan_debug_active():
+    return
+  if not (tensor.is_floating_point() or tensor.is_complex()):
+    return
+  finite_mask = torch.isfinite(tensor)
+  if bool(finite_mask.all().item()):
+    return
+  numel = int(tensor.numel())
+  finite = int(finite_mask.sum().item())
+  nan = int(torch.isnan(tensor).sum().item())
+  inf = int(torch.isinf(tensor).sum().item())
+  raise RuntimeError(
+    f"[NANDBG][moe] non-finite {tag} "
+    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+    f"finite={finite}/{numel} nan={nan} inf={inf}"
+  )
+
+
 # Disabled by default on production hot path; opt-in when debugging capacity.
 _CHECK_DROPPED_TOKENS = os.getenv('NMOE_CHECK_DROPPED_TOKENS', '0') in ('1', 'true', 'True')
 _CHECK_DROPPED_TOKENS_INTERVAL = max(1, int(os.getenv('NMOE_CHECK_DROPPED_TOKENS_INTERVAL', '1000')))
@@ -463,10 +486,18 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     device = dOut.device
     stream = torch.cuda.current_stream(device)
 
-    dOut = _as_contiguous_dtype(dOut, torch.bfloat16)
+    if dOut.dtype != torch.bfloat16:
+      raise RuntimeError(
+        "MoE backward requires BF16 dOut on production no-fallback path. "
+        f"Got dOut.dtype={dOut.dtype}."
+      )
+    dOut = dOut if dOut.is_contiguous() else dOut.contiguous()
+    _require_finite("backward.dOut", dOut)
     x = _as_contiguous_dtype(x, torch.bfloat16)
     eid = _as_contiguous_dtype(eid, torch.int32)
     gates_fp32 = _as_contiguous_dtype(gates_fp32, torch.float32)
+    _require_finite("backward.x", x)
+    _require_finite("backward.gates_fp32", gates_fp32)
 
     T = int(ctx.T)
     H = int(ctx.H)
@@ -626,6 +657,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       else:
         dGates_tk_bf16 = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
       dGates = dGates_tk_bf16
+      _require_finite("backward.zero_recv.dX", dX)
+      _require_finite("backward.zero_recv.dGates", dGates)
 
       if fused_eco is not None:
         # Keep DP collectives aligned even if this rank received zero routed tokens.
@@ -829,6 +862,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(M_recv), int(Dff),
         stream,
       )
+      _require_finite("backward.dGate_sorted", dGate_sorted)
       if is_dist:
         # Distributed IPC+hybrid: send dGate back to source ranks.
         _C.send_dgate_dist_bf16_out_bf16(
@@ -981,6 +1015,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         )
 
     dGates = dGates_tk_bf16
+    _require_finite("backward.dX", dX)
+    _require_finite("backward.dGates", dGates)
 
     if fused_eco is not None:
       return None, dX, None, dGates, None, None, None, None, None, None

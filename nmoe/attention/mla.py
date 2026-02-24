@@ -1,4 +1,5 @@
 import os
+import math
 from contextlib import nullcontext
 
 import torch
@@ -81,7 +82,25 @@ _PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip()
 _VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
 _MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
 _MLA_STREAM_CACHE_LIMIT = max(1, int(os.getenv("NMOE_MLA_STREAM_CACHE_LIMIT", "8")))
-_MLA_SOFTMAX_SCALE_MULT = float(os.getenv("NMOE_MLA_SOFTMAX_SCALE_MULT", "1.0"))
+
+
+def _load_mla_softmax_scale_mult() -> float:
+  raw = os.getenv("NMOE_MLA_SOFTMAX_SCALE_MULT", "1.0")
+  try:
+    mult = float(raw)
+  except ValueError as e:
+    raise RuntimeError(
+      f"NMOE_MLA_SOFTMAX_SCALE_MULT must parse as float, got {raw!r}."
+    ) from e
+  if not math.isfinite(mult) or mult <= 0.0 or mult > 8.0:
+    raise RuntimeError(
+      "NMOE_MLA_SOFTMAX_SCALE_MULT must be finite and in (0, 8], "
+      f"got {mult} (raw={raw!r})."
+    )
+  return mult
+
+
+_MLA_SOFTMAX_SCALE_MULT = _load_mla_softmax_scale_mult()
 
 
 def _check_flashmla_varlen_available() -> tuple[bool, str]:
@@ -551,6 +570,7 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     d_v = v.shape[-1]
 
     d_o = d_out.reshape(total, n_heads, d_v).contiguous()
+    _require_finite("flashmla_bwd.d_o", d_o)
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -583,6 +603,9 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
           seqlen,
           True,  # is_varlen
       )
+    _require_finite("flashmla_bwd.dq", dq)
+    _require_finite("flashmla_bwd.dk", dk)
+    _require_finite("flashmla_bwd.dv", dv)
 
     return dq.reshape(bsz, seqlen, n_heads, d_qk), dk.reshape(bsz, seqlen, n_heads, d_qk), dv.reshape(bsz, seqlen, n_heads, d_v), None
 
@@ -606,6 +629,11 @@ class MLA(nn.Module):
     self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False, dtype=torch.bfloat16)
     self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False, dtype=torch.bfloat16)
     self.softmax_scale = (self.qk_head_dim ** -0.5) * _MLA_SOFTMAX_SCALE_MULT
+    if not math.isfinite(self.softmax_scale) or self.softmax_scale <= 0.0:
+      raise RuntimeError(
+        f"Invalid MLA softmax_scale={self.softmax_scale}. "
+        f"qk_head_dim={self.qk_head_dim}, scale_mult={_MLA_SOFTMAX_SCALE_MULT}."
+      )
 
   def init_weights(self, init_std: float = 0.02):
     for proj in [self.wq_a, self.wq_b, self.wkv_a, self.wkv_b]:

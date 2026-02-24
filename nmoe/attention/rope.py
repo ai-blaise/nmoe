@@ -1,9 +1,37 @@
+import os
 import math
 
 import torch
 from torch import nn
 
 from nmoe.csrc import rdep as _C
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+  return os.getenv(name, default) in ("1", "true", "True")
+
+
+def _nan_debug_active() -> bool:
+  return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_MLA_FINITE_DEBUG", "0")
+
+
+def _require_finite(tag: str, tensor: torch.Tensor) -> None:
+  if not _nan_debug_active():
+    return
+  if not (tensor.is_floating_point() or tensor.is_complex()):
+    return
+  finite_mask = torch.isfinite(tensor)
+  if bool(finite_mask.all().item()):
+    return
+  numel = int(tensor.numel())
+  finite = int(finite_mask.sum().item())
+  nan = int(torch.isnan(tensor).sum().item())
+  inf = int(torch.isinf(tensor).sum().item())
+  raise RuntimeError(
+    f"[NANDBG][rope] non-finite {tag} "
+    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+    f"finite={finite}/{numel} nan={nan} inf={inf}"
+  )
 
 
 class _FusedRoPEFunction(torch.autograd.Function):
@@ -18,6 +46,7 @@ class _FusedRoPEFunction(torch.autograd.Function):
       sin_2d: [T, half_dim] contiguous BF16 tensor (already sliced to seq_len)
     """
     B, T, H, D = x.shape
+    _require_finite("full.forward.x", x)
 
     # Do not reuse output storage across calls: aliasing can silently overwrite
     # earlier layer outputs before downstream consumers read them.
@@ -31,6 +60,7 @@ class _FusedRoPEFunction(torch.autograd.Function):
       total_vecs, T, H, D,
       stream,
     )
+    _require_finite("full.forward.out", out)
 
     ctx.save_for_backward(cos_2d, sin_2d)
     ctx.T = T
@@ -44,6 +74,7 @@ class _FusedRoPEFunction(torch.autograd.Function):
     T, H, D = ctx.T, ctx.H, ctx.D
 
     grad_output = grad_output.contiguous()
+    _require_finite("full.backward.grad_out", grad_output)
     grad_x = torch.empty_like(grad_output)
     total_vecs = grad_output.numel() // D
     stream = torch.cuda.current_stream(grad_output.device)
@@ -53,6 +84,7 @@ class _FusedRoPEFunction(torch.autograd.Function):
       total_vecs, T, H, D,
       stream,
     )
+    _require_finite("full.backward.grad_x", grad_x)
     return grad_x, None, None
 
 
@@ -77,6 +109,7 @@ class _FusedRoPEPartialFunction(torch.autograd.Function):
       nope_dim: number of elements at start of head_dim to leave unchanged
     """
     B, T, H, D = x.shape
+    _require_finite("partial.forward.x", x)
 
     total_vecs = B * T * H
     stream = torch.cuda.current_stream(x.device)
@@ -86,6 +119,7 @@ class _FusedRoPEPartialFunction(torch.autograd.Function):
       total_vecs, T, H, D, nope_dim,
       stream,
     )
+    _require_finite("partial.forward.x_out", x)
 
     ctx.mark_dirty(x)
     ctx.save_for_backward(cos_2d, sin_2d)
@@ -103,6 +137,7 @@ class _FusedRoPEPartialFunction(torch.autograd.Function):
 
     # grad_output is already the right shape, apply in-place backward
     grad_output = grad_output.contiguous()
+    _require_finite("partial.backward.grad_out", grad_output)
     total_vecs = grad_output.numel() // D
     stream = torch.cuda.current_stream(grad_output.device)
 
@@ -111,6 +146,7 @@ class _FusedRoPEPartialFunction(torch.autograd.Function):
       total_vecs, T, H, D, nope_dim,
       stream,
     )
+    _require_finite("partial.backward.grad_x", grad_output)
     return grad_output, None, None, None
 
 

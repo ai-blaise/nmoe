@@ -56,6 +56,17 @@ def _nvtx(tag: str):
     return nullcontext()
 
 
+def _require_finite_scalar(name: str, value: float, *, gt: float | None = None, lt: float | None = None) -> float:
+    v = float(value)
+    if not math.isfinite(v):
+        raise ValueError(f"{name} must be finite, got {value}.")
+    if gt is not None and not (v > gt):
+        raise ValueError(f"{name} must be > {gt}, got {value}.")
+    if lt is not None and not (v < lt):
+        raise ValueError(f"{name} must be < {lt}, got {value}.")
+    return v
+
+
 # Fail fast if PyTorch lacks FP8 support — silent BF16 fallback is a 10x perf trap.
 if not hasattr(torch, 'float8_e5m2') or not hasattr(torch, 'float8_e4m3fn'):
     raise ImportError(
@@ -147,6 +158,13 @@ class FusedBackwardECO:
         self._stochastic_rounding = getattr(cfg, 'eco_stochastic_rounding', True)
         self._error_feedback = getattr(cfg, 'eco_error_feedback', True)
         self._factored_v = getattr(cfg, 'eco_factored_v', False)
+
+        _require_finite_scalar("eco.lr_expert", self.lr, gt=0.0)
+        _require_finite_scalar("eco.adam_beta1", self.beta1, gt=0.0, lt=1.0)
+        _require_finite_scalar("eco.adam_beta2_expert", self.beta2, gt=0.0, lt=1.0)
+        _require_finite_scalar("eco.adam_eps", self.eps, gt=0.0)
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0.0:
+            raise ValueError(f"eco.weight_decay must be finite and >= 0, got {self.weight_decay}.")
 
         # DP group for gradient AllReduce
         self._dp_group = None
@@ -526,7 +544,7 @@ class FusedBackwardECO:
 
     def set_lr(self, lr: float):
         """Set learning rate for the next backward pass."""
-        self.lr = lr
+        self.lr = _require_finite_scalar("eco.lr_expert", lr, gt=0.0)
 
     def pre_backward(self, step: int):
         """Prepare for backward pass. Call before loss.backward().
@@ -541,10 +559,25 @@ class FusedBackwardECO:
             # Bias corrections
             bc1 = 1.0 - (self.beta1 ** self._step_count)
             bc2 = 1.0 - (self.beta2 ** self._step_count)
+            if not math.isfinite(bc1) or bc1 <= 0.0:
+                raise RuntimeError(
+                    f"ECO invalid bias_correction1={bc1} at step={self._step_count} "
+                    f"(beta1={self.beta1})."
+                )
+            if not math.isfinite(bc2) or bc2 <= 0.0:
+                raise RuntimeError(
+                    f"ECO invalid bias_correction2={bc2} at step={self._step_count} "
+                    f"(beta2={self.beta2})."
+                )
             self._bias_correction1 = bc1
             self._bias_correction2 = bc2
             self._step_size = self.lr / bc1
             self._inv_bc2_sqrt = 1.0 / math.sqrt(bc2)
+            if not math.isfinite(self._step_size) or not math.isfinite(self._inv_bc2_sqrt):
+                raise RuntimeError(
+                    "ECO bias-correction scalars became non-finite: "
+                    f"step_size={self._step_size}, inv_bc2_sqrt={self._inv_bc2_sqrt}."
+                )
 
             # ECO injection strength
             if self._error_feedback and self._step_size != 0:

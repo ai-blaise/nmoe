@@ -903,6 +903,20 @@ def train(cfg: Config):
             print(f"[HB] step={step_num} micro={micro_step} stage=bwd_start", flush=True)
           with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
             loss.backward()
+          if nan_debug_scope:
+            _micro_grad_params = [p for p in grad_norm_params if p.grad is not None]
+            micro_grad_norm = (
+              fused_grad_norm_(_micro_grad_params)
+              if _micro_grad_params else torch.tensor(0.0, device='cuda')
+            )
+            if not torch.isfinite(micro_grad_norm).item():
+              bad_grad_details = _collect_nonfinite_grad_details(named_grad_params, max_items=8)
+              detail = "; ".join(bad_grad_details) if bad_grad_details else "none"
+              raise RuntimeError(
+                f"[NANDBG][rank={rank}] non-finite micro grad_norm at "
+                f"step={step_num}, micro={micro_step}: {float(micro_grad_norm)}. "
+                f"First non-finite grads: {detail}"
+              )
           if step_heartbeat and rank == 0:
             print(f"[HB] step={step_num} micro={micro_step} stage=bwd_done", flush=True)
           if fused_eco is not None and fused_eco.is_final_microstep:
