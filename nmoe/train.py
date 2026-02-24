@@ -313,7 +313,7 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
   need_router = bool(getattr(cfg, 'use_fused_router', True))
   need_eco = bool(getattr(cfg, 'eco_fused_backward', False) and getattr(cfg, 'eco_require_cuda', True))
   use_fa4 = os.getenv('NMOE_USE_FA4', '1') in ('1', 'true', 'True')
-  use_flashmla_sm100_fwd = os.getenv("NMOE_MLA_USE_FLASHMLA_SM100_FWD", "0") in ("1", "true", "True")
+  use_flashmla_sm100_fwd = os.getenv("NMOE_MLA_USE_FLASHMLA_SM100_FWD", "1") in ("1", "true", "True")
   require_flashmla = os.getenv('NMOE_REQUIRE_FLASHMLA', '1') in ('1', 'true', 'True')
   packed_attn_backend = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
 

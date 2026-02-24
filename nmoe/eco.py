@@ -629,10 +629,19 @@ class FusedBackwardECO:
                     f"ECO invalid bias_correction2={bc2} at step={self._step_count} "
                     f"(beta2={self.beta2})."
                 )
-            self._bias_correction1 = bc1
-            self._bias_correction2 = bc2
-            self._step_size = self.lr / bc1
-            self._inv_bc2_sqrt = 1.0 / math.sqrt(bc2)
+            # Step-0 bootstrap for weights-only imported checkpoints: use
+            # uncorrected Adam scalars to avoid first-step amplification of
+            # any transient FP8 state corruption.
+            if self._step_count == 1:
+                self._bias_correction1 = 1.0
+                self._bias_correction2 = 1.0
+                self._step_size = self.lr
+                self._inv_bc2_sqrt = 1.0
+            else:
+                self._bias_correction1 = bc1
+                self._bias_correction2 = bc2
+                self._step_size = self.lr / bc1
+                self._inv_bc2_sqrt = 1.0 / math.sqrt(bc2)
             if not math.isfinite(self._step_size) or not math.isfinite(self._inv_bc2_sqrt):
                 raise RuntimeError(
                     "ECO bias-correction scalars became non-finite: "
@@ -645,8 +654,8 @@ class FusedBackwardECO:
             else:
                 self._eco_alpha = 0.0
 
-            # Reset GPU gradient norm accumulator
-            if self._norm_sq_gpu is not None:
+            # Reset gradient norm accumulator once per optimizer step.
+            if self._norm_sq_gpu is not None and self._current_microstep == 0:
                 self._norm_sq_gpu.zero_()
 
     def post_backward(self):
@@ -980,7 +989,8 @@ class FusedBackwardECO:
                 grad.mul_(1.0 / float(self._dp_size))
 
             # Gradient clipping using previous step's global norm estimate.
-            if self.grad_clip > 0 and not pending.is_accumulating:
+            # Apply on every micro-step before writing FP8 optimizer state.
+            if self.grad_clip > 0:
                 with _nvtx("eco/drain_one_grad_clip"):
                     if grad.dtype == torch.float32:
                         grad_flat = grad.reshape(-1)
@@ -1186,6 +1196,18 @@ class FusedBackwardECO:
                 grad = grad_comm
                 del grad_comm
 
+            # Gradient clipping using previous step's global norm estimate.
+            # Apply on every micro-step before writing FP8 optimizer state.
+            if self.grad_clip > 0:
+                with _nvtx("eco/fused_update_grad_clip"):
+                    if grad.dtype == torch.float32:
+                        grad_flat = grad.reshape(-1)
+                        grad_norm_sq = torch.dot(grad_flat, grad_flat)
+                    else:
+                        grad_norm = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float32)
+                        grad_norm_sq = grad_norm * grad_norm
+                    self._accumulate_norm_and_clip(grad, grad_norm_sq)
+
             # --- Synchronous path (single node or sync DP mode): run optimizer step inline ---
             if self.is_accumulating:
                 self._cuda_mv_accumulate(moe, param_name, grad, st,
@@ -1199,17 +1221,6 @@ class FusedBackwardECO:
                 step_state.fill_(float(self._step_count))
             else:
                 st["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
-
-            # Gradient clipping using previous step's global norm estimate.
-            if self.grad_clip > 0:
-                with _nvtx("eco/fused_update_grad_clip"):
-                    if grad.dtype == torch.float32:
-                        grad_flat = grad.reshape(-1)
-                        grad_norm_sq = torch.dot(grad_flat, grad_flat)
-                    else:
-                        grad_norm = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float32)
-                        grad_norm_sq = grad_norm * grad_norm
-                    self._accumulate_norm_and_clip(grad, grad_norm_sq)
 
             # CUDA fused kernel with fractional betas (zero FP32 materialization)
             if self._cuda_fused_update(moe, param_name, grad, st,

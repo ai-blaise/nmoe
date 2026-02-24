@@ -78,7 +78,9 @@ def _nvtx(tag: str):
 _USE_SDPA = os.getenv('NMOE_USE_FA4', '1') not in ('1', 'true', 'True')
 _REQUIRE_FLASHMLA = _env_flag("NMOE_REQUIRE_FLASHMLA", "1")
 _USE_FLASHMLA_VARLEN = _env_flag("NMOE_MLA_USE_FLASHMLA_VARLEN", "0")
-_USE_FLASHMLA_SM100_FWD = _env_flag("NMOE_MLA_USE_FLASHMLA_SM100_FWD", "0")
+# SM100 dense FlashMLA forward is the production default.
+# FA4 forward remains opt-in for targeted kernel debugging only.
+_USE_FLASHMLA_SM100_FWD = _env_flag("NMOE_MLA_USE_FLASHMLA_SM100_FWD", "1")
 _PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
 _VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
 _MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
@@ -505,10 +507,13 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     q_ = q.reshape(total, n_heads, d_qk).contiguous()
     k_ = k.reshape(total, n_heads, d_qk).contiguous()
     v_ = v.reshape(total, n_heads, d_v).contiguous()
-    force_finite = _step0_finite_guard_active()
-    _require_finite("fa4.q", q_, force=force_finite)
-    _require_finite("fa4.k", k_, force=force_finite)
-    _require_finite("fa4.v", v_, force=force_finite)
+    force_finite_inputs = _step0_finite_guard_active()
+    # If FA4 forward is explicitly selected, always enforce output finiteness
+    # to prevent silent NaN propagation into backward/optimizer state.
+    force_finite_outputs = force_finite_inputs or (not _USE_FLASHMLA_SM100_FWD)
+    _require_finite("fa4.q", q_, force=force_finite_inputs)
+    _require_finite("fa4.k", k_, force=force_finite_inputs)
+    _require_finite("fa4.v", v_, force=force_finite_inputs)
 
     cu = _get_uniform_cu(q.device, bsz, seqlen)
 
@@ -582,8 +587,8 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
           f"q_rms={q_rms:.6g} k_rms={k_rms:.6g} v_rms={v_rms:.6g} "
           f"softmax_scale={float(softmax_scale):.6g}"
         )
-    _require_finite(f"{fwd_path_tag}.out", out, force=force_finite)
-    _require_finite(f"{fwd_path_tag}.lse", lse, force=force_finite)
+    _require_finite(f"{fwd_path_tag}.out", out, force=force_finite_outputs)
+    _require_finite(f"{fwd_path_tag}.lse", lse, force=force_finite_outputs)
 
     # FlashMLA expects lse as [total, H] float32 with stride(0) == 1.
     if lse.shape == (n_heads, total):
