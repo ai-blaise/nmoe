@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 
 from nmoe.csrc import rdep as _C
 from nmoe.blockscaled.grouped import expert_blockscaled
@@ -585,18 +586,20 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     )
     if layout_reuse_enabled:
       candidate = getattr(ctx, "_saved_dispatch_layout", None)
-      if candidate is None:
-        raise RuntimeError(
-          "Missing saved dispatch layout in backward while layout reuse is enabled. "
-          "This can diverge rank participation between restore and re-dispatch paths."
-        )
-      if not (isinstance(candidate, tuple) and len(candidate) == 5):
-        raise RuntimeError(
-          "Invalid saved dispatch layout payload; expected 5-tuple "
-          "(dest, offsets, offs_pad, row_id, gate_sorted)."
-        )
-      saved_dispatch_layout = candidate
-      use_saved_layout = True
+      candidate_ok = bool(isinstance(candidate, tuple) and len(candidate) == 5)
+      # Keep collective participation deterministic across ranks:
+      # only use saved-layout restore when every rank can do so.
+      if is_dist and dist.is_available() and dist.is_initialized():
+        with _nvtx("moe_bs/bwd_layout_reuse_consensus"):
+          flag = torch.tensor([1 if candidate_ok else 0], device=device, dtype=torch.int32)
+          flag_min = flag.clone()
+          flag_max = flag.clone()
+          dist.all_reduce(flag_min, op=dist.ReduceOp.MIN)
+          dist.all_reduce(flag_max, op=dist.ReduceOp.MAX)
+          candidate_ok = bool(int(flag_min.item()) == 1 and int(flag_max.item()) == 1)
+      if candidate_ok:
+        saved_dispatch_layout = candidate
+        use_saved_layout = True
 
     with _nvtx("moe_bs/bwd_dispatch_meta"):
       if use_saved_layout:
