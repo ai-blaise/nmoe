@@ -2600,19 +2600,13 @@ def load_checkpoint(
         if resume_step >= 0:
             step = resume_step
             forced_path = checkpointer.path_for_step(step)
-            has_local = 1 if forced_path is not None else 0
-            if _is_dist():
-                device = (
-                    torch.device("cuda", torch.cuda.current_device())
-                    if torch.cuda.is_available()
-                    else torch.device("cpu")
-                )
-                has_tensor = torch.tensor([has_local], device=device, dtype=torch.int64)
-                dist.all_reduce(has_tensor, op=dist.ReduceOp.MIN)
-                has_local = int(has_tensor.item())
-            if has_local != 1:
+            # Keep forced-resume startup collective-free to avoid 128-rank
+            # metadata stalls before checkpoint import. Each rank validates its
+            # local shard path and fails fast independently.
+            if forced_path is None:
                 raise FileNotFoundError(
-                    f"Forced resume_step={step} requested, but checkpoint shard is missing on one or more ranks."
+                    "Forced resume_step="
+                    f"{step} requested, but local checkpoint shard is missing on rank={rank}."
                 )
             if rank == 0:
                 print_fn(f"[checkpoint] Using forced resume_step={step}")

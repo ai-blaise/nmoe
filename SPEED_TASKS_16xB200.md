@@ -1583,6 +1583,11 @@ Scope:
   - Acceptance: direct NVFP4 checkpoint-load requirement is enforced only on real resume (`start_step > 0`), not on fresh launches with default `resume=true`.
   - Status note: startup guard now keys on `start_step` returned by checkpoint loader, preventing pre-step aborts on intentional from-scratch runs.
 
+- [x] R-082 Remove forced-resume startup collective from checkpoint loader.
+  - Files: `nmoe/checkpoint.py`
+  - Acceptance: `resume_step >= 0` path no longer performs pre-load distributed all-reduce consensus before first checkpoint import log line.
+  - Status note: forced-resume now validates local shard presence per-rank and fails fast locally, avoiding step-0 startup stalls from metadata collectives.
+
 - [x] R-040 Harden runtime RDEP mode contract and trim repeated host-side runtime probes.
   - Files: `nmoe/train.py`, `nmoe/csrc/rdep.cu`, `nmoe/csrc/rdep_nvshmem.cu`, `nmoe/zero2.py`, `nmoe/opt.py`
   - Acceptance: runtime BF16-dispatch purity guard cannot silently down-classify missing mode to IPC; warp-stride launch cap helper avoids per-call CUDA device queries; NVTX checks in optimizer/ZeRO paths are import-time cached.
