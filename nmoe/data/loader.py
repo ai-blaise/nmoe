@@ -313,6 +313,7 @@ def build_loader(
     cfg,
     rank: int,
     world_size: int,
+    gradient_accumulation_steps: int = 1,
     split: str = "train",
     print_fn=print,
 ) -> tuple[DeterministicLoader, MixturePlan]:
@@ -320,14 +321,28 @@ def build_loader(
 
     Args:
         cfg: Config object with data settings (flow_mode required)
-        rank: Current process rank
-        world_size: Total number of processes
+        rank: Data-parallel rank (not global world rank when EP>1)
+        world_size: Data-parallel world size (not global world size when EP>1)
+        gradient_accumulation_steps: Micro-steps per optimizer step.
         split: Data split to load ("train" or "valid")
         print_fn: Function for logging (default: print)
 
     Returns:
         (loader, plan): DeterministicLoader instance and MixturePlan
     """
+    if gradient_accumulation_steps <= 0:
+        raise ValueError(
+            f"gradient_accumulation_steps must be >= 1, got {gradient_accumulation_steps}"
+        )
+    if cfg.batch_size % gradient_accumulation_steps != 0:
+        raise ValueError(
+            f"batch_size ({cfg.batch_size}) must be divisible by "
+            f"gradient_accumulation_steps ({gradient_accumulation_steps})"
+        )
+
+    global_micro_batch = cfg.batch_size // gradient_accumulation_steps
+    effective_tpu = global_micro_batch * cfg.seq_len
+
     # Fast path: stream directly from a directory of shards (no flow TOMLs)
     if getattr(cfg, 'data_path', None) and not getattr(cfg, 'flow_mode', None):
         from glob import glob
@@ -367,7 +382,7 @@ def build_loader(
             dp_world_size=world_size,
             dp_rank=rank,
             seq_len=cfg.seq_len,
-            tokens_per_update=cfg.batch_size * cfg.seq_len,
+            tokens_per_update=effective_tpu,
             device='cuda',
             # Prefetch breaks exact-resume unless queue contents are checkpointed.
             prefetch_depth=0,
@@ -433,9 +448,8 @@ def build_loader(
     # Preflight check
     _preflight_check(plan, cfg.seq_len, print_fn)
 
-    # Use batch_size * seq_len as tokens_per_update so each .next() returns batch_size sequences
-    # This matches what train.py expects: inputs.shape[0] == batch_size
-    effective_tpu = cfg.batch_size * cfg.seq_len
+    # Per-forward global micro-batch is batch_size / gradient_accumulation_steps.
+    # The training loop calls loader.next() once per micro-step.
     loader = DeterministicLoader(
         plan=plan,
         dp_world_size=world_size,

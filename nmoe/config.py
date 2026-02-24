@@ -173,7 +173,7 @@ class Config:
   eco_allreduce_chunk_mb: int = 0      # Per-chunk size in MB (0 => async default chunk size)
   eco_allreduce_chunk_threshold_mb: int = 0  # Payload threshold MB (<= threshold => single all-reduce)
   eco_max_pending_allreduce_mb: int = 4096  # Async queue byte budget for in-flight ECO all-reduces
-  eco_max_pending_allreduce_ops: int = 4    # Async queue depth cap (number of in-flight gradient payloads)
+  eco_max_pending_allreduce_ops: int = 0    # Async queue depth cap (0 => auto-size from payload+byte budget)
   eco_comm_stall_warn_s: float = 30.0  # Warn when an ECO DP all-reduce has no progress for this many seconds
   eco_comm_debug: bool = False         # Verbose ECO all-reduce enqueue telemetry
   gradient_checkpointing: bool = False # Required for NVFP4 primary (1 layer BF16 scratch)

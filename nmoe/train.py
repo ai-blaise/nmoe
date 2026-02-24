@@ -207,26 +207,47 @@ def _validate_training_config(cfg: Config, world: int) -> None:
   if cfg.batch_size <= 0:
     raise ValueError(f"batch_size must be > 0 (got {cfg.batch_size})")
 
-  # For SFT with EP/DP, batch_size must be divisible by dp_size (not world).
-  # Example: EP=8, DP=16, world=128, batch_size=256 => 256 % 16 = 0
-  sft_mode = getattr(cfg, 'sft_enabled', False)
-  if sft_mode:
-    ep_size = getattr(cfg, 'ep_size', 1)
-    dp_size = getattr(cfg, 'dp_size', None) or max(1, world // ep_size)
-    if dp_size > 1 and (cfg.batch_size % dp_size) != 0:
-      raise ValueError(
-        f"batch_size ({cfg.batch_size}) must be divisible by dp_size ({dp_size}) in SFT mode. "
-        f"With EP={ep_size}, each DP replica gets batch_size/dp_size microbatch."
-      )
-    if ep_size > 1 and world % ep_size != 0:
-      raise ValueError(
-        f"world_size ({world}) must be divisible by ep_size ({ep_size}). "
-        f"Cannot split {world} GPUs into groups of {ep_size}."
-      )
-  elif world > 1 and (cfg.batch_size % world) != 0:
+  accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
+  if accum_steps <= 0:
     raise ValueError(
-      f"batch_size ({cfg.batch_size}) must be divisible by world_size ({world}). "
-      "Uneven per-rank microbatches break ZeRO-2 AVG semantics and exact token accounting."
+      f"gradient_accumulation_steps must be >= 1 (got {accum_steps})"
+    )
+
+  # For EP/DP training with gradient accumulation, the global batch is consumed
+  # over `accum_steps` micro-steps. Require exact divisibility to avoid silent
+  # floor division in local micro-batch construction.
+  sft_mode = getattr(cfg, 'sft_enabled', False)
+  ep_size = max(1, int(getattr(cfg, 'ep_size', 1)))
+  if world % ep_size != 0:
+    raise ValueError(
+      f"world_size ({world}) must be divisible by ep_size ({ep_size}). "
+      f"Cannot split {world} GPUs into groups of {ep_size}."
+    )
+  dp_size = int(getattr(cfg, 'dp_size', None) or max(1, world // ep_size))
+  if dp_size <= 0:
+    raise ValueError(f"dp_size must be >= 1 (got {dp_size})")
+  if getattr(cfg, 'dp_size', None) is not None and (dp_size * ep_size) != world:
+    raise ValueError(
+      f"dp_size*ep_size must equal world_size when dp_size is set explicitly "
+      f"(got dp_size={dp_size}, ep_size={ep_size}, world_size={world})"
+    )
+
+  denom = dp_size * accum_steps
+  if denom <= 0:
+    raise ValueError(f"Invalid batch denominator dp_size*accum_steps={denom}")
+
+  if sft_mode:
+    if (cfg.batch_size % denom) != 0:
+      raise ValueError(
+        f"batch_size ({cfg.batch_size}) must be divisible by dp_size*accum_steps "
+        f"({dp_size}*{accum_steps}={denom}) in SFT mode. "
+        "Each forward micro-batch uses batch_size/(dp_size*accum_steps)."
+      )
+  elif (cfg.batch_size % denom) != 0:
+    raise ValueError(
+      f"batch_size ({cfg.batch_size}) must be divisible by dp_size*accum_steps "
+      f"({dp_size}*{accum_steps}={denom}). "
+      "Uneven per-rank micro-batches break exact token accounting and DP averaging."
     )
 
   if cfg.seq_len <= 0:
@@ -439,6 +460,12 @@ def train(cfg: Config):
     async_max_queue=1,
   )
 
+  accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
+  if accum_steps <= 0:
+    raise RuntimeError(
+      f"gradient_accumulation_steps must be >= 1, got {accum_steps}"
+    )
+
   # Build components
   sft_mode = getattr(cfg, 'sft_enabled', False)
   if sft_mode:
@@ -453,7 +480,21 @@ def train(cfg: Config):
     loader = build_sft_loader(cfg, dp_rank=dp_rank, dp_world_size=dp_size, print_fn=print)
     plan = None  # SFT has no MixturePlan
   else:
-    loader, plan = build_loader(cfg, rank, world)
+    # Pretraining data is sharded by DP replicas, not by global world rank.
+    ep_size = max(1, int(getattr(cfg, 'ep_size', 1)))
+    dp_size = int(getattr(cfg, 'dp_size', None) or max(1, world // ep_size))
+    dp_rank = rank // ep_size
+    if rank == 0:
+      logger.info(
+        "Pretrain loader ep_size=%d dp_size=%d dp_rank=%d world=%d accum_steps=%d",
+        ep_size, dp_size, dp_rank, world, accum_steps,
+      )
+    loader, plan = build_loader(
+      cfg,
+      dp_rank,
+      dp_size,
+      gradient_accumulation_steps=accum_steps,
+    )
 
   # ── Epoch → steps resolution ──────────────────────────────────────────────
   if cfg.epochs is not None:
@@ -466,7 +507,9 @@ def train(cfg: Config):
     else:
       # Pretraining: one epoch = one pass over all tokens
       # total_tokens estimated from dataset size * seq_len
-      micro_batch = cfg.batch_size // world
+      ep_size = max(1, int(getattr(cfg, 'ep_size', 1)))
+      dp_size = int(getattr(cfg, 'dp_size', None) or max(1, world // ep_size))
+      micro_batch = cfg.batch_size // max(1, dp_size * accum_steps)
       dataset_len = len(loader.dataset) if hasattr(loader, 'dataset') else len(loader)
       resolved_steps = cfg.epochs * (dataset_len // micro_batch)
 
@@ -667,7 +710,6 @@ def train(cfg: Config):
         dense_clip_params.append(p)
 
   # Gradient accumulation configuration
-  accum_steps = int(getattr(cfg, 'gradient_accumulation_steps', 1))
   step_heartbeat = _env_flag("NMOE_STEP_HEARTBEAT", "1")
   if step_heartbeat and rank == 0:
     logger.info("Step heartbeat enabled (NMOE_STEP_HEARTBEAT=1): per-micro-step stage markers will be printed")
@@ -888,16 +930,26 @@ def train(cfg: Config):
                   f"Non-finite DP token-weight loss scale: {float(rank_loss_scale)}"
                 )
               loss = loss * rank_loss_scale.to(dtype=loss.dtype)
+            aux_loss = model.get_router_aux_loss()
+            if aux_loss.device != loss.device:
+              aux_loss = aux_loss.to(device=loss.device)
+            if not torch.isfinite(aux_loss).item():
+              raise RuntimeError(
+                f"Non-finite router aux loss detected at step={step_num}, micro_step={micro_step}: "
+                f"{float(aux_loss)}"
+              )
+            loss = loss + aux_loss.to(dtype=loss.dtype)
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
+            aux_loss_unscaled = float(aux_loss.detach().item())
           micro_loss_unscaled = float(
             (loss.detach() * (accum_steps if accum_steps > 1 else 1)).item()
           )
           if step_heartbeat and rank == 0:
             print(
               f"[HB] step={step_num} micro={micro_step} stage=loss_done "
-              f"loss={micro_loss_unscaled:.6f}",
+              f"loss={micro_loss_unscaled:.6f} aux={aux_loss_unscaled:.6f}",
               flush=True,
             )
 
@@ -954,7 +1006,22 @@ def train(cfg: Config):
             # Drain async ECO comm/update queue only once per optimizer step.
             # Non-final micro-steps only accumulate optimizer state (no weight update),
             # so forcing a full drain/sync here is unnecessary overhead.
+            if step_heartbeat and rank == 0:
+              qlen, qmb = fused_eco.pending_queue_state()
+              print(
+                f"[HB] step={step_num} stage=eco_drain_start pending={qlen} pending_mb={qmb:.1f}",
+                flush=True,
+              )
+            eco_drain_t0 = time.perf_counter()
             fused_eco.post_backward()
+            if step_heartbeat and rank == 0:
+              qlen, qmb = fused_eco.pending_queue_state()
+              eco_drain_ms = (time.perf_counter() - eco_drain_t0) * 1000.0
+              print(
+                f"[HB] step={step_num} stage=eco_drain_done ms={eco_drain_ms:.1f} "
+                f"pending={qlen} pending_mb={qmb:.1f}",
+                flush=True,
+              )
 
           accumulated_loss_gpu += loss.detach() * (accum_steps if accum_steps > 1 else 1)
 
@@ -966,10 +1033,21 @@ def train(cfg: Config):
         # Uses fused foreach op (1 kernel) instead of per-param norm computation (~N kernels)
         _grad_params = [p for p in grad_norm_params if p.grad is not None]
         grad_norm = fused_grad_norm_(_grad_params) if _grad_params else torch.tensor(0.0, device='cuda')
-        _grad_norm_bad = not torch.isfinite(grad_norm).item()
+        local_grad_norm_bad = not torch.isfinite(grad_norm).item()
+        grad_norm_finite = torch.isfinite(grad_norm).to(dtype=torch.int32)
+        if world > 1:
+          import torch.distributed as _dist
+          if _dist.is_available() and _dist.is_initialized():
+            _dist.all_reduce(grad_norm_finite, op=_dist.ReduceOp.MIN)
+        _grad_norm_bad = grad_norm_finite.item() == 0
         if _grad_norm_bad:
             bad_grad_details = _collect_nonfinite_grad_details(named_grad_params, max_items=8)
             detail = "; ".join(bad_grad_details) if bad_grad_details else "none"
+            if not local_grad_norm_bad:
+              detail = (
+                f"remote rank reported non-finite dense grad_norm; local_grad_norm={float(grad_norm):.6g}; "
+                f"local_non_finite_grads={detail}"
+              )
             raise RuntimeError(
               f"Non-finite dense grad_norm detected at step={step_num}: {float(grad_norm)}. "
               f"First non-finite grads: {detail}. Aborting before optimizer step."

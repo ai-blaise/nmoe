@@ -222,9 +222,9 @@ class FusedBackwardECO:
         if max_pending_mb <= 0:
             raise ValueError(f"eco_max_pending_allreduce_mb must be > 0, got {max_pending_mb}")
         self._max_pending_bytes = max_pending_mb * 1024 * 1024
-        max_pending_ops = int(getattr(cfg, 'eco_max_pending_allreduce_ops', 4))
-        if max_pending_ops <= 0:
-            raise ValueError(f"eco_max_pending_allreduce_ops must be > 0, got {max_pending_ops}")
+        max_pending_ops = int(getattr(cfg, 'eco_max_pending_allreduce_ops', 0))
+        if max_pending_ops < 0:
+            raise ValueError(f"eco_max_pending_allreduce_ops must be >= 0, got {max_pending_ops}")
         self._stall_warn_s = float(getattr(cfg, 'eco_comm_stall_warn_s', 30.0))
         if self._stall_warn_s <= 0:
             raise ValueError(f"eco_comm_stall_warn_s must be > 0, got {self._stall_warn_s}")
@@ -235,7 +235,8 @@ class FusedBackwardECO:
         # Async all-reduce queue: deferred optimizer steps overlapping with compute.
         # Track both queue depth and total queued bytes to avoid overcommitting HBM.
         self._pending_queue: deque[PendingAllReduce] = deque()
-        self._max_pending = max_pending_ops
+        self._max_pending_cfg = max_pending_ops
+        self._max_pending = max_pending_ops if max_pending_ops > 0 else 1
         self._pending_bytes: int = 0
         self._allreduce_seq: int = 0
         self._dp_comm_stream: torch.cuda.Stream | None = None
@@ -296,7 +297,7 @@ class FusedBackwardECO:
             f"allreduce_chunk_mb={chunk_mb}, "
             f"allreduce_chunk_threshold_mb={threshold_mb}, "
             f"max_pending_allreduce_mb={max_pending_mb}, "
-            f"max_pending_allreduce_ops={max_pending_ops}"
+            f"max_pending_allreduce_ops={'auto' if max_pending_ops == 0 else max_pending_ops}"
         )
 
     def set_dp_group(self, dp_group, dp_size: int):
@@ -306,6 +307,23 @@ class FusedBackwardECO:
         self._dp_comm_stream = None
         if self._allreduce_mode == 'async' and dp_group is not None and dp_size > 1:
             self._dp_comm_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+
+    def pending_queue_state(self) -> tuple[int, float]:
+        """Return current async DP queue state (count, MB) for telemetry."""
+        return len(self._pending_queue), self._pending_bytes / (1024 * 1024)
+
+    def _effective_max_pending_ops(self, payload_nbytes: int) -> int:
+        """Return queue-depth limit for one payload.
+
+        When eco_max_pending_allreduce_ops=0, derive depth from byte budget and
+        payload size to avoid over-serialization on large gradients while
+        respecting memory limits.
+        """
+        if self._max_pending_cfg > 0:
+            return self._max_pending_cfg
+        payload = max(1, int(payload_nbytes))
+        auto_ops = max(1, self._max_pending_bytes // payload)
+        return min(auto_ops, 8)
 
     def set_microstep(self, microstep: int, total_microsteps: int):
         """Set the current micro-step index for gradient accumulation.
@@ -1032,6 +1050,7 @@ class FusedBackwardECO:
             if self._dp_size > 1 and self._dp_group is not None:
                 comm_nbytes = grad_comm.numel() * grad_comm.element_size()
                 if self._allreduce_mode == 'async':
+                    effective_max_pending = self._effective_max_pending_ops(comm_nbytes)
                     # --- Async path: enqueue all_reduce, defer optimizer step ---
                     # Opportunistic drain: process any completed ops without blocking.
                     self._drain_completed()
@@ -1045,7 +1064,7 @@ class FusedBackwardECO:
 
                     # Back-pressure on queue depth and queued bytes.
                     while self._pending_queue and (
-                        len(self._pending_queue) >= self._max_pending
+                        len(self._pending_queue) >= effective_max_pending
                         or self._pending_bytes + comm_nbytes > self._max_pending_bytes
                     ):
                         self._drain_one()
@@ -1072,13 +1091,14 @@ class FusedBackwardECO:
                     self._pending_bytes += comm_nbytes
                     if self._comm_debug:
                         logger.info(
-                            "[eco] enqueued DP all-reduce: step=%s seq=%s param=%s payload_mb=%.1f pending=%s pending_mb=%.1f",
+                            "[eco] enqueued DP all-reduce: step=%s seq=%s param=%s payload_mb=%.1f pending=%s pending_mb=%.1f max_pending=%s",
                             self._current_step,
                             seq,
                             param_name,
                             comm_nbytes / (1024 * 1024),
                             len(self._pending_queue),
                             self._pending_bytes / (1024 * 1024),
+                            effective_max_pending,
                         )
                     return  # Optimizer step deferred to _drain_one/_drain_all
 
