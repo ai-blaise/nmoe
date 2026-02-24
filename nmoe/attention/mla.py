@@ -35,8 +35,8 @@ def _nan_debug_active() -> bool:
   return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_MLA_FINITE_DEBUG", "0")
 
 
-def _require_finite(tag: str, tensor: torch.Tensor) -> None:
-  if not _nan_debug_active():
+def _require_finite(tag: str, tensor: torch.Tensor, *, force: bool = False) -> None:
+  if (not force) and (not _nan_debug_active()):
     return
   if not (tensor.is_floating_point() or tensor.is_complex()):
     return
@@ -102,6 +102,18 @@ def _load_mla_softmax_scale_mult() -> float:
 
 
 _MLA_SOFTMAX_SCALE_MULT = _load_mla_softmax_scale_mult()
+_MLA_FAILFAST_STEP0 = _env_flag("NMOE_MLA_FAILFAST_STEP0", "1")
+_mla_step0_finite_checks_remaining = 1
+
+
+def _step0_finite_guard_active() -> bool:
+  return _MLA_FAILFAST_STEP0 and (_mla_step0_finite_checks_remaining > 0)
+
+
+def _mark_step0_finite_guard_consumed() -> None:
+  global _mla_step0_finite_checks_remaining
+  if _mla_step0_finite_checks_remaining > 0:
+    _mla_step0_finite_checks_remaining -= 1
 
 
 def _check_flashmla_varlen_available() -> tuple[bool, str]:
@@ -491,9 +503,10 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     q_ = q.reshape(total, n_heads, d_qk).contiguous()
     k_ = k.reshape(total, n_heads, d_qk).contiguous()
     v_ = v.reshape(total, n_heads, d_v).contiguous()
-    _require_finite("fa4.q", q_)
-    _require_finite("fa4.k", k_)
-    _require_finite("fa4.v", v_)
+    force_finite = _step0_finite_guard_active()
+    _require_finite("fa4.q", q_, force=force_finite)
+    _require_finite("fa4.k", k_, force=force_finite)
+    _require_finite("fa4.v", v_, force=force_finite)
 
     cu = _get_uniform_cu(q.device, bsz, seqlen)
 
@@ -562,8 +575,8 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
           f"q_rms={q_rms:.6g} k_rms={k_rms:.6g} v_rms={v_rms:.6g} "
           f"softmax_scale={float(softmax_scale):.6g}"
         )
-    _require_finite("fa4.out", out)
-    _require_finite("fa4.lse", lse)
+    _require_finite("fa4.out", out, force=force_finite)
+    _require_finite("fa4.lse", lse, force=force_finite)
 
     # FlashMLA expects lse as [total, H] float32 with stride(0) == 1.
     if lse.shape == (n_heads, total):
@@ -745,7 +758,10 @@ class MLA(nn.Module):
           else:
             output = _MlaFa4FwdFlashMlaBwd.apply(q, k, v, self.softmax_scale)
     output = output.reshape(bsz, seqlen, self.n_heads * self.v_head_dim)
-    _require_finite("mla.out_attn", output)
+    force_finite = _step0_finite_guard_active()
+    _require_finite("mla.out_attn", output, force=force_finite)
     out = self.wo(output)
-    _require_finite("mla.out_wo", out)
+    _require_finite("mla.out_wo", out, force=force_finite)
+    if force_finite:
+      _mark_step0_finite_guard_consumed()
     return out

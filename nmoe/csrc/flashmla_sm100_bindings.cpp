@@ -33,7 +33,11 @@ void check_fwd_contract(
     const at::Tensor& cumulative_seqlen_kv,
     const at::Tensor& o,
     const at::Tensor& lse,
-    double softmax_scale) {
+    double softmax_scale,
+    int mask_mode_code,
+    int max_seqlen_q,
+    int max_seqlen_kv,
+    bool is_varlen) {
   check_cuda_tensor(workspace_buffer, "workspace_buffer");
   check_cuda_tensor(q, "q");
   check_cuda_tensor(k, "k");
@@ -82,6 +86,27 @@ void check_fwd_contract(
   TORCH_CHECK(o.size(0) == v.size(0) && o.size(1) == v.size(1) && o.size(2) == v.size(2), "o must match v shape");
   TORCH_CHECK(lse.size(0) == q.size(0) && lse.size(1) == q.size(1), "lse must match [T, H]");
 
+  TORCH_CHECK(mask_mode_code == 0 || mask_mode_code == 1, "mask_mode_code must be 0 (non-causal) or 1 (causal)");
+  TORCH_CHECK(max_seqlen_q > 0, "max_seqlen_q must be > 0");
+  TORCH_CHECK(max_seqlen_kv > 0, "max_seqlen_kv must be > 0");
+  TORCH_CHECK(max_seqlen_q <= q.size(0), "max_seqlen_q must not exceed total q tokens");
+  TORCH_CHECK(max_seqlen_kv <= k.size(0), "max_seqlen_kv must not exceed total kv tokens");
+  const auto batch_q = cumulative_seqlen_q.numel() - 1;
+  const auto batch_kv = cumulative_seqlen_kv.numel() - 1;
+  TORCH_CHECK(batch_q == batch_kv, "cumulative_seqlen_q and cumulative_seqlen_kv must describe the same batch size");
+  TORCH_CHECK(batch_q > 0, "batch size inferred from cumulative seqlens must be > 0");
+  if (!is_varlen) {
+    TORCH_CHECK(q.size(0) % batch_q == 0, "fixed-length mode requires q total tokens divisible by batch size");
+    TORCH_CHECK(k.size(0) % batch_kv == 0, "fixed-length mode requires k total tokens divisible by batch size");
+    TORCH_CHECK(v.size(0) % batch_kv == 0, "fixed-length mode requires v total tokens divisible by batch size");
+    TORCH_CHECK(
+        q.size(0) / batch_q == max_seqlen_q,
+        "fixed-length mode requires max_seqlen_q == q_total_tokens / batch_size");
+    TORCH_CHECK(
+        k.size(0) / batch_kv == max_seqlen_kv,
+        "fixed-length mode requires max_seqlen_kv == kv_total_tokens / batch_size");
+  }
+
   TORCH_CHECK(std::isfinite(softmax_scale), "softmax_scale must be finite");
   TORCH_CHECK(softmax_scale > 0.0, "softmax_scale must be > 0");
 }
@@ -99,7 +124,11 @@ void check_bwd_contract(
     const at::Tensor& dq,
     const at::Tensor& dk,
     const at::Tensor& dv,
-    double softmax_scale) {
+    double softmax_scale,
+    int mask_mode_code,
+    int max_seqlen_q,
+    int max_seqlen_kv,
+    bool is_varlen) {
   check_fwd_contract(
       workspace_buffer,
       q,
@@ -109,7 +138,11 @@ void check_bwd_contract(
       cumulative_seqlen_kv,
       o,
       lse,
-      softmax_scale);
+      softmax_scale,
+      mask_mode_code,
+      max_seqlen_q,
+      max_seqlen_kv,
+      is_varlen);
 
   check_cuda_tensor(d_o, "d_o");
   check_cuda_tensor(dq, "dq");
@@ -162,7 +195,11 @@ void dense_prefill_fwd(
       cumulative_seqlen_kv,
       o,
       lse,
-      softmax_scale);
+      softmax_scale,
+      mask_mode_code,
+      max_seqlen_q,
+      max_seqlen_kv,
+      is_varlen);
   FMHACutlassSM100FwdRun(
       workspace_buffer,
       q,
@@ -210,7 +247,11 @@ void dense_prefill_bwd(
       dq,
       dk,
       dv,
-      softmax_scale);
+      softmax_scale,
+      mask_mode_code,
+      max_seqlen_q,
+      max_seqlen_kv,
+      is_varlen);
   FMHACutlassSM100BwdRun(
       workspace_buffer,
       d_o,
