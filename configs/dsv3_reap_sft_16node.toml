@@ -105,7 +105,7 @@ eco_max_pending_allreduce_mb = 1024
 eco_max_pending_allreduce_ops = 0      # Auto-size queue depth from payload + byte budget
 eco_comm_stall_warn_s = 15.0
 eco_comm_debug = false
-gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a time
+gradient_checkpointing = false   # B200 memory headroom at seq_len=1024; avoids checkpoint replay overhead/instability
 
 # =============================================================================
 # Training

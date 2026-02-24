@@ -633,6 +633,34 @@ class FusedBackwardECO:
                 norm_sq = 0.0
             self._prev_global_norm = math.sqrt(max(norm_sq, 1e-30))
 
+    @torch.no_grad()
+    def _accumulate_norm_and_clip(self, grad: torch.Tensor, grad_norm_sq: torch.Tensor) -> None:
+        """Accumulate squared norm and apply clipping.
+
+        Uses previous-step global norm for steady-state clipping. On step 0
+        (bootstrap) falls back to local per-tensor norm clipping to avoid the
+        stale `_prev_global_norm=1.0` bootstrap under-clipping.
+        """
+        if self._norm_sq_gpu is None:
+            self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
+        self._norm_sq_gpu += grad_norm_sq
+
+        use_prev_global = (
+            self._step_count > 1
+            and math.isfinite(self._prev_global_norm)
+            and self._prev_global_norm > 0.0
+        )
+        if use_prev_global:
+            clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
+            if clip_coeff < 1.0:
+                grad.mul_(clip_coeff)
+            return
+
+        # Bootstrap path (step 0): clip by current tensor norm.
+        grad_norm = torch.sqrt(torch.clamp(grad_norm_sq.to(dtype=torch.float32), min=1e-30))
+        clip_coeff_t = torch.clamp(self.grad_clip / (grad_norm + 1e-6), max=1.0)
+        grad.mul_(clip_coeff_t.to(dtype=grad.dtype))
+
     def consume_runtime_counters(self) -> dict[str, float]:
         """Return and reset per-step ECO CUDA-path counters."""
         counters = {
@@ -921,13 +949,7 @@ class FusedBackwardECO:
                     else:
                         grad_norm = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float32)
                         grad_norm_sq = grad_norm * grad_norm
-                    if self._norm_sq_gpu is None:
-                        self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
-                    self._norm_sq_gpu += grad_norm_sq
-                    if self._prev_global_norm > 0:
-                        clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
-                        if clip_coeff < 1.0:
-                            grad.mul_(clip_coeff)
+                    self._accumulate_norm_and_clip(grad, grad_norm_sq)
 
             if pending.is_accumulating:
                 self._cuda_mv_accumulate(
@@ -1140,13 +1162,7 @@ class FusedBackwardECO:
                     else:
                         grad_norm = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float32)
                         grad_norm_sq = grad_norm * grad_norm
-                    if self._norm_sq_gpu is None:
-                        self._norm_sq_gpu = torch.zeros(1, device=grad.device, dtype=torch.float64)
-                    self._norm_sq_gpu += grad_norm_sq
-                    if self._prev_global_norm > 0:
-                        clip_coeff = self.grad_clip / (self._prev_global_norm + 1e-6)
-                        if clip_coeff < 1.0:
-                            grad.mul_(clip_coeff)
+                    self._accumulate_norm_and_clip(grad, grad_norm_sq)
 
             # CUDA fused kernel with fractional betas (zero FP32 materialization)
             if self._cuda_fused_update(moe, param_name, grad, st,

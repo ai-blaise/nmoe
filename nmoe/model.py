@@ -665,6 +665,11 @@ class TransformerBlock(nn.Module):
         )
       self.attn.window = window
     self.is_moe = layer_id >= config.n_dense_layers
+    if self.is_moe and self._checkpoint_ffn and rdep is not None and int(getattr(rdep, "world", 1)) > 1:
+      raise ValueError(
+        "checkpoint_moe_ffn=true is unsupported with distributed RDEP. "
+        "Set checkpoint_moe_ffn=false (attention-only checkpointing)."
+      )
     if layer_id < config.n_dense_layers:
       self.ffn = MLP(dim=config.dim, inter_dim=config.inter_dim)
     else:
