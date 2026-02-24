@@ -149,6 +149,7 @@ def _cache_put_capped(cache: dict, key, value) -> None:
     cache[key] = value
 
 
+@torch._dynamo.disable
 def _get_cached_offs_pad(rdep: "Rdep", device: torch.device, n_local: int) -> torch.Tensor:
     """Return reusable per-stream device buffer for expert padded offsets."""
     sid = _stream_cache_id(device)
@@ -165,6 +166,7 @@ def _get_cached_offs_pad(rdep: "Rdep", device: torch.device, n_local: int) -> to
     return offs_pad
 
 
+@torch._dynamo.disable
 def _get_cached_pinned_m_host(rdep: "Rdep") -> torch.Tensor:
     """Return reusable per-stream pinned host scalar for dispatch M_pad/M_recv."""
     dev = torch.cuda.current_device()
