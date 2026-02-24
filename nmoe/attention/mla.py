@@ -125,6 +125,17 @@ _mla_workspace_cache: dict[tuple[int, int], torch.Tensor] = {}
 _mla_uniform_cu_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
+def _is_compiling() -> bool:
+  try:
+    return bool(torch.compiler.is_compiling())
+  except Exception:
+    dyn = getattr(torch, "_dynamo", None)
+    if dyn is None:
+      return False
+    fn = getattr(dyn, "is_compiling", None)
+    return bool(fn()) if callable(fn) else False
+
+
 def _get_mla_workspace(device: torch.device, workspace_bytes: int) -> torch.Tensor:
   """Get a cached workspace buffer for MLA backward.
 
@@ -155,7 +166,9 @@ def _get_uniform_cu(device: torch.device, bsz: int, seqlen: int) -> torch.Tensor
   if cu is None or cu.device != device:
     cu = torch.arange(0, (bsz + 1) * seqlen, step=seqlen, device=device, dtype=torch.int32)
     _mla_uniform_cu_cache[key] = cu
-  cu.record_stream(torch.cuda.current_stream(device))
+  # Inductor/AOT functionalization cannot lower record_stream in compiled graphs.
+  if not _is_compiling():
+    cu.record_stream(torch.cuda.current_stream(device))
   return cu
 
 
