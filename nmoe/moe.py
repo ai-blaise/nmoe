@@ -369,6 +369,32 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         f"(T={T}, K={K}, mode={rdep._mode}, world={rdep.world})."
       )
     if M_recv <= 0:
+      # Keep backward dispatch path rank-consistent: when layout reuse is enabled,
+      # every rank must carry a saved layout tuple (including empty M_recv==0 cases),
+      # otherwise some ranks restore layout while others re-dispatch.
+      if (
+        torch.is_grad_enabled()
+        and not _DISABLE_LAYOUT_REUSE
+        and _HAS_COPY_BLOCKSCALED_LAYOUT
+        and _HAS_RESTORE_LAYOUT_FROM_SAVED
+        and _HAS_RDEP_LAYOUT_CACHE
+      ):
+        with _nvtx("moe_bs/fwd_snapshot_layout_zero_recv"), cuda_error_context("copy_blockscaled_layout_zero_recv"):
+          saved_dest = torch.empty(0, device=device, dtype=torch.int32)
+          saved_offsets = torch.empty(int(E) + 1, device=device, dtype=torch.int32)
+          _C.copy_blockscaled_layout(
+            saved_dest.data_ptr(),
+            saved_offsets.data_ptr(),
+            0,
+            stream,
+          )
+        saved_dispatch_layout = (
+          saved_dest,
+          saved_offsets,
+          offs_pad.clone(),
+          torch.empty(0, device=device, dtype=torch.int64),
+          torch.empty(0, device=device, dtype=torch.float32),
+        )
       # DeepEP collectiveness: every rank must participate in return_scatter
       if is_dist:
         dummy_ye_pad = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
@@ -379,7 +405,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       ctx.K = int(K)
       ctx.fused_eco = fused_eco
       ctx.moe_ref = moe_ref
-      ctx._saved_dispatch_layout = None
+      ctx._saved_dispatch_layout = saved_dispatch_layout
       if fused_eco is not None:
         # Save empty placeholders — backward will dequant from NVFP4 via moe_ref
         _dev = x.device
