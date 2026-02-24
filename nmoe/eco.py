@@ -1114,7 +1114,7 @@ class FusedBackwardECO:
                     use_async_allreduce
                     and self._dp_size >= 16
                     and self._step_count == 1
-                    and self._current_microstep == 0
+                    and (not self._async_accumulation or self._current_microstep == 0)
                 ):
                     # Bootstrap guard: avoid early async queue back-pressure
                     # waits inside backward on large DP jobs.

@@ -715,6 +715,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       dX = torch.zeros(int(T), int(H), device=device, dtype=torch.float32)
 
       # DeepEP collectiveness: still run distributed gather/scatter
+      dummy_dxe_pad: torch.Tensor | None = None
       if is_dist:
         dGates_tk_bf16 = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
         dummy_row_id = torch.empty(1, device=device, dtype=torch.int64)
@@ -740,19 +741,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
             stream,
           )
         dummy_dxe_pad = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
-        with cuda_error_context("scatter_dx_dist_from_pad_bf16 (blockscaled backward, M_recv=0)"):
-          _C.scatter_dx_dist_from_pad_bf16(
-            dummy_dxe_pad.data_ptr(),
-            dummy_row_id.data_ptr(),
-            dX.data_ptr(),
-            0, int(T), int(H), int(K),
-            stream,
-          )
       else:
         dGates_tk_bf16 = torch.zeros(int(T), int(K), device=device, dtype=torch.bfloat16)
       dGates = dGates_tk_bf16
-      _require_finite("backward.zero_recv.dX", dX)
-      _require_finite("backward.zero_recv.dGates", dGates)
 
       if fused_eco is not None:
         # Keep DP collectives aligned even if this rank received zero routed tokens.
@@ -761,12 +752,40 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         fused_eco.fused_update_zero(moe_ref, 'W2')
         fused_eco.fused_update_zero(moe_ref, 'W1')
         fused_eco.fused_update_zero(moe_ref, 'W3')
+        # Keep EP collective ordering aligned with the non-zero path:
+        # DP fused_update_* runs before final dX scatter.
+        if is_dist:
+          if dummy_dxe_pad is None:
+            raise RuntimeError("dummy_dxe_pad must be populated in distributed zero-recv path.")
+          with cuda_error_context("scatter_dx_dist_from_pad_bf16 (blockscaled backward, M_recv=0)"):
+            _C.scatter_dx_dist_from_pad_bf16(
+              dummy_dxe_pad.data_ptr(),
+              dummy_row_id.data_ptr(),
+              dX.data_ptr(),
+              0, int(T), int(H), int(K),
+              stream,
+            )
+        _require_finite("backward.zero_recv.dX", dX)
+        _require_finite("backward.zero_recv.dGates", dGates)
         # Only invalidate cache when weights were actually updated.
         # Non-final accumulation micro-steps update m/v only.
         if fused_eco.is_final_microstep:
           fused_eco.refresh_layer_cache(moe_ref)
         return None, dX, None, dGates, None, None, None, None, None, None
 
+      if is_dist:
+        if dummy_dxe_pad is None:
+          raise RuntimeError("dummy_dxe_pad must be populated in distributed zero-recv path.")
+        with cuda_error_context("scatter_dx_dist_from_pad_bf16 (blockscaled backward, M_recv=0)"):
+          _C.scatter_dx_dist_from_pad_bf16(
+            dummy_dxe_pad.data_ptr(),
+            dummy_row_id.data_ptr(),
+            dX.data_ptr(),
+            0, int(T), int(H), int(K),
+            stream,
+          )
+      _require_finite("backward.zero_recv.dX", dX)
+      _require_finite("backward.zero_recv.dGates", dGates)
       dW1 = torch.zeros_like(_W1)
       dW3 = torch.zeros_like(_W3)
       dW2 = torch.zeros_like(_W2)
