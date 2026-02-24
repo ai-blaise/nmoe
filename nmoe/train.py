@@ -598,14 +598,20 @@ def train(cfg: Config):
         f"Missing _nvfp4_primary on layers: {non_primary_layers[:16]}"
       )
 
+  dp_group = None
+  dp_world_size = 1
+  if world > 1:
+    from nmoe.opt import _get_dp_group, _get_dp_size
+    dp_group = _get_dp_group()
+    dp_world_size = _get_dp_size()
+
   # Eagerly allocate ZeRO-2 flat buffers and re-point dense params into them.
   # This must happen BEFORE the first forward pass: at this point only model weights
   # are on GPU, leaving ~30+ GiB free.  If deferred to the optimizer step (lazy),
   # the allocation competes with activations and gradients, causing OOM.
   if world > 1 and dense_groups:
     from nmoe import zero2
-    from nmoe.opt import _get_dp_group
-    zero2.eager_init(dense_groups, pg=_get_dp_group())
+    zero2.eager_init(dense_groups, pg=dp_group)
     if rank == 0:
       logger.info("ZeRO-2 flat buffers eagerly initialized for %d dense groups", len(dense_groups))
 
@@ -615,9 +621,6 @@ def train(cfg: Config):
     from nmoe.eco import FusedBackwardECO
     fused_eco = FusedBackwardECO(model, cfg)
     # Set DP group for gradient AllReduce inside backward.
-    from nmoe.opt import _get_dp_group, _get_dp_size
-    dp_group = _get_dp_group()
-    dp_world_size = _get_dp_size()
     if dp_group is not None and dp_world_size > 1:
       fused_eco.set_dp_group(dp_group, dp_world_size)
 
@@ -857,6 +860,34 @@ def train(cfg: Config):
               vocab_size=cfg.vocab_size,
               eos_token_id=cfg.eos_token_id,
             )
+            # Token-weight loss across DP ranks when supervised token counts differ.
+            # Per-rank CE is normalized by local mask sum, while gradients are reduced
+            # with DP AVG. Without this correction, sparse ranks are overweighted.
+            if world > 1 and dp_group is not None and dp_world_size > 1:
+              import torch.distributed as _dist
+              if loss_mask is not None:
+                local_token_count = loss_mask.to(device=loss.device, dtype=torch.float32).sum()
+              elif cfg.eos_token_id is not None:
+                local_token_count = (targets != int(cfg.eos_token_id)).to(dtype=torch.float32).sum()
+              else:
+                local_token_count = torch.full(
+                  (),
+                  float(targets.numel()),
+                  device=loss.device,
+                  dtype=torch.float32,
+                )
+              global_token_count = local_token_count.clone()
+              _dist.all_reduce(global_token_count, op=_dist.ReduceOp.SUM, group=dp_group)
+              if global_token_count.item() <= 0:
+                raise RuntimeError(
+                  "Non-positive supervised token count across DP group during loss scaling."
+                )
+              rank_loss_scale = (float(dp_world_size) * local_token_count) / global_token_count
+              if not torch.isfinite(rank_loss_scale).item():
+                raise RuntimeError(
+                  f"Non-finite DP token-weight loss scale: {float(rank_loss_scale)}"
+                )
+              loss = loss * rank_loss_scale.to(dtype=loss.dtype)
             # Scale loss by accumulation steps so gradients are averaged
             if accum_steps > 1:
               loss = loss / accum_steps
