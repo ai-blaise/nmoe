@@ -136,6 +136,20 @@ def _is_compiling() -> bool:
     return bool(fn()) if callable(fn) else False
 
 
+def _stream_id_for_cache(device: torch.device) -> int:
+  """Best-effort stable stream identifier for per-stream workspace caches."""
+  stream = torch.cuda.current_stream(device)
+  raw = getattr(stream, "cuda_stream", None)
+  if raw is None:
+    raw = getattr(stream, "stream_id", None)
+    if callable(raw):
+      raw = raw()
+  try:
+    return int(raw) if raw is not None else id(stream)
+  except Exception:
+    return id(stream)
+
+
 def _get_mla_workspace(device: torch.device, workspace_bytes: int) -> torch.Tensor:
   """Get a cached workspace buffer for MLA backward.
 
@@ -144,7 +158,7 @@ def _get_mla_workspace(device: torch.device, workspace_bytes: int) -> torch.Tens
   if workspace_bytes > _MLA_WORKSPACE_CACHE_MAX_BYTES:
     return torch.empty((workspace_bytes,), device=device, dtype=torch.uint8)
   dev_idx = device.index if device.index is not None else torch.cuda.current_device()
-  stream_id = int(torch.cuda.current_stream(device).cuda_stream)
+  stream_id = _stream_id_for_cache(device)
   key = (dev_idx, stream_id)
   buf = _mla_workspace_cache.get(key)
   if buf is None or buf.numel() < workspace_bytes:
