@@ -35,6 +35,19 @@ def _require_finite(tag: str, tensor: torch.Tensor) -> None:
   )
 
 
+def _current_cuda_stream_or_none(device: torch.device) -> torch.cuda.Stream | None:
+  """Return a concrete CUDA stream object accepted by C++ bindings.
+
+  Some compiled/traced execution paths can surface non-standard stream proxy
+  objects. The extension binding accepts `torch.cuda.Stream` or `None`.
+  """
+  try:
+    stream = torch.cuda.current_stream(device)
+  except Exception:
+    return None
+  return stream if hasattr(stream, "cuda_stream") else None
+
+
 class _FusedRoPEFunction(torch.autograd.Function):
   """Autograd wrapper for the fused CUDA RoPE kernel."""
 
@@ -54,7 +67,7 @@ class _FusedRoPEFunction(torch.autograd.Function):
     out = torch.empty_like(x)
 
     total_vecs = B * T * H
-    stream = torch.cuda.current_stream(x.device)
+    stream = _current_cuda_stream_or_none(x.device)
 
     _C.fused_rope_forward(
       x.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(), out.data_ptr(),
@@ -78,7 +91,7 @@ class _FusedRoPEFunction(torch.autograd.Function):
     _require_finite("full.backward.grad_out", grad_output)
     grad_x = torch.empty_like(grad_output)
     total_vecs = grad_output.numel() // D
-    stream = torch.cuda.current_stream(grad_output.device)
+    stream = _current_cuda_stream_or_none(grad_output.device)
 
     _C.fused_rope_backward(
       grad_output.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(), grad_x.data_ptr(),
@@ -113,7 +126,7 @@ class _FusedRoPEPartialFunction(torch.autograd.Function):
     _require_finite("partial.forward.x", x)
 
     total_vecs = B * T * H
-    stream = torch.cuda.current_stream(x.device)
+    stream = _current_cuda_stream_or_none(x.device)
 
     _C.fused_rope_forward_partial(
       x.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(),
@@ -140,7 +153,7 @@ class _FusedRoPEPartialFunction(torch.autograd.Function):
     grad_output = grad_output.contiguous()
     _require_finite("partial.backward.grad_out", grad_output)
     total_vecs = grad_output.numel() // D
-    stream = torch.cuda.current_stream(grad_output.device)
+    stream = _current_cuda_stream_or_none(grad_output.device)
 
     _C.fused_rope_backward_partial(
       grad_output.data_ptr(), cos_2d.data_ptr(), sin_2d.data_ptr(),
