@@ -792,6 +792,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
           int(M_recv), int(T), int(H), int(K),
           stream,
         )
+      _require_finite("backward.dYe_sorted", dYe_sorted)
 
       dYe_pad = torch.empty(int(max_pad), int(H), device=device, dtype=torch.bfloat16)
       _C.scatter_sorted_to_pad_bf16(
@@ -808,6 +809,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(H),
         stream,
       )
+      _require_finite("backward.dYe_pad", dYe_pad)
     del dYe_sorted  # Consumed; free [M_recv, H] BF16
 
     with _nvtx("moe_bs/bwd_expert_grad"):
@@ -818,26 +820,35 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         gs = moe_ref._nvfp4_group_size
         W1 = dequant_nvfp4_to_bf16_transient(
           moe_ref._W1_packed, moe_ref._W1_scale, moe_ref._W1_gs, gs, transpose=True)
+        _require_finite("backward.W1_dequant", W1)
         H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
+        _require_finite("backward.H1", H1)
 
         W3 = dequant_nvfp4_to_bf16_transient(
           moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
+        _require_finite("backward.W3_dequant", W3)
         H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+        _require_finite("backward.H3", H3)
       else:
         H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
         H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+        _require_finite("backward.H1", H1)
+        _require_finite("backward.H3", H3)
 
       # dA needs W2^T. In NVFP4 fused mode, dequantize directly to [E, H, Dff]
       # to avoid [E, Dff, H] materialization + transpose.
       if _nvfp4_stagger:
         W2_t = dequant_nvfp4_to_bf16_transient(
           moe_ref._W2_packed, moe_ref._W2_scale, moe_ref._W2_gs, gs, transpose=False)
+        _require_finite("backward.W2_dequant_t", W2_t)
         Dff = int(W2_t.size(2))
         dA = torch._grouped_mm(dYe_pad, W2_t, offs=offs_pad)
+        _require_finite("backward.dA", dA)
         del W2_t
       else:
         Dff = int(W2.size(1))
         dA = torch._grouped_mm(dYe_pad, W2.transpose(1, 2), offs=offs_pad)
+        _require_finite("backward.dA", dA)
 
       A = torch.empty_like(H1)
       dH1 = torch.empty_like(H1)
@@ -852,6 +863,9 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         int(max_pad), int(Dff),
         stream,
       )
+      _require_finite("backward.A", A)
+      _require_finite("backward.dH1", dH1)
+      _require_finite("backward.dH3", dH3)
 
       # SonicMoE dGate identity: dGate = ⟨A, dA⟩ instead of ⟨dOut, Ye⟩
       # This avoids recomputing Ye_pad in both single-GPU and distributed modes.
@@ -913,6 +927,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
         # Phase B: dX from W1.T using already-dequantized W1.
         dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
+        _require_finite("backward.dX_pad.part1", dX_pad)
         del W1
 
         # Phase C: paired dW1/dW3 = wgrad_w13(Xe, dH1/dH3) → fused_update W1 → keep dW3 for later.
@@ -944,6 +959,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         # Reuse already-dequantized W3.
         # Xe_pad freed above; now we have room for grouped_mm temp (~1.23 GiB).
         dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+        _require_finite("backward.dX_pad.part2", dX_pad)
         del W3, dH3
 
         # Phase F: fused_update for W3 — AFTER dX has been computed from original W3.
@@ -989,6 +1005,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
 
         dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
         dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+        _require_finite("backward.dX_pad", dX_pad)
         del W1, W3, A, dH1, dH3, Xe_pad, dYe_pad
 
     with _nvtx("moe_bs/bwd_input_grad"):
