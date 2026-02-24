@@ -50,6 +50,28 @@ def _nvtx(name: str):
         return torch.cuda.nvtx.range(name)
     return _NULL_NVTX_CTX
 
+
+def _cuda_stream_int(device: torch.device) -> int:
+    """Best-effort CUDA stream integer for ctypes kernels."""
+    stream_obj = torch.cuda.current_stream(device)
+    raw = getattr(stream_obj, "cuda_stream", None)
+    if raw is None:
+        get_raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+        if callable(get_raw):
+            dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+            try:
+                raw = get_raw(int(dev_idx))
+            except Exception:
+                raw = None
+    if raw is None:
+        raw = getattr(stream_obj, "stream_id", None)
+        if callable(raw):
+            raw = raw()
+    try:
+        return int(raw) if raw is not None else 0
+    except Exception:
+        return 0
+
 # ---------------------------------------------------------------------------
 # Load the fused aux loss CUDA extension.
 # The .so can be produced by any build path that compiles aux_loss.cu.
@@ -252,8 +274,7 @@ def fused_aux_loss(
 
         device = expert_ids.device
         TK = expert_ids.numel()
-        stream_obj = torch.cuda.current_stream(device)
-        stream = int(stream_obj.cuda_stream)
+        stream = _cuda_stream_int(device)
 
         # Get cached buffers. The CUDA entrypoint resets accumulators internally.
         buffers = _get_buffers(device, E, stream)

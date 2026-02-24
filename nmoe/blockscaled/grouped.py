@@ -94,6 +94,24 @@ def _require_sm100(device_index: int | None = None) -> None:
         raise RuntimeError(f"blockscaled GEMM requires SM100 (B200). Got capability={cap}.")
 
 
+def _current_cu_stream(device: torch.device) -> cuda.CUstream:
+    """Resolve current stream pointer for CuTeDSL launch APIs."""
+    torch_stream = torch.cuda.current_stream(device)
+    raw = getattr(torch_stream, "cuda_stream", None)
+    if raw is None:
+        get_raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+        if callable(get_raw):
+            dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+            try:
+                raw = get_raw(int(dev_idx))
+            except Exception:
+                raw = None
+    try:
+        return cuda.CUstream(int(raw) if raw is not None else 0)
+    except Exception:
+        return cuda.CUstream(0)
+
+
 # -----------------------------------------------------------------------------
 # Lightweight workspace cache to avoid per-call GPU allocations of metadata
 # tensors in run_grouped_blockscaled_strided().
@@ -2099,8 +2117,7 @@ def run_grouped_blockscaled_strided(
         return
 
     # Get CUDA stream (must match current PyTorch stream)
-    torch_stream = torch.cuda.current_stream(device)
-    cu_stream = cuda.CUstream(torch_stream.cuda_stream)
+    cu_stream = _current_cu_stream(device)
 
     # Profile-specific settings
     if profile == "fp8":

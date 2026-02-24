@@ -87,6 +87,19 @@ def _nvtx(tag: str):
     return _NULL_NVTX_CTX
 
 
+def _stream_cache_id(device: torch.device | int) -> int:
+    stream = torch.cuda.current_stream(device)
+    raw = getattr(stream, "cuda_stream", None)
+    if raw is None:
+        raw = getattr(stream, "stream_id", None)
+        if callable(raw):
+            raw = raw()
+    try:
+        return int(raw) if raw is not None else id(stream)
+    except Exception:
+        return id(stream)
+
+
 def _cache_put_capped(cache: dict, key, value) -> None:
     """Insert into an insertion-ordered dict with bounded cardinality."""
     if key in cache:
@@ -100,8 +113,7 @@ def _cache_put_capped(cache: dict, key, value) -> None:
 
 def _get_cached_offs_pad(rdep: "Rdep", device: torch.device, n_local: int) -> torch.Tensor:
     """Return reusable per-stream device buffer for expert padded offsets."""
-    stream = torch.cuda.current_stream(device)
-    sid = int(stream.cuda_stream)
+    sid = _stream_cache_id(device)
     dev_idx = device.index if device.index is not None else torch.cuda.current_device()
     key = (int(dev_idx), sid, int(n_local))
     cache = getattr(rdep, "_offs_pad_dev_cache", None)
@@ -118,8 +130,7 @@ def _get_cached_offs_pad(rdep: "Rdep", device: torch.device, n_local: int) -> to
 def _get_cached_pinned_m_host(rdep: "Rdep") -> torch.Tensor:
     """Return reusable per-stream pinned host scalar for dispatch M_pad/M_recv."""
     dev = torch.cuda.current_device()
-    stream = torch.cuda.current_stream(dev)
-    sid = int(stream.cuda_stream)
+    sid = _stream_cache_id(dev)
     key = (int(dev), sid)
     cache = getattr(rdep, "_pinned_M_host_cache", None)
     if cache is None:

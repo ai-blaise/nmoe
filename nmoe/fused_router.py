@@ -65,6 +65,36 @@ def _nvtx(name: str):
     return _NULL_NVTX_CTX
 
 
+def _cuda_stream_cache_id(device: torch.device) -> int:
+    stream = torch.cuda.current_stream(device)
+    raw = getattr(stream, "cuda_stream", None)
+    if raw is None:
+        raw = getattr(stream, "stream_id", None)
+        if callable(raw):
+            raw = raw()
+    try:
+        return int(raw) if raw is not None else id(stream)
+    except Exception:
+        return id(stream)
+
+
+def _cuda_stream_ptr_or_default(device: torch.device) -> int:
+    stream = torch.cuda.current_stream(device)
+    raw = getattr(stream, "cuda_stream", None)
+    if raw is None:
+        get_raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+        if callable(get_raw):
+            dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+            try:
+                raw = get_raw(int(dev_idx))
+            except Exception:
+                raw = None
+    try:
+        return int(raw) if raw is not None else 0
+    except Exception:
+        return 0
+
+
 def _nan_debug_active() -> bool:
     return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_ROUTER_FINITE_DEBUG", "0")
 
@@ -306,7 +336,7 @@ def fused_update_bias_from_expert_ids(
             return
 
         # Reuse temporary counts scratch; fused update kernel resets it in-place.
-        stream_id = int(torch.cuda.current_stream(bias.device).cuda_stream)
+        stream_id = _cuda_stream_cache_id(bias.device)
         counts = _get_bias_counts_scratch(bias.device, E, stream_id)
 
         # Kernel 1: Parallel bincount
@@ -671,7 +701,7 @@ def _call_fused_router_backward_impl(
     T, D = hidden.shape
     E = router_weight.shape[1]
     K = expert_ids.shape[1]
-    stream = torch.cuda.current_stream(hidden.device).cuda_stream
+    stream = _cuda_stream_ptr_or_default(hidden.device)
 
     grad_rw_fp32: Optional[torch.Tensor] = None
     grad_rw_bf16: Optional[torch.Tensor] = None
