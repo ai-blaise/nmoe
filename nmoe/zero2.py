@@ -31,6 +31,41 @@ def _nvtx(tag: str):
     return _NULL_NVTX_CTX
 
 
+def _current_cuda_stream_or_none(device: torch.device | None = None) -> torch.cuda.Stream | None:
+    """Return a stream object accepted by C++ bindings, or None."""
+    try:
+        stream = torch.cuda.current_stream(device=device)
+    except Exception:
+        return None
+    if hasattr(stream, "cuda_stream"):
+        try:
+            _ = int(getattr(stream, "cuda_stream"))
+            return stream
+        except Exception:
+            pass
+    get_raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    external_cls = getattr(torch.cuda, "ExternalStream", None)
+    if callable(get_raw) and external_cls is not None:
+        dev_idx = torch.cuda.current_device() if device is None else (
+            device.index if isinstance(device, torch.device) and device.index is not None else int(device)
+        )
+        try:
+            raw = int(get_raw(int(dev_idx)))
+        except Exception:
+            raw = 0
+        if raw:
+            try:
+                return external_cls(raw, device=device)
+            except TypeError:
+                try:
+                    return external_cls(raw)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+    return None
+
+
 # Check for multi-tensor copy op (available in PyTorch 2.0+).
 # This allows batching ~100 copy kernels into a single launch.
 _HAS_FOREACH_COPY = hasattr(torch, '_foreach_copy_')
@@ -397,7 +432,7 @@ def step_dense_adamw(
       # in-loop drain and the trailing drain after the loop.
       # Uses the fused CUDA kernel (single launch replacing 9 PyTorch kernels).
       _fused_fn = _fused_adamw_fns[dtype]
-      cur_stream = torch.cuda.current_stream()
+      cur_stream = _current_cuda_stream_or_none(param_shard.device)
       param_elem_size = param_shard.element_size()
       exp_avg_elem_size = exp_avg.element_size()
       exp_avg_sq_elem_size = exp_avg_sq.element_size()

@@ -57,6 +57,39 @@ def _nvtx(tag: str):
     return nullcontext()
 
 
+def _current_cuda_stream_or_none(device: torch.device) -> torch.cuda.Stream | None:
+    """Return a stream object accepted by rdep bindings, or None."""
+    try:
+        stream = torch.cuda.current_stream(device)
+    except Exception:
+        return None
+    if hasattr(stream, "cuda_stream"):
+        try:
+            _ = int(getattr(stream, "cuda_stream"))
+            return stream
+        except Exception:
+            pass
+    get_raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    external_cls = getattr(torch.cuda, "ExternalStream", None)
+    if callable(get_raw) and external_cls is not None:
+        dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+        try:
+            raw = int(get_raw(int(dev_idx)))
+        except Exception:
+            raw = 0
+        if raw:
+            try:
+                return external_cls(raw, device=device)
+            except TypeError:
+                try:
+                    return external_cls(raw)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+    return None
+
+
 def _require_finite_scalar(name: str, value: float, *, gt: float | None = None, lt: float | None = None) -> float:
     v = float(value)
     if not math.isfinite(v):
@@ -405,7 +438,7 @@ class FusedBackwardECO:
 
             m_u8 = m_data.view(torch.uint8) if m_data.dtype != torch.uint8 else m_data
             m_sc_flat = m_sc.view(-1)
-            stream = torch.cuda.current_stream(packed.device)
+            stream = _current_cuda_stream_or_none(packed.device)
 
             if self._factored_v:
                 v_row = st["v_row"]
@@ -747,7 +780,7 @@ class FusedBackwardECO:
             prng_seed1 = (self._step_count * 7919 + idx * 31 + _param_offset * 127) & 0xFFFFFFFF
 
             scale_u8 = scale_buf.view(torch.uint8)
-            stream = torch.cuda.current_stream(packed.device)
+            stream = _current_cuda_stream_or_none(packed.device)
 
             if self._factored_v:
                 v_row = st["v_row"]

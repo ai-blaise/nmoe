@@ -112,6 +112,46 @@ def _current_cu_stream(device: torch.device) -> cuda.CUstream:
         return cuda.CUstream(0)
 
 
+def _current_torch_stream_or_none(device: torch.device) -> torch.cuda.Stream | None:
+    """Return a stream object accepted by rdep pybind wrappers.
+
+    Some compile/tracing paths may surface a `torch.Stream` proxy without the
+    `cuda_stream` attribute expected by bindings.cpp::to_stream(). In that case,
+    rebuild an ExternalStream from the current raw stream pointer when possible.
+    """
+    try:
+        stream = torch.cuda.current_stream(device)
+    except Exception:
+        return None
+    raw = None
+    if hasattr(stream, "cuda_stream"):
+        try:
+            # Tracing proxies can report this attribute but not a real raw pointer.
+            raw = int(getattr(stream, "cuda_stream"))
+            return stream
+        except Exception:
+            raw = None
+    get_raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    external_cls = getattr(torch.cuda, "ExternalStream", None)
+    if callable(get_raw) and external_cls is not None:
+        dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+        try:
+            raw = int(get_raw(int(dev_idx)))
+        except Exception:
+            raw = 0
+        if raw:
+            try:
+                return external_cls(raw, device=device)
+            except TypeError:
+                try:
+                    return external_cls(raw)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+    return None
+
+
 # -----------------------------------------------------------------------------
 # Lightweight workspace cache to avoid per-call GPU allocations of metadata
 # tensors in run_grouped_blockscaled_strided().
@@ -2118,6 +2158,7 @@ def run_grouped_blockscaled_strided(
 
     # Get CUDA stream (must match current PyTorch stream)
     cu_stream = _current_cu_stream(device)
+    torch_stream = _current_torch_stream_or_none(device)
 
     # Profile-specific settings
     if profile == "fp8":
@@ -2485,7 +2526,7 @@ def quantize_weights(
     # Use the fused quantize+pack kernel that writes SFA directly into the per-expert
     # MMA swizzle layout (no per-expert Python loops, no separate swizzle kernel).
     # We treat weights as expert-concatenated with fixed per-expert row count.
-    stream = torch.cuda.current_stream(W1.device)
+    stream = _current_torch_stream_or_none(W1.device)
 
     # -------------------------------------------------------------------------
     # W13: interleave W1/W3 and transpose to [E, 2*Dff, H]
@@ -2776,7 +2817,7 @@ def _dequant_nvfp4_triplet_to_bf16(
     K = packed.shape[2] * 2   # in_dim (2 elements per byte)
     total_M = E * M
     device = packed.device
-    stream = torch.cuda.current_stream(device)
+    stream = _current_torch_stream_or_none(device)
 
     packed_flat = packed.reshape(total_M, K // 2).contiguous()
     n_groups = K // group_size
@@ -2850,7 +2891,7 @@ def quantize_weights_from_nvfp4(
     if W2_packed.shape[1] != H:
         raise RuntimeError(f"W2 out_dim {W2_packed.shape[1]} != H {H}")
 
-    stream = torch.cuda.current_stream(W1_packed.device)
+    stream = _current_torch_stream_or_none(W1_packed.device)
     device = W1_packed.device
 
     if profile == "nvfp4":

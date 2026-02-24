@@ -87,6 +87,44 @@ def _nvtx(tag: str):
     return _NULL_NVTX_CTX
 
 
+def _current_cuda_stream_or_none(device: torch.device) -> torch.cuda.Stream | None:
+    """Return a stream object accepted by C++ bindings, or None.
+
+    Some torch.compile/tracing paths can surface `torch.Stream` proxies without
+    a usable `cuda_stream` handle. In that case, rebuild an ExternalStream from
+    the raw current stream pointer when possible.
+    """
+    try:
+        stream = torch.cuda.current_stream(device)
+    except Exception:
+        return None
+    if hasattr(stream, "cuda_stream"):
+        try:
+            _ = int(getattr(stream, "cuda_stream"))
+            return stream
+        except Exception:
+            pass
+    get_raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    external_cls = getattr(torch.cuda, "ExternalStream", None)
+    if callable(get_raw) and external_cls is not None:
+        dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+        try:
+            raw = int(get_raw(int(dev_idx)))
+        except Exception:
+            raw = 0
+        if raw:
+            try:
+                return external_cls(raw, device=device)
+            except TypeError:
+                try:
+                    return external_cls(raw)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+    return None
+
+
 def _stream_cache_id(device: torch.device | int) -> int:
     stream = torch.cuda.current_stream(device)
     raw = getattr(stream, "cuda_stream", None)
@@ -249,7 +287,7 @@ def dequant_nvfp4_to_bf16_transient(
     K = packed.shape[2] * 2   # in_dim (each byte holds 2 elements)
     total_M = E * M
     device = packed.device
-    stream = torch.cuda.current_stream(device)
+    stream = _current_cuda_stream_or_none(device)
 
     # Flatten to [E*M, K/2] for the kernel.
     packed_flat = packed.reshape(total_M, K // 2)
@@ -318,7 +356,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       )
 
     device = x.device
-    stream = torch.cuda.current_stream(device)
+    stream = _current_cuda_stream_or_none(device)
 
     x = _as_contiguous_dtype(x, torch.bfloat16)
     eid = _as_contiguous_dtype(eid, torch.int32)
@@ -524,7 +562,7 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       )
 
     device = dOut.device
-    stream = torch.cuda.current_stream(device)
+    stream = _current_cuda_stream_or_none(device)
 
     if dOut.dtype != torch.bfloat16:
       raise RuntimeError(
