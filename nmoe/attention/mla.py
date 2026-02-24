@@ -521,7 +521,7 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
             float(softmax_scale),
             seqlen,
             seqlen,
-            True,  # is_varlen
+            False,  # non-packed dense path: fixed-length [B, S]
         )
     else:
       with _nvtx("attn/fa4_fwd"):
@@ -629,7 +629,7 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
           softmax_scale,
           seqlen,
           seqlen,
-          True,  # is_varlen
+          False,  # non-packed dense path: fixed-length [B, S]
       )
     _require_finite("flashmla_bwd.dq", dq)
     _require_finite("flashmla_bwd.dk", dk)

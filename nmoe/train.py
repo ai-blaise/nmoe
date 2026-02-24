@@ -95,6 +95,28 @@ def _collect_nonfinite_grad_details(
   return details
 
 
+@torch.no_grad()
+def _reference_grad_norm_fp64(parameters: list[torch.nn.Parameter]) -> torch.Tensor:
+  """Slow high-precision grad norm used only for NaN diagnostics."""
+  if not parameters:
+    return torch.tensor(0.0, device='cuda')
+
+  device = parameters[0].device
+  for p in parameters:
+    if p.grad is not None:
+      device = p.grad.device
+      break
+
+  total_sq = torch.zeros((), device=device, dtype=torch.float64)
+  for p in parameters:
+    g = p.grad
+    if g is None or not (g.is_floating_point() or g.is_complex()):
+      continue
+    g_norm = torch.linalg.vector_norm(g, ord=2, dtype=torch.float32).to(dtype=torch.float64)
+    total_sq += g_norm * g_norm
+  return total_sq.sqrt().to(dtype=torch.float32)
+
+
 def _register_nan_debug_hooks(model: torch.nn.Module):
   """Register module forward hooks that fail fast on non-finite outputs.
 
@@ -444,6 +466,13 @@ def train(cfg: Config):
   if nan_debug_enabled and rank == 0:
     print(
       f"[NANDBG] enabled for step={nan_debug_step}, micro={nan_debug_micro}",
+      flush=True,
+    )
+  nan_trace_step0 = _env_flag("NMOE_NAN_TRACE_STEP0", "0")
+  nan_trace_micro = int(os.getenv("NMOE_NAN_TRACE_MICRO", "0"))
+  if nan_trace_step0 and rank == 0:
+    print(
+      f"[NANTRACE] detect_anomaly enabled for step=0, micro={nan_trace_micro} only",
       flush=True,
     )
 
@@ -825,6 +854,11 @@ def train(cfg: Config):
             and step_num == nan_debug_step
             and micro_step == nan_debug_micro
           )
+          nan_trace_scope = (
+            nan_trace_step0
+            and step_num == 0
+            and micro_step == nan_trace_micro
+          )
           os.environ["NMOE_NAN_DEBUG_ACTIVE"] = "1" if nan_debug_scope else "0"
           if nan_debug_scope:
             tok_min = int(inputs.min().item())
@@ -984,8 +1018,17 @@ def train(cfg: Config):
             fused_eco.pre_backward(step_num)
           if step_heartbeat and rank == 0:
             print(f"[HB] step={step_num} micro={micro_step} stage=bwd_start", flush=True)
+          if nan_trace_scope:
+            print(
+              f"[NANTRACE][rank={rank}] detect_anomaly active at step={step_num}, micro={micro_step}",
+              flush=True,
+            )
           with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
-            loss.backward()
+            if nan_trace_scope:
+              with torch.autograd.detect_anomaly(check_nan=True):
+                loss.backward()
+            else:
+              loss.backward()
           if nan_debug_scope:
             _micro_grad_params = [p for p in grad_norm_params if p.grad is not None]
             micro_grad_norm = (
@@ -1041,16 +1084,39 @@ def train(cfg: Config):
             _dist.all_reduce(grad_norm_finite, op=_dist.ReduceOp.MIN)
         _grad_norm_bad = grad_norm_finite.item() == 0
         if _grad_norm_bad:
+            bad_ranks: list[int] = []
+            if world > 1:
+              import torch.distributed as _dist
+              if _dist.is_available() and _dist.is_initialized():
+                local_bad_t = torch.tensor(
+                  1 if local_grad_norm_bad else 0,
+                  device=grad_norm.device,
+                  dtype=torch.int32,
+                )
+                gathered = [torch.zeros_like(local_bad_t) for _ in range(_dist.get_world_size())]
+                _dist.all_gather(gathered, local_bad_t)
+                bad_ranks = [i for i, t in enumerate(gathered) if int(t.item()) == 1]
+
             bad_grad_details = _collect_nonfinite_grad_details(named_grad_params, max_items=8)
             detail = "; ".join(bad_grad_details) if bad_grad_details else "none"
+            if local_grad_norm_bad and not bad_grad_details:
+              ref_norm = _reference_grad_norm_fp64(_grad_params)
+              ref_finite = bool(torch.isfinite(ref_norm).item())
+              detail = (
+                "no elementwise non-finite dense grads found; "
+                "fused_grad_norm_ may have overflowed/underflowed. "
+                f"fp64_ref_grad_norm={float(ref_norm):.6g} "
+                f"fp64_ref_finite={int(ref_finite)}"
+              )
             if not local_grad_norm_bad:
               detail = (
                 f"remote rank reported non-finite dense grad_norm; local_grad_norm={float(grad_norm):.6g}; "
                 f"local_non_finite_grads={detail}"
               )
+            rank_detail = f"bad_ranks={bad_ranks}" if bad_ranks else "bad_ranks=unknown"
             raise RuntimeError(
               f"Non-finite dense grad_norm detected at step={step_num}: {float(grad_norm)}. "
-              f"First non-finite grads: {detail}. Aborting before optimizer step."
+              f"First non-finite grads: {detail}. {rank_detail}. Aborting before optimizer step."
             )
         else:
             # Only clip and step when gradients are clean

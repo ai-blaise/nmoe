@@ -468,6 +468,11 @@ Scope:
   - Acceptance: agent launch defaults to `<nmoe_dir>/.venv/bin/torchrun`; provision/launch parity checks fail on repo/env/extension drift across nodes.
   - Status note: added strict venv torchrun selection (system fallback opt-in only), expanded per-node probe to include flash-attn SHA + Python/PyTorch/marker/torchrun source, and wired parity validation into `repo-parity --strict` and post-provision checks.
 
+- [x] B-102 Add step-0 NaN localization diagnostics for dense-grad failures.
+  - Files: `nmoe/train.py`
+  - Acceptance: when enabled, backward emits anomaly trace for one micro-step and dense-grad NaN failures include bad-rank localization/details without adding steady-state overhead.
+  - Status note: added `NMOE_NAN_TRACE_STEP0` / `NMOE_NAN_TRACE_MICRO` scoped anomaly tracing, bad-rank all-gather context on grad-norm failure, and FP64 reference norm fallback detail when fused norm is non-finite but elementwise grad scans are inconclusive.
+
 - [x] B-073 Replace full `dYe_pad` zero-fill with selective padding-row zero kernel.
   - Files: `nmoe/moe.py`, `nmoe/csrc/rdep.cu`, `nmoe/csrc/rdep_nvshmem.cu`, `nmoe/csrc/rdep_nvshmem.cuh`, `nmoe/csrc/bindings.cpp`
   - Acceptance: backward padded buffer path no longer uses `torch.zeros(max_pad, H)`; only expert-alignment gap rows are zeroed via CUDA kernel.
@@ -967,6 +972,16 @@ Scope:
   - Files: `nmoe/attention/mla.py`
   - Acceptance: packed FlashMLA preprocessing avoids per-sample `.item()` host syncs and per-sample Python gather/scatter loops.
   - Status note: packed path now computes token masks/merged tensors in batched tensor operations and reassembles output via boolean mask scatter, with mandatory aggregate token-count `.item()` sync removed from default path (only optional validation keeps scalar sync checks).
+
+- [x] D-031 Fix non-packed SM100 FlashMLA dense path varlen-mode contract.
+  - Files: `nmoe/attention/mla.py`
+  - Acceptance: non-packed dense path (`[B,S,H,D]`) invokes SM100 FlashMLA forward/backward with fixed-length mode (`is_varlen=false`), eliminating varlen-mode misuse in step-loop training.
+  - Status note: `_MlaFa4FwdFlashMlaBwd` now passes `is_varlen=false` in both `dense_prefill_fwd` and `dense_prefill_bwd` calls for non-packed execution.
+
+- [x] D-032 Harden FlashMLA SM100 Python binding contracts with fail-fast checks.
+  - Files: `nmoe/csrc/flashmla_sm100_bindings.cpp`
+  - Acceptance: malformed tensor/device/dtype/layout inputs fail before kernel launch; no silent undefined behavior from invalid lse stride/shape contracts.
+  - Status note: added strict CUDA/device/dtype/shape/contiguity checks (including `lse.stride(0)==1` and finite `softmax_scale`) for both dense forward and backward entrypoints.
 
 - [x] D-017 Add fused packed-RoPE support for per-sample position-reset tables (`[B,S,half]`) without falling back.
   - Files: `nmoe/attention/rope.py`
