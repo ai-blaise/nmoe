@@ -453,6 +453,21 @@ Scope:
   - Acceptance: any `rdep.profile='nvfp4'` backward call that is not on hybrid distributed blockscaled metadata path fails fast.
   - Status note: added explicit guard requiring `use_dist_blockscaled_meta` whenever profile is NVFP4; BF16 backward metadata/gather fallback is now unreachable.
 
+- [x] B-099 Label distributed backward IPC barrier sites for deterministic timeout forensics.
+  - Files: `nmoe/csrc/rdep.cu`
+  - Acceptance: hot distributed backward BF16/blockscaled barriers emit non-null site labels in RDEP barrier trace/watchdog logs.
+  - Status note: replaced unlabeled `ipc_barrier_*` calls in gather-dY/dGate/scatter-dX distributed paths with `ipc_barrier_*_site(...)` labels (pre/post-zero, post-send, post-gather) so phase timeouts map to exact stages.
+
+- [x] B-100 Keep router aux-loss differentiable unless MoE FFN checkpointing is active.
+  - Files: `nmoe/model.py`
+  - Acceptance: `gradient_checkpointing=true` without `checkpoint_moe_ffn=true` no longer detaches aux-loss path; router aux receives gradients.
+  - Status note: `_aux_loss_detached_for_checkpoint` now keys off `checkpoint_moe_ffn` only, fixing unintended aux-loss detach in common NVFP4 runs.
+
+- [x] B-101 Enforce venv-only torchrun and runtime parity checks before launch/provision success.
+  - Files: `../nmoe-multinode/agent.py`, `../nmoe-multinode/orchestrate.py`
+  - Acceptance: agent launch defaults to `<nmoe_dir>/.venv/bin/torchrun`; provision/launch parity checks fail on repo/env/extension drift across nodes.
+  - Status note: added strict venv torchrun selection (system fallback opt-in only), expanded per-node probe to include flash-attn SHA + Python/PyTorch/marker/torchrun source, and wired parity validation into `repo-parity --strict` and post-provision checks.
+
 - [x] B-073 Replace full `dYe_pad` zero-fill with selective padding-row zero kernel.
   - Files: `nmoe/moe.py`, `nmoe/csrc/rdep.cu`, `nmoe/csrc/rdep_nvshmem.cu`, `nmoe/csrc/rdep_nvshmem.cuh`, `nmoe/csrc/bindings.cpp`
   - Acceptance: backward padded buffer path no longer uses `torch.zeros(max_pad, H)`; only expert-alignment gap rows are zeroed via CUDA kernel.

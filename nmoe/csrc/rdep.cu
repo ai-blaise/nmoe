@@ -6668,9 +6668,9 @@ extern "C" void rdep_gather_dy_dist_bf16(
             abort();
         }
         const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "gather_dy_dist_bf16/pre_zero");
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, g_bf16.Ha, false, true, stream);
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "gather_dy_dist_bf16/post_zero");
 
         const int threads = 256;
         const int warps_needed = std::max(1, tok_slots);
@@ -6683,7 +6683,7 @@ extern "C" void rdep_gather_dy_dist_bf16(
             g_bf16.n_local, static_cast<int>(g_bf16.capacity),
             x_off);
 
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "gather_dy_dist_bf16/post_stage_push");
 
         const uint16_t* stage = reinterpret_cast<const uint16_t*>(local_buf + x_off);
         const int g_threads = 256;
@@ -6703,7 +6703,7 @@ extern "C" void rdep_gather_dy_dist_bf16(
                 tok_gate_off);
         }
 
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "gather_dy_dist_bf16/post_gather");
 
         const float* tok_gate = reinterpret_cast<const float*>(local_buf + tok_gate_off);
         const int t_threads = 256;
@@ -6742,9 +6742,9 @@ extern "C" void rdep_gather_dy_dist_bf16(
             abort();
         }
         const char* local_buf = static_cast<const char*>(g_block.buffer_ptrs[g_block.rank]);
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "gather_dy_dist_blockscaled/pre_zero");
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, g_block.Ha, false, true, stream);
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "gather_dy_dist_blockscaled/post_zero");
 
         const int threads = 256;
         const int warps_needed = std::max(1, tok_slots);
@@ -6757,7 +6757,7 @@ extern "C" void rdep_gather_dy_dist_bf16(
             g_block.n_local, static_cast<int>(g_block.capacity),
             y_off);
 
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "gather_dy_dist_blockscaled/post_stage_push");
 
         const uint16_t* stage = reinterpret_cast<const uint16_t*>(local_buf + y_off);
         const int g_threads = 256;
@@ -6777,7 +6777,7 @@ extern "C" void rdep_gather_dy_dist_bf16(
                 tok_gate_off);
         }
 
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "gather_dy_dist_blockscaled/post_gather");
 
         const float* tok_gate = reinterpret_cast<const float*>(local_buf + tok_gate_off);
         const int t_threads = 256;
@@ -6868,7 +6868,7 @@ extern "C" void rdep_gather_dy_nogate_dist_bf16(
         g_bf16.n_local, static_cast<int>(g_bf16.capacity),
         x_off);
 
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "gather_dy_nogate_dist_bf16/post_stage_push");
 
     // Step 2: Gather dYe with gate scaling (no dGate computation)
     const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
@@ -6942,9 +6942,9 @@ extern "C" void rdep_send_dgate_dist_bf16(
         abort();
     }
     const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "send_dgate_dist_bf16/pre_zero");
     maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, g_bf16.Ha, false, true, stream);
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "send_dgate_dist_bf16/post_zero");
 
     // Step 1: Send dGate to source ranks via tok-slot IPC buffer
     const int threads = 256;
@@ -6959,7 +6959,7 @@ extern "C" void rdep_send_dgate_dist_bf16(
             tok_gate_off);
     }
 
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "send_dgate_dist_bf16/post_send");
 
     // Step 2: Collect dGate from tok-slot buffer
     const float* tok_gate = reinterpret_cast<const float*>(local_buf + tok_gate_off);
@@ -7023,9 +7023,9 @@ extern "C" void rdep_send_dgate_dist_bf16_out_bf16(
         abort();
     }
     const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "send_dgate_dist_bf16_out_bf16/pre_zero");
     maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, g_bf16.Ha, false, true, stream);
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "send_dgate_dist_bf16_out_bf16/post_zero");
 
     const int threads = 256;
     const int blocks_by_work = std::max(1, (M + threads - 1) / threads);
@@ -7039,7 +7039,7 @@ extern "C" void rdep_send_dgate_dist_bf16_out_bf16(
             tok_gate_off);
     }
 
-    ipc_barrier_bf16(stream);
+    ipc_barrier_bf16_site(stream, "send_dgate_dist_bf16_out_bf16/post_send");
 
     const float* tok_gate = reinterpret_cast<const float*>(local_buf + tok_gate_off);
     const int t_threads = 256;
@@ -7127,7 +7127,7 @@ extern "C" void rdep_scatter_dx_dist_bf16(
         // We only need: (1) zero complete on all ranks before send, and
         // (2) send complete on all ranks before local reduce.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "scatter_dx_dist_bf16/post_zero");
 
         if (M > 0) {
             k_send_dx_tokslot_bf16<<<blocks, threads, 0, stream>>>(
@@ -7139,7 +7139,7 @@ extern "C" void rdep_scatter_dx_dist_bf16(
                 tok_gate_off);
         }
 
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "scatter_dx_dist_bf16/post_send");
 
         const uint16_t* tok_y = reinterpret_cast<const uint16_t*>(local_buf + tok_y_off);
         const float* tok_tag = reinterpret_cast<const float*>(local_buf + tok_gate_off);
@@ -7202,7 +7202,7 @@ extern "C" void rdep_scatter_dx_dist_bf16(
         const char* local_buf = static_cast<const char*>(g_block.buffer_ptrs[g_block.rank]);
         // Mirror BF16 path: drop redundant pre-zero barrier in steady-state.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "scatter_dx_dist_blockscaled/post_zero");
         if (M > 0) {
             k_send_dx_tokslot_blockscaled<<<blocks, threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(dXe_sorted),
@@ -7213,7 +7213,7 @@ extern "C" void rdep_scatter_dx_dist_bf16(
                 tok_gate_off);
         }
 
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "scatter_dx_dist_blockscaled/post_send");
 
         const uint16_t* tok_y = reinterpret_cast<const uint16_t*>(local_buf + tok_y_off);
         const float* tok_tag = reinterpret_cast<const float*>(local_buf + tok_gate_off);
@@ -7312,7 +7312,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
         const char* local_buf = static_cast<const char*>(g_bf16.buffer_ptrs[g_bf16.rank]);
         // Same ordering contract as scatter_dx_dist_bf16(): pre-zero barrier is redundant.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "scatter_dx_dist_from_pad_bf16/post_zero");
 
         if (M > 0) {
             k_send_dx_tokslot_from_pad_bf16<<<blocks, threads, 0, stream>>>(
@@ -7325,7 +7325,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                 tok_gate_off);
         }
 
-        ipc_barrier_bf16(stream);
+        ipc_barrier_bf16_site(stream, "scatter_dx_dist_from_pad_bf16/post_send");
 
         const uint16_t* tok_y = reinterpret_cast<const uint16_t*>(local_buf + tok_y_off);
         const float* tok_tag = reinterpret_cast<const float*>(local_buf + tok_gate_off);
@@ -7386,7 +7386,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
         const char* local_buf = static_cast<const char*>(g_block.buffer_ptrs[g_block.rank]);
         // Same ordering contract as BF16 branch.
         maybe_zero_tokslot_buffers(const_cast<char*>(local_buf), tok_y_off, tok_gate_off, tok_slots, Ha, false, true, stream);
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "scatter_dx_dist_from_pad_blockscaled/post_zero");
 
         if (M > 0) {
             k_send_dx_tokslot_from_pad_blockscaled<<<blocks, threads, 0, stream>>>(
@@ -7399,7 +7399,7 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
                 tok_gate_off);
         }
 
-        ipc_barrier_block(stream);
+        ipc_barrier_block_site(stream, "scatter_dx_dist_from_pad_blockscaled/post_send");
 
         const uint16_t* tok_y = reinterpret_cast<const uint16_t*>(local_buf + tok_y_off);
         const float* tok_tag = reinterpret_cast<const float*>(local_buf + tok_gate_off);
