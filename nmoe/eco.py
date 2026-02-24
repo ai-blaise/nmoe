@@ -783,6 +783,19 @@ class FusedBackwardECO:
         """Launch DP all-reduce over optional chunks of the flattened gradient."""
         import torch.distributed as dist
 
+        if self._dp_size > 1:
+            if not grad.is_cuda:
+                raise RuntimeError(
+                    "ECO DP all-reduce requires CUDA gradients on production path "
+                    f"(got device={grad.device}, dtype={grad.dtype})."
+                )
+            backend = str(dist.get_backend(self._dp_group) if self._dp_group is not None else dist.get_backend()).lower()
+            if "nccl" not in backend:
+                raise RuntimeError(
+                    "ECO DP all-reduce requires an NCCL process group on production path "
+                    f"(detected backend={backend!r})."
+                )
+
         flat = grad.reshape(-1)
         if flat.numel() == 0:
             return tuple()
@@ -813,7 +826,7 @@ class FusedBackwardECO:
                     chunk = flat.narrow(0, start, length)
                     work = dist.all_reduce(
                         chunk,
-                        op=dist.ReduceOp.AVG,
+                        op=dist.ReduceOp.SUM,
                         group=self._dp_group,
                         async_op=True,
                     )
@@ -826,7 +839,7 @@ class FusedBackwardECO:
             chunk = flat.narrow(0, start, length)
             work = dist.all_reduce(
                 chunk,
-                op=dist.ReduceOp.AVG,
+                op=dist.ReduceOp.SUM,
                 group=self._dp_group,
                 async_op=async_op,
             )
@@ -865,6 +878,9 @@ class FusedBackwardECO:
                 )
 
             grad = pending.grad
+            if self._dp_size > 1:
+                # _launch_dp_allreduce uses SUM for backend stability; normalize once after completion.
+                grad.mul_(1.0 / float(self._dp_size))
 
             # Gradient clipping using previous step's global norm estimate.
             if self.grad_clip > 0 and not pending.is_accumulating:
@@ -1059,6 +1075,7 @@ class FusedBackwardECO:
                 # --- Synchronous DP path: all-reduce inline before optimizer step ---
                 with _nvtx("eco/fused_update_sync_allreduce"):
                     self._launch_dp_allreduce(grad_comm, async_op=False)
+                    grad_comm.mul_(1.0 / float(self._dp_size))
 
             if grad is None:
                 grad = grad_comm

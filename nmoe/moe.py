@@ -379,15 +379,11 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         and _HAS_RESTORE_LAYOUT_FROM_SAVED
         and _HAS_RDEP_LAYOUT_CACHE
       ):
-        with _nvtx("moe_bs/fwd_snapshot_layout_zero_recv"), cuda_error_context("copy_blockscaled_layout_zero_recv"):
-          saved_dest = torch.empty(0, device=device, dtype=torch.int32)
-          saved_offsets = torch.empty(int(E) + 1, device=device, dtype=torch.int32)
-          _C.copy_blockscaled_layout(
-            saved_dest.data_ptr(),
-            saved_offsets.data_ptr(),
-            0,
-            stream,
-          )
+        # dispatch_meta_blockscaled(M_recv=0) does not materialize a fresh dest/offsets
+        # layout in the runtime cache. Save a deterministic empty layout snapshot here
+        # so backward layout-restore can remain rank-consistent without stale state.
+        saved_dest = torch.empty(0, device=device, dtype=torch.int32)
+        saved_offsets = torch.zeros(int(E) + 1, device=device, dtype=torch.int32)
         saved_dispatch_layout = (
           saved_dest,
           saved_offsets,
@@ -581,15 +577,26 @@ class _MoEBlockscaledFused(torch.autograd.Function):
     saved_row_id: torch.Tensor | None = None
     saved_gate_sorted: torch.Tensor | None = None
     use_saved_layout = False
-    if not _DISABLE_LAYOUT_REUSE:
+    layout_reuse_enabled = bool(
+      not _DISABLE_LAYOUT_REUSE
+      and _HAS_COPY_BLOCKSCALED_LAYOUT
+      and _HAS_RESTORE_LAYOUT_FROM_SAVED
+      and _HAS_RDEP_LAYOUT_CACHE
+    )
+    if layout_reuse_enabled:
       candidate = getattr(ctx, "_saved_dispatch_layout", None)
-      if isinstance(candidate, tuple) and len(candidate) == 5:
-        saved_dispatch_layout = candidate
-        use_saved_layout = bool(
-          _HAS_COPY_BLOCKSCALED_LAYOUT
-          and _HAS_RESTORE_LAYOUT_FROM_SAVED
-          and _HAS_RDEP_LAYOUT_CACHE
+      if candidate is None:
+        raise RuntimeError(
+          "Missing saved dispatch layout in backward while layout reuse is enabled. "
+          "This can diverge rank participation between restore and re-dispatch paths."
         )
+      if not (isinstance(candidate, tuple) and len(candidate) == 5):
+        raise RuntimeError(
+          "Invalid saved dispatch layout payload; expected 5-tuple "
+          "(dest, offsets, offs_pad, row_id, gate_sorted)."
+        )
+      saved_dispatch_layout = candidate
+      use_saved_layout = True
 
     with _nvtx("moe_bs/bwd_dispatch_meta"):
       if use_saved_layout:
@@ -601,15 +608,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         offs_pad.copy_(saved_offs_pad)
         M_recv = int(saved_row_id.numel())
         dispatch_fn = "restore_layout_from_saved"
-        if M_recv > 0:
-          with cuda_error_context("restore_layout_from_saved"):
-            _C.restore_layout_from_saved(
-              saved_dest.data_ptr(),
-              saved_offsets.data_ptr(),
-              offs_pad.data_ptr(),
-              int(M_recv),
-              stream,
-            )
+        with cuda_error_context("restore_layout_from_saved"):
+          _C.restore_layout_from_saved(
+            saved_dest.data_ptr(),
+            saved_offsets.data_ptr(),
+            offs_pad.data_ptr(),
+            int(M_recv),
+            stream,
+          )
       elif use_dist_blockscaled_meta:
         dispatch_fn = "dispatch_meta_blockscaled"
         M_recv = _C.dispatch_meta_blockscaled(
@@ -672,10 +678,10 @@ class _MoEBlockscaledFused(torch.autograd.Function):
             0, int(T), int(K),
             stream,
           )
-        dummy_dxe_sorted = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
-        with cuda_error_context("scatter_dx_dist_bf16 (blockscaled backward, M_recv=0)"):
-          _C.scatter_dx_dist_bf16(
-            dummy_dxe_sorted.data_ptr(),
+        dummy_dxe_pad = torch.empty(1, int(H), device=device, dtype=torch.bfloat16)
+        with cuda_error_context("scatter_dx_dist_from_pad_bf16 (blockscaled backward, M_recv=0)"):
+          _C.scatter_dx_dist_from_pad_bf16(
+            dummy_dxe_pad.data_ptr(),
             dummy_row_id.data_ptr(),
             dX.data_ptr(),
             0, int(T), int(H), int(K),
