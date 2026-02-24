@@ -29,6 +29,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 // CUDA error checking macro
@@ -286,6 +288,19 @@ __host__ __forceinline__ bool complete_device_int_read_blocking(
     AsyncDeviceIntReadSlot* st,
     bool* ok_out,
     const char* context) {
+    auto counter_wait_timeout_ms = []() -> int {
+        static int cached = -1;
+        if (cached < 0) {
+            int parsed = 180000;  // 3 minutes
+            const char* raw = std::getenv("NMOE_RDEP_COUNTER_WAIT_TIMEOUT_MS");
+            if (raw && raw[0] != '\0') {
+                parsed = std::atoi(raw);
+                if (parsed < 0) parsed = 0;
+            }
+            cached = parsed;
+        }
+        return cached;
+    };
     if (st == nullptr || st->ready == nullptr || st->h_value == nullptr) {
         fprintf(stderr, "RDEP ERROR: %s invalid async read slot state\n", context);
         return false;
@@ -298,11 +313,33 @@ __host__ __forceinline__ bool complete_device_int_read_blocking(
         return true;
     }
     if (q == cudaErrorNotReady) {
-        cudaError_t wait = cudaEventSynchronize(st->ready);
-        if (wait != cudaSuccess) {
-            fprintf(stderr, "RDEP ERROR: %s cudaEventSynchronize failed: %s\n", context, cudaGetErrorString(wait));
+        const int timeout_ms = counter_wait_timeout_ms();
+        const auto t0 = std::chrono::steady_clock::now();
+        while (q == cudaErrorNotReady) {
+            if (timeout_ms > 0) {
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0
+                ).count();
+                if (elapsed_ms > timeout_ms) {
+                    fprintf(
+                        stderr,
+                        "RDEP ERROR: %s counter wait timed out after %lld ms (set NMOE_RDEP_COUNTER_WAIT_TIMEOUT_MS=0 to disable)\n",
+                        context,
+                        static_cast<long long>(elapsed_ms)
+                    );
+                    st->pending = false;
+                    if (ok_out) *ok_out = false;
+                    return false;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            q = cudaEventQuery(st->ready);
+        }
+        if (q != cudaSuccess) {
+            fprintf(stderr, "RDEP ERROR: %s cudaEventQuery failed after wait: %s\n", context, cudaGetErrorString(q));
             (void)cudaGetLastError();
             st->pending = false;
+            if (ok_out) *ok_out = false;
             return false;
         }
         st->last_value = *st->h_value;
