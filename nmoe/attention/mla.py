@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import record_function
 
-from nmoe.attention.fa4_import import get_fa4_flashmla_modules
+from nmoe.attention.fa4_import import get_fa4_fwd, get_flashmla_sm100_module
 from nmoe.attention.rope import rotate_pe, rotate_pe_partial
 from nmoe.config import Config
 from nmoe.norm import RMSNorm
@@ -494,10 +494,12 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     _require(v.shape == (bsz, seqlen, n_heads, d_v), "v must have shape [B, S, H, Dv].")
     _require(d_qk == 192 and d_v == 128, f"Only (d_qk, d_v) = (192, 128) is supported. Got ({d_qk}, {d_v}).")
 
-    # Hard requirement: do not proceed without FA4 forward + FlashMLA backward.
-    # Environment contract: `third_party/flash_attn` is on PYTHONPATH (so
-    # `flash_attn.cute` is importable), and `nmoe.csrc.flashmla_sm100` is built.
-    _flash_attn_fwd, _flashmla = get_fa4_flashmla_modules()
+    # Hard requirement: do not proceed without CUDA attention kernels.
+    # Environment contract:
+    # - `nmoe.csrc.flashmla_sm100` must be built for backward.
+    # - FA4 forward is required only when SM100 dense forward is disabled.
+    _flashmla = get_flashmla_sm100_module()
+    _flash_attn_fwd = get_fa4_fwd() if not _USE_FLASHMLA_SM100_FWD else None
 
     total = bsz * seqlen
     q_ = q.reshape(total, n_heads, d_qk).contiguous()
@@ -509,6 +511,8 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
     _require_finite("fa4.v", v_, force=force_finite)
 
     cu = _get_uniform_cu(q.device, bsz, seqlen)
+
+    fwd_path_tag = "flashmla_sm100" if _USE_FLASHMLA_SM100_FWD else "fa4"
 
     if _USE_FLASHMLA_SM100_FWD:
       _require(
@@ -537,6 +541,7 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
             False,  # non-packed dense path: fixed-length [B, S]
         )
     else:
+      _require(_flash_attn_fwd is not None, "FA4 forward kernel is unavailable.")
       with _nvtx("attn/fa4_fwd"):
         # Use m_block=128, n_block=64 for (d_qk=192, d_v=128) on SM100 (B200)
         # The default n_block=128 triggers a TMEM layout mismatch in cute-dsl
@@ -552,9 +557,11 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
             m_block_size=128,
             n_block_size=64,
         )
-    _require(out.shape == (total, n_heads, d_v),
-             f"FA4 output shape mismatch: expected {(total, n_heads, d_v)}, got {tuple(out.shape)}.")
-    _require(lse.ndim == 2, f"FA4 lse must be 2D, got shape={tuple(lse.shape)}.")
+    _require(
+      out.shape == (total, n_heads, d_v),
+      f"MLA forward output shape mismatch: expected {(total, n_heads, d_v)}, got {tuple(out.shape)}.",
+    )
+    _require(lse.ndim == 2, f"MLA forward lse must be 2D, got shape={tuple(lse.shape)}.")
     if _nan_debug_active():
       out_finite = torch.isfinite(out)
       if not bool(out_finite.all().item()):
@@ -569,14 +576,14 @@ class _MlaFa4FwdFlashMlaBwd(torch.autograd.Function):
         k_rms = float(k_.float().pow(2).mean().sqrt().item())
         v_rms = float(v_.float().pow(2).mean().sqrt().item())
         raise RuntimeError(
-          f"[NANDBG][mla] non-finite fa4.out shape={tuple(out.shape)} dtype={out.dtype} "
+          f"[NANDBG][mla] non-finite {fwd_path_tag}.out shape={tuple(out.shape)} dtype={out.dtype} "
           f"finite={finite}/{numel} nan={nan} inf={inf} "
           f"q_abs_max={q_abs:.6g} k_abs_max={k_abs:.6g} v_abs_max={v_abs:.6g} "
           f"q_rms={q_rms:.6g} k_rms={k_rms:.6g} v_rms={v_rms:.6g} "
           f"softmax_scale={float(softmax_scale):.6g}"
         )
-    _require_finite("fa4.out", out, force=force_finite)
-    _require_finite("fa4.lse", lse, force=force_finite)
+    _require_finite(f"{fwd_path_tag}.out", out, force=force_finite)
+    _require_finite(f"{fwd_path_tag}.lse", lse, force=force_finite)
 
     # FlashMLA expects lse as [total, H] float32 with stride(0) == 1.
     if lse.shape == (n_heads, total):

@@ -313,6 +313,7 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
   need_router = bool(getattr(cfg, 'use_fused_router', True))
   need_eco = bool(getattr(cfg, 'eco_fused_backward', False) and getattr(cfg, 'eco_require_cuda', True))
   use_fa4 = os.getenv('NMOE_USE_FA4', '1') in ('1', 'true', 'True')
+  use_flashmla_sm100_fwd = os.getenv("NMOE_MLA_USE_FLASHMLA_SM100_FWD", "0") in ("1", "true", "True")
   require_flashmla = os.getenv('NMOE_REQUIRE_FLASHMLA', '1') in ('1', 'true', 'True')
   packed_attn_backend = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip().lower()
 
@@ -412,7 +413,10 @@ def _validate_required_cuda_bindings(cfg: Config) -> None:
       "NMOE_PACKED_ATTN_BACKEND=flashmla required when NMOE_REQUIRE_FLASHMLA=1"
     )
   if use_fa4:
-    attn_missing = probe_fa4_flashmla_bindings()
+    attn_missing = probe_fa4_flashmla_bindings(
+      require_fa4_fwd=not use_flashmla_sm100_fwd,
+      require_flashmla_fwd=use_flashmla_sm100_fwd,
+    )
     if attn_missing:
       missing['attention'] = attn_missing
 
@@ -904,7 +908,6 @@ def train(cfg: Config):
               raise RuntimeError(
                 f"[NANDBG][rank={rank}] non-finite logits at step={step_num}, micro={micro_step}"
               )
-          os.environ["NMOE_NAN_DEBUG_ACTIVE"] = "0"
 
           # Fail-fast on token drops (indicates expert load collapse)
           _dropped = getattr(model, 'total_dropped_tokens', 0)
@@ -1043,6 +1046,7 @@ def train(cfg: Config):
                 f"step={step_num}, micro={micro_step}: {float(micro_grad_norm)}. "
                 f"First non-finite grads: {detail}"
               )
+          os.environ["NMOE_NAN_DEBUG_ACTIVE"] = "0"
           if step_heartbeat and rank == 0:
             print(f"[HB] step={step_num} micro={micro_step} stage=bwd_done", flush=True)
           if fused_eco is not None and fused_eco.is_final_microstep:

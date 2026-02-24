@@ -82,17 +82,24 @@ def get_fa4_flashmla_modules():
   return get_fa4_fwd(), get_flashmla_sm100_module()
 
 
-def probe_fa4_flashmla_bindings() -> list[str]:
+def probe_fa4_flashmla_bindings(
+    *,
+    require_fa4_fwd: bool = True,
+    require_flashmla_fwd: bool = False,
+) -> list[str]:
   missing: list[str] = []
-  try:
-    _ = get_fa4_fwd()
-  except Exception as e:
-    missing.append(f"flash_attn.cute.interface._flash_attn_fwd ({e})")
+  if require_fa4_fwd:
+    try:
+      _ = get_fa4_fwd()
+    except Exception as e:
+      missing.append(f"flash_attn.cute.interface._flash_attn_fwd ({e})")
 
   try:
     flashmla = get_flashmla_sm100_module()
     if not hasattr(flashmla, "dense_prefill_bwd"):
       missing.append("flashmla_sm100.dense_prefill_bwd")
+    if require_flashmla_fwd and not hasattr(flashmla, "dense_prefill_fwd"):
+      missing.append("flashmla_sm100.dense_prefill_fwd")
   except Exception as e:
     missing.append(f"nmoe.csrc.flashmla_sm100 ({e})")
 

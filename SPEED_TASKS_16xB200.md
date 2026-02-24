@@ -983,6 +983,21 @@ Scope:
   - Acceptance: malformed tensor/device/dtype/layout inputs fail before kernel launch; no silent undefined behavior from invalid lse stride/shape contracts.
   - Status note: added strict CUDA/device/dtype/shape/contiguity checks (including `lse.stride(0)==1` and finite `softmax_scale`) for both dense forward and backward entrypoints.
 
+- [x] D-033 Align attention-kernel preflight with non-packed SM100 forward mode.
+  - Files: `nmoe/attention/fa4_import.py`, `nmoe/train.py`
+  - Acceptance: launch-time CUDA binding validation only requires FA4 forward when FA4 forward is selected, and requires SM100 dense-forward symbol when SM100 forward is selected.
+  - Status note: `probe_fa4_flashmla_bindings(...)` now accepts mode flags; `_validate_required_cuda_bindings` passes `NMOE_MLA_USE_FLASHMLA_SM100_FWD` through to preflight checks.
+
+- [x] D-034 Remove unconditional FA4 import from non-packed MLA SM100 forward path.
+  - Files: `nmoe/attention/mla.py`
+  - Acceptance: non-packed MLA with `NMOE_MLA_USE_FLASHMLA_SM100_FWD=1` does not import/require FA4 forward modules at runtime.
+  - Status note: `_MlaFa4FwdFlashMlaBwd` now loads FlashMLA bindings unconditionally and FA4 forward lazily only when SM100 forward is disabled.
+
+- [x] D-035 Keep scoped NaN debug active through backward for MLA diagnostics.
+  - Files: `nmoe/train.py`
+  - Acceptance: `NMOE_NAN_DEBUG_ACTIVE` remains enabled for configured debug micro-step until after backward/micro-grad checks complete.
+  - Status note: moved debug-scope reset to post-backward so MLA backward finite checks can fire in the intended scope.
+
 - [x] D-017 Add fused packed-RoPE support for per-sample position-reset tables (`[B,S,half]`) without falling back.
   - Files: `nmoe/attention/rope.py`
   - Acceptance: packed-mode 3D cos/sin inputs use fused CUDA kernels safely (no undefined layout assumptions / no OOB behavior).
