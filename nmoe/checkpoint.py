@@ -2596,9 +2596,11 @@ def load_checkpoint(
     eco_fused = getattr(cfg, 'eco_fused_backward', False)
     if getattr(cfg, 'resume', True):
         resume_step = int(getattr(cfg, 'resume_step', -1))
+        forced_path: Optional[str] = None
         if resume_step >= 0:
             step = resume_step
-            has_local = 1 if checkpointer.path_for_step(step) is not None else 0
+            forced_path = checkpointer.path_for_step(step)
+            has_local = 1 if forced_path is not None else 0
             if _is_dist():
                 device = (
                     torch.device("cuda", torch.cuda.current_device())
@@ -2617,67 +2619,50 @@ def load_checkpoint(
         else:
             local_step, _ = checkpointer.find_latest()
             step = _consensus_resume_step(local_step)
-        path = checkpointer.path_for_step(step) if step >= 0 else None
+        path = forced_path if resume_step >= 0 else (checkpointer.path_for_step(step) if step >= 0 else None)
         if step >= 0 and path is None:
             raise FileNotFoundError(
                 f"Checkpoint step {step} selected by consensus but local shard file is missing"
             )
 
         if path is not None:
-            saved_dp_count, saved_world = _read_checkpoint_layout_from_rd(checkpointer.base, step)
-            current_world = _world_size()
-            current_dp_count = _checkpoint_shard_count()
             import_bootstrap = int(step) == 0
-            if saved_world > 0 and saved_world != current_world:
-                if import_bootstrap:
-                    if rank == 0:
-                        print_fn(
-                            "[checkpoint] step=0 import across world-size change: "
-                            f"saved_world={saved_world}, current_world={current_world} "
-                            "(weights-only resume path)."
-                        )
-                else:
+            if import_bootstrap:
+                if rank == 0:
+                    print_fn(
+                        "[checkpoint] step=0 fast import path: skipping pre-load "
+                        "layout/signature consensus checks to avoid 128-rank startup stalls."
+                    )
+            else:
+                saved_dp_count, saved_world = _read_checkpoint_layout_from_rd(checkpointer.base, step)
+                current_world = _world_size()
+                current_dp_count = _checkpoint_shard_count()
+                if saved_world > 0 and saved_world != current_world:
                     raise RuntimeError(
                         "Checkpoint world-size mismatch: "
                         f"saved={saved_world}, current={current_world}"
                     )
-            if saved_dp_count > 0 and saved_dp_count != current_dp_count:
-                if import_bootstrap:
-                    if rank == 0:
-                        print_fn(
-                            "[checkpoint] step=0 import across shard-count change: "
-                            f"saved_dp_count={saved_dp_count}, current_dp_count={current_dp_count} "
-                            "(weights-only resume path)."
-                        )
-                else:
+                if saved_dp_count > 0 and saved_dp_count != current_dp_count:
                     raise RuntimeError(
                         "Checkpoint shard-count mismatch: "
                         f"saved={saved_dp_count}, current={current_dp_count}"
                     )
 
-            checkpoint_local_layout = _checkpoint_uses_local_layout(checkpointer.base, step)
-            env_local_layout = _use_local_ep_checkpoint_layout()
-            if (
-                checkpoint_local_layout is not None
-                and checkpoint_local_layout != env_local_layout
-            ):
-                mode = "local-ep" if checkpoint_local_layout else "global-rank"
-                expected_env = "1" if checkpoint_local_layout else "0"
-                if import_bootstrap:
-                    if rank == 0:
-                        print_fn(
-                            "[checkpoint] step=0 import with layout mismatch: "
-                            f"on-disk={mode}, NMOE_CHECKPOINT_LOCAL_EP={int(env_local_layout)}. "
-                            f"Continuing weights-only import (recommended env: {expected_env})."
-                        )
-                else:
+                checkpoint_local_layout = _checkpoint_uses_local_layout(checkpointer.base, step)
+                env_local_layout = _use_local_ep_checkpoint_layout()
+                if (
+                    checkpoint_local_layout is not None
+                    and checkpoint_local_layout != env_local_layout
+                ):
+                    mode = "local-ep" if checkpoint_local_layout else "global-rank"
+                    expected_env = "1" if checkpoint_local_layout else "0"
                     raise RuntimeError(
                         "Checkpoint layout mismatch: on-disk layout is "
                         f"{mode} for step {step}, but NMOE_CHECKPOINT_LOCAL_EP={int(env_local_layout)}. "
                         f"Set NMOE_CHECKPOINT_LOCAL_EP={expected_env} and retry."
                     )
 
-            _consensus_checkpoint_signature(step)
+                _consensus_checkpoint_signature(step)
 
             run_dtype = str(getattr(cfg, 'dtype', 'bf16') or 'bf16').lower()
             nvfp4_direct = run_dtype == 'nvfp4' or getattr(cfg, 'eco_enabled', False) or eco_fused
