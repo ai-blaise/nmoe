@@ -202,6 +202,7 @@ class FusedBackwardECO:
             raise ValueError(
                 f"eco_allreduce_mode must be 'async' or 'sync', got {self._allreduce_mode!r}"
             )
+        self._async_accumulation = bool(getattr(cfg, 'eco_async_accumulation', False))
         self._allreduce_dtype = str(getattr(cfg, 'eco_allreduce_dtype', 'bf16')).lower()
         if self._allreduce_dtype not in {'fp32', 'bf16'}:
             raise ValueError(
@@ -293,6 +294,7 @@ class FusedBackwardECO:
             f"accum_steps={self._accum_steps}, "
             f"require_cuda={self._require_cuda}, "
             f"allreduce_mode={self._allreduce_mode}, "
+            f"async_accumulation={self._async_accumulation}, "
             f"allreduce_dtype={self._allreduce_dtype}, "
             f"allreduce_chunk_mb={chunk_mb}, "
             f"allreduce_chunk_threshold_mb={threshold_mb}, "
@@ -1049,7 +1051,11 @@ class FusedBackwardECO:
 
             if self._dp_size > 1 and self._dp_group is not None:
                 comm_nbytes = grad_comm.numel() * grad_comm.element_size()
-                if self._allreduce_mode == 'async':
+                use_async_allreduce = (
+                    self._allreduce_mode == 'async'
+                    and (self._async_accumulation or not self.is_accumulating)
+                )
+                if use_async_allreduce:
                     effective_max_pending = self._effective_max_pending_ops(comm_nbytes)
                     # --- Async path: enqueue all_reduce, defer optimizer step ---
                     # Opportunistic drain: process any completed ops without blocking.
