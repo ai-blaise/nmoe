@@ -992,13 +992,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       _require_finite("backward.dGate_sorted", dGate_sorted)
       if is_dist:
         # Distributed IPC+hybrid: send dGate back to source ranks.
-        _C.send_dgate_dist_bf16_out_bf16(
-          row_id.data_ptr(),
-          dGate_sorted.data_ptr(),
-          dGates_tk_bf16.data_ptr(),
-          int(M_recv), int(T), int(K),
-          stream,
-        )
+        with cuda_error_context("send_dgate_dist_bf16_out_bf16 (blockscaled backward)"):
+          _C.send_dgate_dist_bf16_out_bf16(
+            row_id.data_ptr(),
+            dGate_sorted.data_ptr(),
+            dGates_tk_bf16.data_ptr(),
+            int(M_recv), int(T), int(K),
+            stream,
+          )
       else:
         # Single-GPU: scatter dGate directly.
         _C.scatter_gate_bf16_out_bf16(
@@ -1126,13 +1127,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
       _require_contiguous(dX_pad, "dX_pad", dtype=torch.bfloat16)
       if is_dist:
         if mode in ("ipc", "hybrid"):
-          _C.scatter_dx_dist_from_pad_bf16(
-            dX_pad.data_ptr(),
-            row_id.data_ptr(),
-            dX.data_ptr(),
-            int(M_recv), int(T), int(H), int(K),
-            stream,
-          )
+          with cuda_error_context("scatter_dx_dist_from_pad_bf16 (blockscaled backward)"):
+            _C.scatter_dx_dist_from_pad_bf16(
+              dX_pad.data_ptr(),
+              row_id.data_ptr(),
+              dX.data_ptr(),
+              int(M_recv), int(T), int(H), int(K),
+              stream,
+            )
         else:
           raise RuntimeError(f"Unsupported distributed RDEP mode for dX scatter: mode={mode}")
       else:

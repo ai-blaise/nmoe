@@ -6682,7 +6682,9 @@ extern "C" void rdep_gather_dy_dist_bf16(
         abort();
     }
 
-    if (g_bf16.initialized) {
+    // When blockscaled is active both states may be initialized; prefer the
+    // blockscaled branch so barrier/layout domains match dispatch_meta_blockscaled.
+    if (g_bf16.initialized && !(g_block.initialized && (g_block.profile == 0 || g_block.profile == 1))) {
         if (g_bf16.world <= 1) return;
         if (g_bf16.world > MAX_RANKS) {
             fprintf(stderr, "RDEP ERROR: world=%d exceeds MAX_RANKS=%d\n", g_bf16.world, MAX_RANKS);
@@ -7117,7 +7119,9 @@ extern "C" void rdep_scatter_dx_dist_bf16(
         abort();
     }
 
-    if (g_bf16.initialized) {
+    // When blockscaled is active both states may be initialized; prefer the
+    // blockscaled branch so barrier/layout domains match dispatch_meta_blockscaled.
+    if (g_bf16.initialized && !(g_block.initialized && (g_block.profile == 0 || g_block.profile == 1))) {
         if (g_bf16.world <= 1) return;
         if (H != g_bf16.H) {
             fprintf(stderr, "RDEP FATAL: BF16 H mismatch in scatter_dx_dist_bf16: got H=%d state H=%d\n",
@@ -7298,7 +7302,9 @@ extern "C" void rdep_scatter_dx_dist_from_pad_bf16(
         abort();
     }
 
-    if (g_bf16.initialized) {
+    // When blockscaled is active both states may be initialized; prefer the
+    // blockscaled branch so barrier/layout domains match dispatch_meta_blockscaled.
+    if (g_bf16.initialized && !(g_block.initialized && (g_block.profile == 0 || g_block.profile == 1))) {
         if (g_bf16.world <= 1) return;
         if (H != g_bf16.H) {
             fprintf(stderr, "RDEP FATAL: BF16 H mismatch in scatter_dx_dist_from_pad_bf16: got H=%d state H=%d\n",
