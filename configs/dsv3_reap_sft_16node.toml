@@ -102,11 +102,11 @@ eco_sync_bootstrap_steps = 0     # Disable forced sync bootstrap; avoid step-0 b
 eco_allreduce_dtype = "bf16"     # Socket-mode speed path: halve DP all-reduce wire bytes vs FP32
 eco_allreduce_chunk_mb = 64      # Reduce collective launch count for large expert gradient payloads
 eco_allreduce_chunk_threshold_mb = 64  # Single all-reduce below 64MB; chunk only large payloads
-eco_max_pending_allreduce_mb = 2048    # Allow multiple in-flight expert payloads for comm/compute overlap
+eco_max_pending_allreduce_mb = 4096    # Allow multiple in-flight expert payloads for comm/compute overlap
 eco_max_pending_allreduce_ops = 0      # Auto-size queue depth from payload size + byte budget
 eco_comm_stall_warn_s = 15.0
 eco_comm_debug = false
-gradient_checkpointing = true    # Enable higher compute density (larger micro-batch) without OOM at seq_len=1024
+gradient_checkpointing = true    # Enable higher compute density (larger micro-batch) without OOM at seq_len=4096
 
 # =============================================================================
 # Training
@@ -114,8 +114,8 @@ gradient_checkpointing = true    # Enable higher compute density (larger micro-b
 steps = 10000
 dtype = "nvfp4"
 batch_size = 128                  # Increase per-step compute to improve compute:comm ratio on DP-over-TCP runs
-seq_len = 1024                    # Keep sequence length conservative while raising global batch
-gradient_accumulation_steps = 4   # 128 global / 16 DP / 4 accum = 2 micro-batches per GPU
+seq_len = 4096                    # Restore base config seq_len for proper compute:communication ratio
+gradient_accumulation_steps = 4   # micro_batch = 128 / (16 * 4) = 2 (sequences are now 4096 tokens each)
 resume = true
 resume_step = 0                  # Force clean import checkpoint (iter_0000000); avoid unstable latest local step drift
 grad_clip = 1.0
@@ -140,6 +140,6 @@ sft_packing_enabled = false      # Disabled for debugging - test basic SFT first
 # RDEP capacity override (worst-case token-expert dispatch slots per GPU)
 # Set to 0 to use auto-computed capacity: micro_batch * seq_len * K * ep_size
 # micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 128 / (16 * 4) = 2
-# T per forward = micro_batch * seq_len = 2 * 1024 = 2,048
-# Auto-compute: 2,048 * 8 * 8 = 131,072
+# T per forward = micro_batch * seq_len = 2 * 4096 = 8,192
+# Auto-compute: 8,192 * 8 * 8 = 524,288
 rdep_capacity = 0

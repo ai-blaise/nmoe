@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.profiler import record_function
 
-from nmoe.attention.rope import rotate_pe
+from nmoe.attention.rope import rotate_pe_partial
 from nmoe.config import Config
 import nmoe.triton.swa as swa_k
 
@@ -68,10 +68,8 @@ class SWA(nn.Module):
     v = v.view(B, T, KV, D)
 
     if self.rope_dim:
-      q_rope = rotate_pe(q[..., self.nope_dim:], cos, sin)
-      q[..., self.nope_dim:].copy_(q_rope)
-      k_rope = rotate_pe(k[..., self.nope_dim:], cos, sin)
-      k[..., self.nope_dim:].copy_(k_rope)
+      rotate_pe_partial(q, cos, sin, nope_dim=self.nope_dim)
+      rotate_pe_partial(k, cos, sin, nope_dim=self.nope_dim)
 
     G = self.repeat_kv
     assert H == KV * G, f"Heads must satisfy H = KV*G (got H={H}, KV={KV}, G={G})"

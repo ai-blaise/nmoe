@@ -835,14 +835,20 @@ def train(cfg: Config):
 
       del _warmup_t
 
+  scalar_device = torch.device('cuda', torch.cuda.current_device())
+  accumulated_loss_gpu = torch.zeros((), device=scalar_device, dtype=torch.float32)
+  rank_loss_scale = torch.ones((), device=scalar_device, dtype=torch.float32)
+  global_token_count = torch.ones((), device=scalar_device, dtype=torch.float32)
+  diag_scalars = torch.empty((3,), device=scalar_device, dtype=torch.float32)
+  micro_bad = torch.empty((4,), device=scalar_device, dtype=torch.int32)
+
   try:
     with nvtx_ctx('train/run'):
       for step_num in range(start_step, cfg.steps):
         lr = update_lr(optimizer, dense_groups, step_num, tokens_seen, cfg)
 
         # Gradient accumulation: inner loop over micro-batches
-        accumulated_loss = 0.0
-        accumulated_loss_gpu = torch.tensor(0.0, device='cuda')
+        accumulated_loss_gpu.zero_()
         t0 = time.perf_counter()
 
         for micro_step in range(accum_steps):
@@ -974,8 +980,8 @@ def train(cfg: Config):
             # Token-weight loss across DP ranks when supervised token counts differ.
             # Per-rank CE is normalized by local mask sum, while gradients are reduced
             # with DP AVG. Without this correction, sparse ranks are overweighted.
-            rank_loss_scale = torch.ones((), device=loss.device, dtype=torch.float32)
-            global_token_count = torch.ones((), device=loss.device, dtype=torch.float32)
+            rank_loss_scale.fill_(1.0)
+            global_token_count.fill_(1.0)
             if world > 1 and dp_group is not None and dp_world_size > 1:
               import torch.distributed as _dist
               if loss_mask is not None:
@@ -989,9 +995,9 @@ def train(cfg: Config):
                   device=loss.device,
                   dtype=torch.float32,
                 )
-              global_token_count = local_token_count.clone()
+              global_token_count.copy_(local_token_count)
               _dist.all_reduce(global_token_count, op=_dist.ReduceOp.SUM, group=dp_group)
-              rank_loss_scale = (float(dp_world_size) * local_token_count) / global_token_count
+              rank_loss_scale.copy_((float(dp_world_size) * local_token_count) / global_token_count)
               loss = loss * rank_loss_scale.to(dtype=loss.dtype)
             aux_loss = model.get_router_aux_loss()
             if aux_loss.device != loss.device:
@@ -1002,18 +1008,13 @@ def train(cfg: Config):
               loss = loss / accum_steps
             # Fail-fast on non-finite loss before backward. With fused ECO enabled,
             # expert optimizer updates happen inside backward, so we must abort first.
-            diag_scalars = torch.stack((
-              rank_loss_scale.to(dtype=torch.float32),
-              aux_loss.detach().to(dtype=torch.float32),
-              loss.detach().to(dtype=torch.float32),
-            ))
-            diag_finite = torch.isfinite(diag_scalars).to(dtype=torch.int32)
-            micro_bad = torch.stack((
-              (global_token_count <= 0).to(dtype=torch.int32),
-              1 - diag_finite[0],
-              1 - diag_finite[1],
-              1 - diag_finite[2],
-            ))
+            diag_scalars[0].copy_(rank_loss_scale)
+            diag_scalars[1].copy_(aux_loss.detach())
+            diag_scalars[2].copy_(loss.detach())
+            micro_bad[0].copy_((global_token_count <= 0).to(dtype=torch.int32))
+            micro_bad[1].copy_((~torch.isfinite(diag_scalars[0])).to(dtype=torch.int32))
+            micro_bad[2].copy_((~torch.isfinite(diag_scalars[1])).to(dtype=torch.int32))
+            micro_bad[3].copy_((~torch.isfinite(diag_scalars[2])).to(dtype=torch.int32))
             if world > 1:
               import torch.distributed as _dist
               if _dist.is_available() and _dist.is_initialized():

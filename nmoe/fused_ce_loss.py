@@ -35,20 +35,29 @@ This module provides:
 Both pretraining (EOS masking) and SFT (explicit loss_mask) modes are supported.
 """
 
-from contextlib import contextmanager
+import os
+from contextlib import nullcontext
 from typing import Optional
 import torch
 import torch.nn.functional as F
 
 
-@contextmanager
-def _nvtx(name: str):
-    """Emit an NVTX range visible in Nsight Systems / nvprof."""
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) in ("1", "true", "True")
+
+
+_NVTX_ENABLED = (
+    _env_flag("NMOE_NVTX", "0")
+    and torch.cuda.is_available()
+    and hasattr(torch.cuda, "nvtx")
+    and hasattr(torch.cuda.nvtx, "range")
+)
+
+
+def _nvtx(tag: str):
+    if _NVTX_ENABLED:
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
 
 
 class FusedMaskedCELossFunction(torch.autograd.Function):
@@ -480,18 +489,20 @@ class _ChunkedProjectedMaskedCELossFunction(torch.autograd.Function):
                     grad_w_chunk.mul_(scale)
 
                 in_chunk = (targets_1d >= start) & (targets_1d < end)
-                if bool(in_chunk.any().item()):
-                    local_idx = targets_1d[in_chunk] - start
-                    coeff = row_scale[in_chunk]
-                    hidden_sel = hidden_f32[in_chunk]
-                    grad_w_chunk.index_add_(
-                        0,
-                        local_idx,
-                        (-coeff.unsqueeze(1) * hidden_sel * scale),
-                    )
-                    grad_hidden[in_chunk].add_(
-                        -coeff.unsqueeze(1) * w_chunk_f32.index_select(0, local_idx) * scale
-                    )
+                row_idx = torch.nonzero(in_chunk, as_tuple=False).flatten()
+                local_idx = targets_1d.index_select(0, row_idx) - start
+                coeff = row_scale.index_select(0, row_idx)
+                hidden_sel = hidden_f32.index_select(0, row_idx)
+                grad_w_chunk.index_add_(
+                    0,
+                    local_idx,
+                    (-coeff.unsqueeze(1) * hidden_sel * scale),
+                )
+                grad_hidden.index_add_(
+                    0,
+                    row_idx,
+                    (-coeff.unsqueeze(1) * w_chunk_f32.index_select(0, local_idx) * scale),
+                )
 
                 grad_weight[start:end].add_(grad_w_chunk.to(dtype=grad_weight.dtype))
 

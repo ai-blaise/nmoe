@@ -12,19 +12,28 @@ Performance:
 
 Requires PyTorch 2.0+ for _foreach_norm and _foreach_mul_ support.
 """
-from contextlib import contextmanager
+import os
+from contextlib import nullcontext
 import torch
 from typing import Iterable, Union
 
 
-@contextmanager
-def _nvtx(name: str):
-    """Emit an NVTX range visible in Nsight Systems / nvprof."""
-    torch.cuda.nvtx.range_push(name)
-    try:
-        yield
-    finally:
-        torch.cuda.nvtx.range_pop()
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default) in ("1", "true", "True")
+
+
+_NVTX_ENABLED = (
+    _env_flag("NMOE_NVTX", "0")
+    and torch.cuda.is_available()
+    and hasattr(torch.cuda, "nvtx")
+    and hasattr(torch.cuda.nvtx, "range")
+)
+
+
+def _nvtx(tag: str):
+    if _NVTX_ENABLED:
+        return torch.cuda.nvtx.range(tag)
+    return nullcontext()
 
 # Type alias for parameters
 ParamsT = Union[Iterable[torch.Tensor], torch.Tensor]
@@ -107,10 +116,7 @@ def fused_clip_grad_norm_(
         # The clamping ensures we never scale up, but we still apply the multiply
         # for consistency. The multiply by 1.0 is essentially a no-op for the GPU.
         #
-        # Create a list of the same scalar for each gradient
-        # _foreach_mul_ expects either a list of scalars or a list of tensors
-        # We use a single-element tensor repeated, which gets broadcast
-        torch._foreach_mul_(grads, clip_coef_clamped.expand(len(grads)).tolist())
+        torch._foreach_mul_(grads, clip_coef_clamped)
 
         return total_norm
 

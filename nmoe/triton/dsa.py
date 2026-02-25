@@ -3,12 +3,17 @@
 Paper: DeepSeek-V3.2 Section 2.1, Equation 1:
     I_{t,s} = Σ_{j=1}^{H^I} w^I_{t,j} · ReLU(q^I_{t,j} · k^I_s)
 
-Uses score computation kernel + torch.topk for top-k selection.
+Uses a fused score+topk kernel for small-k cases and falls back to
+score computation + torch.topk for general k.
 """
 
 import torch
 import triton
 import triton.language as tl
+
+_FUSED_TOPK_BLOCK_M = 32
+_FUSED_TOPK_BLOCK_N = 64
+_FUSED_TOPK_MAX_NPAD = 0xFFFF
 
 
 # =============================================================================
@@ -115,8 +120,8 @@ def compute_indexer_scores(
     scores = torch.empty(B, M, N, device=q.device, dtype=torch.float32)
 
     # Block sizes tuned for B200
-    BLOCK_M = 32
-    BLOCK_N = 64
+    BLOCK_M = _FUSED_TOPK_BLOCK_M
+    BLOCK_N = _FUSED_TOPK_BLOCK_N
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), B)
 
@@ -145,12 +150,8 @@ def lightning_indexer(
     """
     Compute lightning indexer scores and select top-k indices.
 
-    This implementation computes scores using a Triton kernel then uses
-    torch.topk for selection. This is efficient for training where we
-    need reliable correctness for any k value.
-
-    For inference with very long sequences, a fused streaming implementation
-    would be more memory efficient.
+    Uses a fused streaming score+topk Triton path when k is small enough.
+    Falls back to score materialization + torch.topk for larger k.
 
     Args:
         q: [B, M, H, D] - indexer queries
@@ -166,6 +167,13 @@ def lightning_indexer(
     B, M, H, D = q.shape
     N = k.shape[1]
     K_SEL = min(top_k, N)
+
+    if (
+        K_SEL > 0
+        and K_SEL <= _FUSED_TOPK_BLOCK_N
+        and triton.cdiv(N, _FUSED_TOPK_BLOCK_N) * _FUSED_TOPK_BLOCK_N <= _FUSED_TOPK_MAX_NPAD
+    ):
+        return _lightning_indexer_fused_small_k_dispatch(q, k, w, K_SEL, causal=causal)
 
     # Compute all scores using Triton kernel
     scores = compute_indexer_scores(q, k, w, causal=causal)
@@ -324,3 +332,40 @@ def _lightning_indexer_fused_small_k(
     tl.store(v_ptrs, y_values, mask=mask_m[:, None])
     tl.store(i_ptrs, y_indices, mask=mask_m[:, None])
 
+
+def _lightning_indexer_fused_small_k_dispatch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    top_k: int,
+    causal: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused streaming top-k path for small k."""
+    B, M, H, D = q.shape
+    N = k.shape[1]
+    K_SEL = int(top_k)
+    BLOCK_M = _FUSED_TOPK_BLOCK_M
+    BLOCK_N = _FUSED_TOPK_BLOCK_N
+    N_PAD = triton.cdiv(N, BLOCK_N) * BLOCK_N
+
+    vals = torch.empty((B, M, K_SEL), device=q.device, dtype=torch.float32)
+    idxs = torch.empty((B, M, K_SEL), device=q.device, dtype=torch.int32)
+    grid = (triton.cdiv(M, BLOCK_M), B)
+
+    _lightning_indexer_fused_small_k[grid](
+        q, k, w,
+        vals, idxs,
+        M, N,
+        H=H,
+        D=D,
+        K_SEL=K_SEL,
+        *q.stride(), *k.stride(), *w.stride(), *vals.stride(), *idxs.stride(),
+        CAUSAL=causal,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        N_PAD=N_PAD,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return vals, idxs

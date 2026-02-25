@@ -327,17 +327,28 @@ class MLP(nn.Module):
     self.w1 = nn.Linear(dim, inter_dim, bias=False, dtype=torch.bfloat16)
     self.w3 = nn.Linear(dim, inter_dim, bias=False, dtype=torch.bfloat16)
     self.w2 = nn.Linear(inter_dim, dim, bias=False, dtype=torch.bfloat16)
+    self._w13_cache: torch.Tensor | None = None
+    self._w13_cache_key: tuple[int, int, int, int] | None = None
 
   def init_weights(self, init_std: float = 0.02):
     nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
     nn.init.trunc_normal_(self.w3.weight, mean=0.0, std=0.02)
     nn.init.trunc_normal_(self.w2.weight, mean=0.0, std=init_std)
 
+  def _fused_gate_up_weight(self) -> torch.Tensor:
+    w1 = self.w1.weight
+    w3 = self.w3.weight
+    cache_key = (w1.data_ptr(), int(w1._version), w3.data_ptr(), int(w3._version))
+    if self._w13_cache is None or self._w13_cache_key != cache_key:
+      self._w13_cache = torch.cat((w1, w3), dim=0)
+      self._w13_cache_key = cache_key
+    return self._w13_cache
+
   @record_function("mlp")
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     if self._fuse_gate_up_proj:
       # Single gate+up GEMM (gate_up_proj style), then split.
-      w13 = torch.cat((self.w1.weight, self.w3.weight), dim=0)
+      w13 = self._fused_gate_up_weight()
       up, gate = F.linear(x, w13).split(self.inter_dim, dim=-1)
     else:
       up = self.w1(x)

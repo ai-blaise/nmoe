@@ -1037,10 +1037,13 @@ def log_training_step(step: int,
         except Exception as e:
             raise RuntimeError("metrics: local W&B core metric log failed (no-fallback policy)") from e
 
+    router_stats: tuple[list[dict], dict] | None = None
+
     # Router metrics (per-layer + aggregates)
     if ctx is not None and ctx.writer is not None and rank == 0:
         try:
-            per, agg = collect_router_stats(model)
+            router_stats = collect_router_stats(model)
+            per, agg = router_stats
             for item in per:
                 cv = item['cv']
                 ent = item['entropy']
@@ -1072,7 +1075,9 @@ def log_training_step(step: int,
     # W&B router aggregates (rank 0 only)
     if ctx is not None and ctx.wandb_run is not None:
         try:
-            _per, _agg = collect_router_stats(model)
+            if router_stats is None:
+                router_stats = collect_router_stats(model)
+            _per, _agg = router_stats
             wandb_router: dict[str, float] = {}
             if _agg.get('mean_cv') is not None:
                 wandb_router["router/mean_cv"] = float(_agg['mean_cv'])
