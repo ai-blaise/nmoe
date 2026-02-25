@@ -177,6 +177,7 @@ class Config:
   eco_allreduce_dtype: str = "bf16"    # fp32 | bf16 payload dtype for DP all-reduce
   eco_allreduce_chunk_mb: int = 0      # Per-chunk size in MB (0 => async default chunk size)
   eco_allreduce_chunk_threshold_mb: int = 0  # Payload threshold MB (<= threshold => single all-reduce)
+  eco_allreduce_bucket_mb: int = 512   # Async bucket size in MB (coalesce many expert gradients per NCCL launch)
   eco_max_pending_allreduce_mb: int = 4096  # Async queue byte budget for in-flight ECO all-reduces
   eco_max_pending_allreduce_ops: int = 0    # Async queue depth cap (0 => auto-size from payload+byte budget)
   eco_comm_stall_warn_s: float = 30.0  # Warn when an ECO DP all-reduce has no progress for this many seconds

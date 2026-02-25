@@ -5,14 +5,18 @@ import torch
 from torch import nn
 
 from nmoe.csrc import rdep as _C
+from nmoe.nan_debug import nan_debug_active as _nan_debug_scope_active
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
   return os.getenv(name, default) in ("1", "true", "True")
 
 
+_MLA_FINITE_DEBUG = _env_flag("NMOE_MLA_FINITE_DEBUG", "0")
+
+
 def _nan_debug_active() -> bool:
-  return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_MLA_FINITE_DEBUG", "0")
+  return _MLA_FINITE_DEBUG or _nan_debug_scope_active()
 
 
 def _require_finite(tag: str, tensor: torch.Tensor) -> None:

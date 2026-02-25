@@ -40,6 +40,8 @@ import triton
 import triton.language as tl
 from typing import Optional, Tuple
 
+from nmoe.nan_debug import nan_debug_active as _nan_debug_scope_active
+
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default) in ("1", "true", "True")
@@ -55,6 +57,7 @@ _ROUTER_BWD_ALLOW_STANDALONE = _env_flag("NMOE_ROUTER_BWD_ALLOW_STANDALONE", "0"
 _ROUTER_STREAM_CACHE_LIMIT = max(1, int(os.getenv("NMOE_ROUTER_STREAM_CACHE_LIMIT", "8")))
 _EXPECTED_RDEP_ABI = 1
 _FUSED_ROUTER_MAX_K = 16
+_ROUTER_FINITE_DEBUG = _env_flag("NMOE_ROUTER_FINITE_DEBUG", "0")
 _NULL_NVTX_CTX = nullcontext()
 
 
@@ -96,7 +99,7 @@ def _cuda_stream_ptr_or_default(device: torch.device) -> int:
 
 
 def _nan_debug_active() -> bool:
-    return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_ROUTER_FINITE_DEBUG", "0")
+    return _ROUTER_FINITE_DEBUG or _nan_debug_scope_active()
 
 
 def _require_finite(tag: str, tensor: torch.Tensor) -> None:

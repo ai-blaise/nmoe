@@ -272,7 +272,7 @@ def _install_timers_on_module(mod: torch.nn.Module, tag: str) -> None:
     """
     if not torch.cuda.is_available():
         return
-    if _os.getenv('NMOE_TIMERS', '1') in ('0', 'false', 'False'):
+    if _os.getenv('NMOE_TIMERS', '0') in ('0', 'false', 'False'):
         return
 
     key_f = f"_nmoe_timer_{tag}_fwd_start"

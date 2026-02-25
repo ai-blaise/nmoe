@@ -91,7 +91,7 @@ def _resolve_time_ctx():
   global _TIME_CTX
   if _TIME_CTX is not None:
     return _TIME_CTX
-  timers_on = os.getenv('NMOE_TIMERS', '1') not in ('0', 'false', 'False')
+  timers_on = os.getenv('NMOE_TIMERS', '0') not in ('0', 'false', 'False')
   if not timers_on:
     _TIME_CTX = lambda _tag: nullcontext()
     return _TIME_CTX

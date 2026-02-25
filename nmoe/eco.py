@@ -110,17 +110,26 @@ if not hasattr(torch, 'float8_e5m2') or not hasattr(torch, 'float8_e4m3fn'):
 
 
 @dataclass
-class PendingAllReduce:
-    """Pending async all-reduce operation with deferred optimizer step."""
-    works: tuple[object, ...]  # dist.Work handles (one per chunk)
-    tail_work: object | None  # Last work in ordered stream, used as completion sentinel
-    grad: torch.Tensor  # Gradient buffer kept alive until all-reduce completion
-    moe: object  # MoE module reference
+class PendingGradTask:
+    """One deferred optimizer task whose gradient is reduced asynchronously."""
+    grad: torch.Tensor
+    moe: object
     param_name: str
     state: dict  # optimizer state dict
     beta1_eff: float
     beta2_eff: float
     is_accumulating: bool
+    seq: int
+    nbytes: int
+
+
+@dataclass
+class PendingAllReduce:
+    """Pending async all-reduce operation with deferred optimizer steps."""
+    works: tuple[object, ...]  # dist.Work handles (one per launched collective)
+    tail_work: object | None  # Last work in ordered stream, used as completion sentinel
+    tasks: tuple[PendingGradTask, ...]  # Ordered deferred optimizer tasks
+    bucket: torch.Tensor  # Flattened bucket storage backing all task gradients
     enqueue_ts: float
     seq: int
     nbytes: int
@@ -256,6 +265,10 @@ class FusedBackwardECO:
                 f"eco_allreduce_chunk_threshold_mb must be >= 0, got {threshold_mb}"
             )
         self._allreduce_chunk_threshold_bytes = threshold_mb * 1024 * 1024
+        bucket_mb = int(getattr(cfg, 'eco_allreduce_bucket_mb', 512))
+        if bucket_mb <= 0:
+            raise ValueError(f"eco_allreduce_bucket_mb must be > 0, got {bucket_mb}")
+        self._allreduce_bucket_bytes = bucket_mb * 1024 * 1024
 
         max_pending_mb = int(getattr(cfg, 'eco_max_pending_allreduce_mb', 4096))
         if max_pending_mb <= 0:
@@ -277,6 +290,10 @@ class FusedBackwardECO:
         self._max_pending_cfg = max_pending_ops
         self._max_pending = max_pending_ops if max_pending_ops > 0 else 1
         self._pending_bytes: int = 0
+        self._staged_tasks: list[PendingGradTask] = []
+        self._staged_bytes: int = 0
+        self._staged_dtype: torch.dtype | None = None
+        self._staged_device: torch.device | None = None
         self._allreduce_seq: int = 0
         self._dp_comm_stream: torch.cuda.Stream | None = None
         self._runtime_fused_update_calls: int = 0
@@ -337,6 +354,7 @@ class FusedBackwardECO:
             f"allreduce_dtype={self._allreduce_dtype}, "
             f"allreduce_chunk_mb={chunk_mb}, "
             f"allreduce_chunk_threshold_mb={threshold_mb}, "
+            f"allreduce_bucket_mb={bucket_mb}, "
             f"max_pending_allreduce_mb={max_pending_mb}, "
             f"max_pending_allreduce_ops={'auto' if max_pending_ops == 0 else max_pending_ops}"
         )
@@ -351,7 +369,9 @@ class FusedBackwardECO:
 
     def pending_queue_state(self) -> tuple[int, float]:
         """Return current async DP queue state (count, MB) for telemetry."""
-        return len(self._pending_queue), self._pending_bytes / (1024 * 1024)
+        staged = 1 if self._staged_tasks else 0
+        total_bytes = self._pending_bytes + self._staged_bytes
+        return len(self._pending_queue) + staged, total_bytes / (1024 * 1024)
 
     def _effective_max_pending_ops(self, payload_nbytes: int) -> int:
         """Return queue-depth limit for one payload.
@@ -876,7 +896,9 @@ class FusedBackwardECO:
             self._runtime_cuda_fused_kernel_calls += 1
             return True
 
-    def _launch_dp_allreduce(self, grad: torch.Tensor, async_op: bool) -> tuple[object, ...]:
+    def _launch_dp_allreduce(
+        self, grad: torch.Tensor, async_op: bool, *, force_single_chunk: bool = False
+    ) -> tuple[object, ...]:
         """Launch DP all-reduce over optional chunks of the flattened gradient."""
         import torch.distributed as dist
 
@@ -906,13 +928,16 @@ class FusedBackwardECO:
                     "ECO DP all-reduce chunk size not set; defaulting to %d MB for stability",
                     chunk_bytes // (1024 * 1024),
                 )
-        threshold_bytes = self._allreduce_chunk_threshold_bytes or chunk_bytes
-        if threshold_bytes > 0 and payload_bytes <= threshold_bytes:
+        if force_single_chunk:
             chunk_elems = flat.numel()
-        elif chunk_bytes > 0:
-            chunk_elems = max(1, chunk_bytes // flat.element_size())
         else:
-            chunk_elems = flat.numel()
+            threshold_bytes = self._allreduce_chunk_threshold_bytes or chunk_bytes
+            if threshold_bytes > 0 and payload_bytes <= threshold_bytes:
+                chunk_elems = flat.numel()
+            elif chunk_bytes > 0:
+                chunk_elems = max(1, chunk_bytes // flat.element_size())
+            else:
+                chunk_elems = flat.numel()
 
         works: list[object] = []
         if async_op and self._dp_comm_stream is not None:
@@ -944,6 +969,142 @@ class FusedBackwardECO:
                 works.append(work)
         return tuple(works)
 
+    def _flush_staged_async_bucket(self, *, force: bool = False) -> None:
+        """Pack staged gradients into one bucket and launch one async DP all-reduce."""
+        if not self._staged_tasks:
+            return
+        if not force and self._staged_bytes < self._allreduce_bucket_bytes:
+            return
+
+        with _nvtx("eco/flush_staged_async_bucket"):
+            staged = self._staged_tasks
+            staged_dtype = self._staged_dtype
+            staged_device = self._staged_device
+            if staged_dtype is None or staged_device is None:
+                raise RuntimeError("BUG: staged ECO all-reduce tasks missing dtype/device metadata.")
+
+            total_elems = 0
+            for task in staged:
+                total_elems += int(task.grad.numel())
+            if total_elems <= 0:
+                self._staged_tasks = []
+                self._staged_bytes = 0
+                self._staged_dtype = None
+                self._staged_device = None
+                return
+
+            bucket = torch.empty(total_elems, device=staged_device, dtype=staged_dtype)
+            cursor = 0
+            for task in staged:
+                src = task.grad
+                numel = int(src.numel())
+                dst = bucket.narrow(0, cursor, numel).view_as(src)
+                dst.copy_(src)
+                task.grad = dst
+                cursor += numel
+            if cursor != total_elems:
+                raise RuntimeError(
+                    f"BUG: staged ECO bucket copy mismatch: copied={cursor} elems, expected={total_elems}."
+                )
+
+            comm_nbytes = int(bucket.numel() * bucket.element_size())
+            effective_max_pending = self._effective_max_pending_ops(comm_nbytes)
+            self._drain_completed()
+            if comm_nbytes > self._max_pending_bytes:
+                logger.warning(
+                    "[eco] single all-reduce payload exceeds max pending budget: params=%s payload_mb=%.1f budget_mb=%.1f",
+                    len(staged),
+                    comm_nbytes / (1024 * 1024),
+                    self._max_pending_bytes / (1024 * 1024),
+                )
+
+            # Back-pressure on launched queue depth/bytes. Bucket composition is
+            # deterministic from gradient call order + byte threshold only.
+            while self._pending_queue and (
+                len(self._pending_queue) >= effective_max_pending
+                or self._pending_bytes + comm_nbytes > self._max_pending_bytes
+            ):
+                self._drain_one()
+
+            with _nvtx("eco/fused_update_async_allreduce_bucket"):
+                works = self._launch_dp_allreduce(
+                    bucket,
+                    async_op=True,
+                    force_single_chunk=True,
+                )
+            tail_work = works[-1] if works else None
+            first_seq = staged[0].seq
+            last_seq = staged[-1].seq
+            self._pending_queue.append(PendingAllReduce(
+                works=works,
+                tail_work=tail_work,
+                tasks=tuple(staged),
+                bucket=bucket,
+                enqueue_ts=time.monotonic(),
+                seq=first_seq,
+                nbytes=comm_nbytes,
+            ))
+            self._pending_bytes += comm_nbytes
+            if self._comm_debug:
+                logger.info(
+                    "[eco] enqueued DP all-reduce bucket: step=%s seq=%s..%s params=%s payload_mb=%.1f pending=%s pending_mb=%.1f max_pending=%s",
+                    self._current_step,
+                    first_seq,
+                    last_seq,
+                    len(staged),
+                    comm_nbytes / (1024 * 1024),
+                    len(self._pending_queue),
+                    self._pending_bytes / (1024 * 1024),
+                    effective_max_pending,
+                )
+
+            self._staged_tasks = []
+            self._staged_bytes = 0
+            self._staged_dtype = None
+            self._staged_device = None
+
+    def _stage_async_task(
+        self,
+        grad: torch.Tensor,
+        moe: nn.Module,
+        param_name: str,
+        state: dict,
+        beta1_eff: float,
+        beta2_eff: float,
+        is_accumulating: bool,
+    ) -> None:
+        """Stage one async DP all-reduce task and flush when bucket is full."""
+        if grad.numel() == 0:
+            return
+        task_nbytes = int(grad.numel() * grad.element_size())
+        task = PendingGradTask(
+            grad=grad,
+            moe=moe,
+            param_name=param_name,
+            state=state,
+            beta1_eff=beta1_eff,
+            beta2_eff=beta2_eff,
+            is_accumulating=is_accumulating,
+            seq=self._allreduce_seq,
+            nbytes=task_nbytes,
+        )
+        self._allreduce_seq += 1
+
+        if self._staged_tasks:
+            if self._staged_dtype != grad.dtype or self._staged_device != grad.device:
+                self._flush_staged_async_bucket(force=True)
+            elif self._staged_bytes + task_nbytes > self._allreduce_bucket_bytes:
+                self._flush_staged_async_bucket(force=True)
+
+        if not self._staged_tasks:
+            self._staged_dtype = grad.dtype
+            self._staged_device = grad.device
+
+        self._staged_tasks.append(task)
+        self._staged_bytes += task_nbytes
+        if self._staged_bytes >= self._allreduce_bucket_bytes:
+            self._flush_staged_async_bucket(force=True)
+
     def _drain_one(self) -> None:
         """Wait for the oldest pending async all-reduce and run its optimizer step.
 
@@ -956,16 +1117,19 @@ class FusedBackwardECO:
 
         with _nvtx("eco/drain_one"):
             pending = self._pending_queue.popleft()
+            task_count = len(pending.tasks)
+            first_param = pending.tasks[0].param_name if task_count > 0 else "none"
             wait_t0 = time.monotonic()
             with _nvtx("eco/drain_one_wait_allreduce"):
                 tail = pending.tail_work
                 if tail is not None and not tail.is_completed():
                     if _ECO_WAIT_DEBUG:
                         logger.warning(
-                            "[eco] waiting on DP all-reduce: step=%s seq=%s param=%s pending=%s pending_mb=%.1f",
+                            "[eco] waiting on DP all-reduce: step=%s seq=%s param=%s params=%s pending=%s pending_mb=%.1f",
                             self._current_step,
                             pending.seq,
-                            pending.param_name,
+                            first_param,
+                            task_count,
                             len(self._pending_queue),
                             self._pending_bytes / (1024 * 1024),
                         )
@@ -974,49 +1138,52 @@ class FusedBackwardECO:
             self._pending_bytes = max(0, self._pending_bytes - pending.nbytes)
             if wait_s > self._stall_warn_s:
                 logger.warning(
-                    "[eco] DP all-reduce wait stall: step=%s seq=%s param=%s wait_s=%.2f pending=%s pending_mb=%.1f",
+                    "[eco] DP all-reduce wait stall: step=%s seq=%s param=%s params=%s wait_s=%.2f pending=%s pending_mb=%.1f",
                     self._current_step,
                     pending.seq,
-                    pending.param_name,
+                    first_param,
+                    task_count,
                     wait_s,
                     len(self._pending_queue),
                     self._pending_bytes / (1024 * 1024),
                 )
 
-            grad = pending.grad
-            if self._dp_size > 1:
-                # _launch_dp_allreduce uses SUM for backend stability; normalize once after completion.
-                grad.mul_(1.0 / float(self._dp_size))
+            for task in pending.tasks:
+                grad = task.grad
+                if self._dp_size > 1:
+                    # _launch_dp_allreduce uses SUM for backend stability; normalize once after completion.
+                    grad.mul_(1.0 / float(self._dp_size))
 
-            # Gradient clipping using previous step's global norm estimate.
-            # Apply on every micro-step before writing FP8 optimizer state.
-            if self.grad_clip > 0:
-                with _nvtx("eco/drain_one_grad_clip"):
-                    if grad.dtype == torch.float32:
-                        grad_flat = grad.reshape(-1)
-                        grad_norm_sq = torch.dot(grad_flat, grad_flat)
-                    else:
-                        grad_norm = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float32)
-                        grad_norm_sq = grad_norm * grad_norm
-                    self._accumulate_norm_and_clip(grad, grad_norm_sq)
+                # Gradient clipping using previous step's global norm estimate.
+                # Apply on every micro-step before writing FP8 optimizer state.
+                if self.grad_clip > 0:
+                    with _nvtx("eco/drain_one_grad_clip"):
+                        if grad.dtype == torch.float32:
+                            grad_flat = grad.reshape(-1)
+                            grad_norm_sq = torch.dot(grad_flat, grad_flat)
+                        else:
+                            grad_norm = torch.linalg.vector_norm(grad, ord=2, dtype=torch.float32)
+                            grad_norm_sq = grad_norm * grad_norm
+                        self._accumulate_norm_and_clip(grad, grad_norm_sq)
 
-            if pending.is_accumulating:
-                self._cuda_mv_accumulate(
-                    pending.moe, pending.param_name, grad, pending.state,
-                    pending.beta1_eff, pending.beta2_eff,
-                )
-            else:
-                step_state = pending.state.get("step")
-                if torch.is_tensor(step_state):
-                    step_state.fill_(float(self._step_count))
+                if task.is_accumulating:
+                    self._cuda_mv_accumulate(
+                        task.moe, task.param_name, grad, task.state,
+                        task.beta1_eff, task.beta2_eff,
+                    )
                 else:
-                    pending.state["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
-                self._cuda_fused_update(
-                    pending.moe, pending.param_name, grad, pending.state,
-                    beta1_eff=pending.beta1_eff, beta2_eff=pending.beta2_eff,
-                )
+                    step_state = task.state.get("step")
+                    if torch.is_tensor(step_state):
+                        step_state.fill_(float(self._step_count))
+                    else:
+                        task.state["step"] = torch.tensor(float(self._step_count), dtype=torch.float32)
+                    self._cuda_fused_update(
+                        task.moe, task.param_name, grad, task.state,
+                        beta1_eff=task.beta1_eff, beta2_eff=task.beta2_eff,
+                    )
 
-            del pending.grad  # Free FP32 buffer
+                del task.grad  # Free reduced gradient view
+            del pending.bucket
 
     def _drain_completed(self) -> None:
         """Non-blockingly drain all entries whose NCCL ops have already completed.
@@ -1032,12 +1199,14 @@ class FusedBackwardECO:
                 age_s = time.monotonic() - entry.enqueue_ts
                 if age_s > self._stall_warn_s and not entry.stall_reported:
                     entry.stall_reported = True
+                    head_param = entry.tasks[0].param_name if entry.tasks else "none"
                     logger.warning(
-                        "[eco] DP all-reduce no progress: step=%s seq=%s age_s=%.2f param=%s pending=%s pending_mb=%.1f",
+                        "[eco] DP all-reduce no progress: step=%s seq=%s age_s=%.2f param=%s params=%s pending=%s pending_mb=%.1f",
                         self._current_step,
                         entry.seq,
                         age_s,
-                        entry.param_name,
+                        head_param,
+                        len(entry.tasks),
                         len(self._pending_queue),
                         self._pending_bytes / (1024 * 1024),
                     )
@@ -1050,6 +1219,7 @@ class FusedBackwardECO:
         complete before the training step ends.
         """
         with _nvtx("eco/drain_all"):
+            self._flush_staged_async_bucket(force=True)
             while self._pending_queue:
                 self._drain_one()
 
@@ -1121,7 +1291,6 @@ class FusedBackwardECO:
             st = self._get_or_init_state(moe, param_name)
 
             if self._dp_size > 1 and self._dp_group is not None:
-                comm_nbytes = grad_comm.numel() * grad_comm.element_size()
                 use_async_allreduce = (
                     self._allreduce_mode == 'async'
                     and (self._async_accumulation or not self.is_accumulating)
@@ -1135,59 +1304,20 @@ class FusedBackwardECO:
                     # on large DP jobs to avoid early async queue instability.
                     use_async_allreduce = False
                 if use_async_allreduce:
-                    effective_max_pending = self._effective_max_pending_ops(comm_nbytes)
-                    # --- Async path: enqueue all_reduce, defer optimizer step ---
-                    # Opportunistic drain: process any completed ops without blocking.
-                    self._drain_completed()
-                    if comm_nbytes > self._max_pending_bytes:
-                        logger.warning(
-                            "[eco] single all-reduce payload exceeds max pending budget: param=%s payload_mb=%.1f budget_mb=%.1f",
-                            param_name,
-                            comm_nbytes / (1024 * 1024),
-                            self._max_pending_bytes / (1024 * 1024),
-                        )
-
-                    # Back-pressure on queue depth and queued bytes.
-                    while self._pending_queue and (
-                        len(self._pending_queue) >= effective_max_pending
-                        or self._pending_bytes + comm_nbytes > self._max_pending_bytes
-                    ):
-                        self._drain_one()
-
-                    with _nvtx("eco/fused_update_async_allreduce"):
-                        works = self._launch_dp_allreduce(grad_comm, async_op=True)
-                    tail_work = works[-1] if works else None
-                    seq = self._allreduce_seq
-                    self._allreduce_seq += 1
-                    self._pending_queue.append(PendingAllReduce(
-                        works=works,
-                        tail_work=tail_work,
-                        grad=grad_comm,
-                        moe=moe,
-                        param_name=param_name,
-                        state=st,
-                        beta1_eff=beta1_frac,
-                        beta2_eff=beta2_frac,
-                        is_accumulating=self.is_accumulating,
-                        enqueue_ts=time.monotonic(),
-                        seq=seq,
-                        nbytes=comm_nbytes,
-                    ))
-                    self._pending_bytes += comm_nbytes
-                    if self._comm_debug:
-                        logger.info(
-                            "[eco] enqueued DP all-reduce: step=%s seq=%s param=%s payload_mb=%.1f pending=%s pending_mb=%.1f max_pending=%s",
-                            self._current_step,
-                            seq,
-                            param_name,
-                            comm_nbytes / (1024 * 1024),
-                            len(self._pending_queue),
-                            self._pending_bytes / (1024 * 1024),
-                            effective_max_pending,
-                        )
+                    # --- Async DP path: stage gradient into a deterministic bucket ---
+                    self._stage_async_task(
+                        grad_comm,
+                        moe,
+                        param_name,
+                        st,
+                        beta1_frac,
+                        beta2_frac,
+                        self.is_accumulating,
+                    )
                     return  # Optimizer step deferred to _drain_one/_drain_all
 
                 # --- Synchronous DP path: all-reduce inline before optimizer step ---
+                self._flush_staged_async_bucket(force=True)
                 with _nvtx("eco/fused_update_sync_allreduce"):
                     self._launch_dp_allreduce(grad_comm, async_op=False)
                     grad_comm.mul_(1.0 / float(self._dp_size))

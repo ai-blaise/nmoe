@@ -10,6 +10,7 @@ from torch.profiler import record_function
 from nmoe.attention.fa4_import import get_fa4_fwd, get_flashmla_sm100_module
 from nmoe.attention.rope import rotate_pe, rotate_pe_partial
 from nmoe.config import Config
+from nmoe.nan_debug import nan_debug_active as _nan_debug_scope_active
 from nmoe.norm import RMSNorm
 
 
@@ -32,7 +33,7 @@ def _require(cond: bool, msg: str) -> None:
 
 def _nan_debug_active() -> bool:
   # Scoped by train.py to a specific failing step/micro-step.
-  return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_MLA_FINITE_DEBUG", "0")
+  return _MLA_FINITE_DEBUG or _nan_debug_scope_active()
 
 
 def _require_finite(tag: str, tensor: torch.Tensor, *, force: bool = False) -> None:
@@ -85,6 +86,7 @@ _PACKED_ATTN_BACKEND = os.getenv("NMOE_PACKED_ATTN_BACKEND", "flashmla").strip()
 _VALIDATE_PACKED_CU = _env_flag("NMOE_VALIDATE_PACKED_CU_SEQLENS", "0")
 _MLA_WORKSPACE_CACHE_MAX_BYTES = int(os.getenv("NMOE_MLA_WORKSPACE_CACHE_MAX_BYTES", str(512 * 1024 * 1024)))
 _MLA_STREAM_CACHE_LIMIT = max(1, int(os.getenv("NMOE_MLA_STREAM_CACHE_LIMIT", "8")))
+_MLA_FINITE_DEBUG = _env_flag("NMOE_MLA_FINITE_DEBUG", "0")
 
 
 def _load_mla_softmax_scale_mult() -> float:
@@ -451,9 +453,11 @@ def _mla_flashmla_uniform_forward(
   q_ = q.reshape(total, n_heads, d_qk).contiguous()
   k_ = k.reshape(total, n_heads, d_qk).contiguous()
   v_ = v.reshape(total, n_heads, d_v).contiguous()
-  _require_finite("flashmla_uniform.q", q_)
-  _require_finite("flashmla_uniform.k", k_)
-  _require_finite("flashmla_uniform.v", v_)
+  finite_guard = _nan_debug_active()
+  if finite_guard:
+    _require_finite("flashmla_uniform.q", q_, force=True)
+    _require_finite("flashmla_uniform.k", k_, force=True)
+    _require_finite("flashmla_uniform.v", v_, force=True)
 
   cu = _get_uniform_cu(q.device, bsz, seqlen)
   out, _ = flash_attn_varlen_func(
@@ -468,7 +472,8 @@ def _mla_flashmla_uniform_forward(
       softmax_scale=softmax_scale,
       is_varlen=True,
   )
-  _require_finite("flashmla_uniform.out", out)
+  if finite_guard:
+    _require_finite("flashmla_uniform.out", out, force=True)
   return out.reshape(bsz, seqlen, n_heads, d_v)
 
 

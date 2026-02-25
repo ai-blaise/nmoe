@@ -18,6 +18,7 @@ import torch.distributed as dist
 from nmoe.csrc import rdep as _C
 from nmoe.blockscaled.grouped import expert_blockscaled, grouped_mm_blockscaled_bf16
 from nmoe.cuda_errors import cuda_error_context
+from nmoe.nan_debug import nan_debug_active as _nan_debug_scope_active
 
 if TYPE_CHECKING:
   from nmoe.rdep import Rdep
@@ -27,8 +28,11 @@ def _env_flag(name: str, default: str = "0") -> bool:
   return os.getenv(name, default) in ("1", "true", "True")
 
 
+_MOE_FINITE_DEBUG = _env_flag("NMOE_MOE_FINITE_DEBUG", "0")
+
+
 def _nan_debug_active() -> bool:
-  return _env_flag("NMOE_NAN_DEBUG_ACTIVE", "0") or _env_flag("NMOE_MOE_FINITE_DEBUG", "0")
+  return _MOE_FINITE_DEBUG or _nan_debug_scope_active()
 
 
 def _require_finite(tag: str, tensor: torch.Tensor) -> None:
@@ -650,11 +654,8 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         consensus_group = getattr(rdep, "ep_group", None)
         with _nvtx("moe_bs/bwd_layout_reuse_consensus"):
           flag = torch.tensor([1 if candidate_ok else 0], device=device, dtype=torch.int32)
-          flag_min = flag.clone()
-          flag_max = flag.clone()
-          dist.all_reduce(flag_min, op=dist.ReduceOp.MIN, group=consensus_group)
-          dist.all_reduce(flag_max, op=dist.ReduceOp.MAX, group=consensus_group)
-          candidate_ok = bool(int(flag_min.item()) == 1 and int(flag_max.item()) == 1)
+          dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=consensus_group)
+          candidate_ok = bool(int(flag.item()) == 1)
       if candidate_ok:
         saved_dispatch_layout = candidate
         use_saved_layout = True
