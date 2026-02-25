@@ -19,6 +19,7 @@ from nmoe.fused_router import (
     fused_update_bias_from_expert_ids,
 )
 from nmoe.fused_aux_loss import fused_aux_loss
+from nmoe.triton.silu_mul import silu_mul
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -251,9 +252,78 @@ def get_attention(name: str):
   return getattr(import_module(module_path), cls_name)
 
 
+class _AttentionCudaGraphRunner:
+  """Per-layer attention sub-block CUDA graph replay.
+
+  Captures: x + attn(attn_norm(x), cos, sin) for fixed tensor metadata.
+  Falls back to eager execution if capture is unavailable or fails.
+  """
+
+  def __init__(self, attn_norm: nn.Module, attn: nn.Module, warmup_iters: int = 3):
+    self.attn_norm = attn_norm
+    self.attn = attn
+    self.warmup_iters = max(1, int(warmup_iters))
+    self._graphed = None
+    self._signature = None
+    self._disabled = False
+
+  @staticmethod
+  def _sig(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple:
+    return (
+      tuple(x.shape), x.dtype, x.device, bool(x.requires_grad), x.stride(),
+      tuple(cos.shape), cos.dtype, cos.device, cos.stride(),
+      tuple(sin.shape), sin.dtype, sin.device, sin.stride(),
+    )
+
+  def _eager(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return x + self.attn(self.attn_norm(x), cos, sin)
+
+  def _capture(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
+    if not hasattr(torch.cuda, "make_graphed_callables"):
+      raise RuntimeError("torch.cuda.make_graphed_callables is unavailable.")
+    sample_x = x.detach().clone().requires_grad_(x.requires_grad)
+    sample_cos = cos.detach().clone()
+    sample_sin = sin.detach().clone()
+    self._graphed = torch.cuda.make_graphed_callables(
+      self._eager,
+      (sample_x, sample_cos, sample_sin),
+      num_warmup_iters=self.warmup_iters,
+    )
+    self._signature = self._sig(x, cos, sin)
+
+  def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    if self._disabled or not x.is_cuda or not cos.is_cuda or not sin.is_cuda:
+      return self._eager(x, cos, sin)
+
+    sig = self._sig(x, cos, sin)
+    if self._graphed is None or sig != self._signature:
+      try:
+        self._capture(x, cos, sin)
+      except Exception:
+        self._disabled = True
+        self._graphed = None
+        self._signature = None
+        return self._eager(x, cos, sin)
+
+    return self._graphed(x, cos, sin)
+
+  def __call__(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return self.forward(x, cos, sin)
+
+
 class MLP(nn.Module):
-  def __init__(self, dim: int, inter_dim: int):
+  def __init__(
+    self,
+    dim: int,
+    inter_dim: int,
+    *,
+    fuse_gate_up_proj: bool = True,
+    fuse_silu_mul: bool = True,
+  ):
     super().__init__()
+    self.inter_dim = int(inter_dim)
+    self._fuse_gate_up_proj = bool(fuse_gate_up_proj)
+    self._fuse_silu_mul = bool(fuse_silu_mul)
     self.w1 = nn.Linear(dim, inter_dim, bias=False, dtype=torch.bfloat16)
     self.w3 = nn.Linear(dim, inter_dim, bias=False, dtype=torch.bfloat16)
     self.w2 = nn.Linear(inter_dim, dim, bias=False, dtype=torch.bfloat16)
@@ -265,10 +335,18 @@ class MLP(nn.Module):
 
   @record_function("mlp")
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    up = self.w1(x)
-    gate = self.w3(x)
-    hidden = F.silu(up)
-    hidden.mul_(gate)
+    if self._fuse_gate_up_proj:
+      # Single gate+up GEMM (gate_up_proj style), then split.
+      w13 = torch.cat((self.w1.weight, self.w3.weight), dim=0)
+      up, gate = F.linear(x, w13).split(self.inter_dim, dim=-1)
+    else:
+      up = self.w1(x)
+      gate = self.w3(x)
+    if self._fuse_silu_mul:
+      hidden = silu_mul(up, gate)
+    else:
+      hidden = F.silu(up)
+      hidden.mul_(gate)
     return self.w2(hidden)
 
 
@@ -395,7 +473,16 @@ class MoE(nn.Module):
     self._nvfp4_group_size = 16
 
     n_shared = getattr(cfg, 'n_shared_experts', 0)
-    self._shared = MLP(self.dim, n_shared * self.moe_inter_dim) if n_shared else None
+    self._shared = (
+      MLP(
+        self.dim,
+        n_shared * self.moe_inter_dim,
+        fuse_gate_up_proj=bool(getattr(cfg, "fuse_mlp_gate_up_proj", True)),
+        fuse_silu_mul=bool(getattr(cfg, "fuse_mlp_silu_mul", True)),
+      )
+      if n_shared
+      else None
+    )
     self.last_loads = None
     self.last_expert_ids = None
     self.last_aux_loss = None
@@ -683,6 +770,17 @@ class TransformerBlock(nn.Module):
     attn_name = config.attn if is_global else config.attn_local
 
     self.attn = get_attention(attn_name)(config)
+    self._attn_cuda_graph_enabled = bool(getattr(config, "attn_cuda_graphs", False))
+    self._attn_cuda_graph_disable_with_checkpointing = bool(
+      getattr(config, "attn_cuda_graph_disable_with_checkpointing", True)
+    )
+    self._attn_cuda_graph = None
+    if self._attn_cuda_graph_enabled and torch.cuda.is_available():
+      self._attn_cuda_graph = _AttentionCudaGraphRunner(
+        self.attn_norm,
+        self.attn,
+        warmup_iters=int(getattr(config, "attn_cuda_graph_warmup_iters", 3)),
+      )
     if not is_global:
       window = int(getattr(config, "attn_local_window", 0))
       if window <= 0:
@@ -700,7 +798,12 @@ class TransformerBlock(nn.Module):
         "Set checkpoint_moe_ffn=false (attention-only checkpointing)."
       )
     if layer_id < config.n_dense_layers:
-      self.ffn = MLP(dim=config.dim, inter_dim=config.inter_dim)
+      self.ffn = MLP(
+        dim=config.dim,
+        inter_dim=config.inter_dim,
+        fuse_gate_up_proj=bool(getattr(config, "fuse_mlp_gate_up_proj", True)),
+        fuse_silu_mul=bool(getattr(config, "fuse_mlp_silu_mul", True)),
+      )
     else:
       if rdep is None:
         raise ValueError("MoE layers require an Rdep instance")
@@ -738,6 +841,14 @@ class TransformerBlock(nn.Module):
       raise RuntimeError(
         f"{type(self.attn).__name__} does not support packed cu_seqlens inputs."
       )
+    use_attn_cuda_graph = (
+      self._attn_cuda_graph is not None
+      and not pass_cu
+      and (
+        not self._use_gradient_checkpointing
+        or not self._attn_cuda_graph_disable_with_checkpointing
+      )
+    )
 
     if self._use_gradient_checkpointing:
       # Checkpoint both attention and FFN/MoE for memory efficiency
@@ -748,7 +859,15 @@ class TransformerBlock(nn.Module):
       # The checkpoint itself provides memory savings, and the recomputation
       # naturally fuses operations during the backward pass.
       with _nvtx("block/attn"):
-        if pass_cu:
+        if use_attn_cuda_graph:
+          x = torch.utils.checkpoint.checkpoint(
+            self._attn_cuda_graph.forward,
+            x,
+            cos,
+            sin,
+            **self._gradient_checkpointing_kwargs,
+          )
+        elif pass_cu:
           x = x + torch.utils.checkpoint.checkpoint(
             self.attn, self.attn_norm(x), cos, sin, cu_seqlens, **self._gradient_checkpointing_kwargs
           )
@@ -775,7 +894,9 @@ class TransformerBlock(nn.Module):
       # out = layer(x_normed) -> fused with residual
       # x = x + out           -> single fused kernel
       with _nvtx("block/attn"):
-        if pass_cu:
+        if use_attn_cuda_graph:
+          x = self._attn_cuda_graph(x, cos, sin)
+        elif pass_cu:
           normed_x = self.attn_norm(x)
           x = _get_fused_residual_attn_cu()(x, normed_x, self.attn, cos, sin, cu_seqlens)
         else:

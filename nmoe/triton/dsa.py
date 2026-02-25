@@ -46,6 +46,13 @@ def _compute_indexer_scores(
     mask_m = offs_m < M
     mask_n = offs_n < N
 
+    # Skip fully-masked causal blocks (all keys are strictly in the future).
+    if CAUSAL:
+        block_m_end = pid_m * BLOCK_M + (BLOCK_M - 1)
+        block_n_start = pid_n * BLOCK_N
+        if block_n_start > block_m_end:
+            return
+
     # Base pointers for this batch
     Q_base = Q + pid_b * stride_qb
     K_base = K + pid_b * stride_kb
@@ -316,5 +323,4 @@ def _lightning_indexer_fused_small_k(
 
     tl.store(v_ptrs, y_values, mask=mask_m[:, None])
     tl.store(i_ptrs, y_indices, mask=mask_m[:, None])
-
 

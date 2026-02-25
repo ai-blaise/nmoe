@@ -74,6 +74,13 @@ class Config:
   norm_topk_prob: bool = True
   route_scale: float = 1.0
   use_fused_router: bool = True      # Enforce fused router kernel in production training
+  fuse_mlp_gate_up_proj: bool = True # Fuse gate+up projections into one GEMM in MLP/SwiGLU
+  fuse_mlp_silu_mul: bool = True     # Fuse silu(x)*y elementwise into one Triton kernel
+
+  # Attention CUDA Graphs
+  attn_cuda_graphs: bool = False
+  attn_cuda_graph_warmup_iters: int = 3
+  attn_cuda_graph_disable_with_checkpointing: bool = True
 
   # Precision
   dtype: Optional[str] = "bf16"  # bf16 | fp8 | nvfp4
@@ -290,6 +297,11 @@ class Config:
     if int(self.sft_token_cache_size) < 0:
       raise ValueError(
         f"Config error: `sft_token_cache_size` must be >= 0, got {self.sft_token_cache_size}."
+      )
+    if int(self.attn_cuda_graph_warmup_iters) < 1:
+      raise ValueError(
+        "Config error: `attn_cuda_graph_warmup_iters` must be >= 1, "
+        f"got {self.attn_cuda_graph_warmup_iters}."
       )
 
 # =============================================================================
