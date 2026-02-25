@@ -456,18 +456,17 @@ def train(cfg: Config):
   # RDEP IPC phase barriers require deterministic barrier-call ordering across ranks.
   # PyTorch autograd worker-thread scheduling can reorder layer backward launches,
   # which can deadlock distributed dispatch-meta barriers on large MoE graphs.
-  if (
+  force_single_thread_autograd = (
     world > 1
     and str(getattr(cfg, "dtype", "bf16") or "bf16").lower() in {"fp8", "nvfp4"}
     and os.getenv("NMOE_RDEP_AUTOGRAD_SINGLE_THREAD", "1") in ("1", "true", "True")
     and hasattr(torch.autograd, "set_multithreading_enabled")
-  ):
-    torch.autograd.set_multithreading_enabled(False)
-    if rank == 0:
-      logger.info(
-        "Autograd multithreading disabled for deterministic distributed RDEP barrier ordering "
-        "(set NMOE_RDEP_AUTOGRAD_SINGLE_THREAD=0 to override)."
-      )
+  )
+  if force_single_thread_autograd and rank == 0:
+    logger.info(
+      "Autograd multithreading will be disabled only during backward for deterministic "
+      "distributed RDEP barrier ordering (set NMOE_RDEP_AUTOGRAD_SINGLE_THREAD=0 to override)."
+    )
   timers_on = os.getenv('NMOE_TIMERS', '0') not in ('0', 'false', 'False')
   time_ctx = cuda_time if timers_on else (lambda _tag: nullcontext())
   nvtx_on = os.getenv('NMOE_NVTX', '0') in ('1', 'true', 'True')
@@ -1079,11 +1078,16 @@ def train(cfg: Config):
               flush=True,
             )
           with nvtx_ctx('train/bwd_total'), time_ctx('time_ms/bwd_total'):
-            if nan_trace_scope:
-              with torch.autograd.detect_anomaly(check_nan=True):
+            autograd_mt_ctx = (
+              torch.autograd.set_multithreading_enabled(False)
+              if force_single_thread_autograd else nullcontext()
+            )
+            with autograd_mt_ctx:
+              if nan_trace_scope:
+                with torch.autograd.detect_anomaly(check_nan=True):
+                  loss.backward()
+              else:
                 loss.backward()
-            else:
-              loss.backward()
           if nan_debug_scope:
             _micro_grad_params = [p for p in grad_norm_params if p.grad is not None]
             micro_grad_norm = (

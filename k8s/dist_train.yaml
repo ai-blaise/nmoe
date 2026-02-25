@@ -74,10 +74,42 @@ spec:
               value: "expandable_segments:True"
             - name: NCCL_DEBUG
               value: "WARN"
+            - name: NCCL_NET
+              value: "Socket"
             - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_P2P_DISABLE
               value: "0"
+            - name: NCCL_P2P_LEVEL
+              value: "NVL"
             - name: NCCL_NET_GDR_LEVEL
-              value: "5"
+              value: "0"
+            - name: NCCL_NVLS_ENABLE
+              value: "0"
+            - name: NCCL_SOCKET_IFNAME
+              value: "eth0"
+            - name: GLOO_SOCKET_IFNAME
+              value: "eth0"
+            - name: NCCL_SOCKET_NTHREADS
+              value: "4"
+            - name: NCCL_NSOCKS_PERTHREAD
+              value: "4"
+            - name: NCCL_BUFFSIZE
+              value: "16777216"
+            - name: NCCL_MIN_NCHANNELS
+              value: "4"
+            - name: NCCL_MAX_NCHANNELS
+              value: "8"
+            - name: NCCL_ALGO
+              value: "Tree,Ring"
+            - name: NCCL_PROTO
+              value: "Simple,LL128,LL"
+            - name: NCCL_CROSS_NIC
+              value: "0"
+            - name: TORCH_NCCL_BLOCKING_WAIT
+              value: "0"
+            - name: NMOE_ZERO2_RS_CHUNK_MB
+              value: "512"
           securityContext:
             capabilities:
               add:

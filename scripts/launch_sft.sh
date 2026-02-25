@@ -50,7 +50,24 @@ if [[ "${1:-}" == "--local" ]]; then
     source "${VENV}/bin/activate"
     cd "${NMOE_ROOT}"
 
+    export NCCL_NET=Socket
+    export NCCL_IB_DISABLE=1
+    export NCCL_P2P_DISABLE=0
     export NCCL_P2P_LEVEL=NVL
+    export NCCL_NET_GDR_LEVEL=0
+    export NCCL_NVLS_ENABLE=0
+    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+    export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
+    export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-4}"
+    export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-4}"
+    export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-16777216}"
+    export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-4}"
+    export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
+    export NCCL_ALGO="${NCCL_ALGO:-Tree,Ring}"
+    export NCCL_PROTO="${NCCL_PROTO:-Simple,LL128,LL}"
+    export NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-0}"
+    export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
+    export NMOE_ZERO2_RS_CHUNK_MB="${NMOE_ZERO2_RS_CHUNK_MB:-512}"
     export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
     exec torchrun \
@@ -84,41 +101,37 @@ echo "[launch] Node rank: ${SLURM_NODEID}  Node name: $(hostname)"
 # NCCL configuration
 # ============================================================================
 
-# Intra-node: NVSwitch (NV18 all-to-all on B200 DGX/HGX)
-export NCCL_P2P_LEVEL=NVL
-
-# Inter-node: auto-detect best transport (IB/RoCE/TCP)
-# These are safe defaults; override per-cluster as needed.
-# For InfiniBand clusters:
-#   export NCCL_IB_DISABLE=0
-#   export NCCL_IB_HCA=mlx5  # or specific HCA
-#   export NCCL_NET_GDR_LEVEL=5  # GPU Direct RDMA
-# For RoCE/Ethernet clusters:
-#   export NCCL_IB_DISABLE=1
-#   export NCCL_SOCKET_IFNAME=eth0
-
-# Auto-detect: let NCCL probe available transports
-export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
-
-# Socket interface for OOB communication (fallback / bootstrap)
-# Common: eth0, ens5, ib0 — override via NCCL_SOCKET_IFNAME env var
-if [[ -z "${NCCL_SOCKET_IFNAME:-}" ]]; then
-    # Auto-detect: pick the first UP interface that isn't loopback or docker
-    NCCL_SOCKET_IFNAME=$(ip -o link show up | awk -F': ' '{print $2}' \
-        | grep -v -E '^(lo|docker|veth|br-)' | head -n 1)
-    export NCCL_SOCKET_IFNAME
-fi
+# TCP-only cluster defaults (single 200 Gbps gVNIC; no RDMA, no GPUDirect).
+export NCCL_NET="${NCCL_NET:-Socket}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}"
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
+export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-0}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME}}"
+export NCCL_SOCKET_NTHREADS="${NCCL_SOCKET_NTHREADS:-4}"
+export NCCL_NSOCKS_PERTHREAD="${NCCL_NSOCKS_PERTHREAD:-4}"
+export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-16777216}"
+export NCCL_MIN_NCHANNELS="${NCCL_MIN_NCHANNELS:-4}"
+export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
+export NCCL_ALGO="${NCCL_ALGO:-Tree,Ring}"
+export NCCL_PROTO="${NCCL_PROTO:-Simple,LL128,LL}"
+export NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-0}"
+export NMOE_ZERO2_RS_CHUNK_MB="${NMOE_ZERO2_RS_CHUNK_MB:-512}"
 
 # Debug level (INFO for first run, WARN for production)
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
-export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET}"
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,ENV}"
 
 # Timeout for large-model init (default 30min may not be enough for 345B load)
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-1800}"
-export TORCH_NCCL_BLOCKING_WAIT=1
+export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
 
 echo "[launch] NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
 echo "[launch] NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
+echo "[launch] NCCL_SOCKET_NTHREADS=${NCCL_SOCKET_NTHREADS}"
+echo "[launch] NCCL_NSOCKS_PERTHREAD=${NCCL_NSOCKS_PERTHREAD}"
 echo "[launch] NCCL_DEBUG=${NCCL_DEBUG}"
 
 # ============================================================================

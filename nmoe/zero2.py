@@ -183,8 +183,11 @@ def _rs_chunk_elems(*, dtype: torch.dtype, world: int, shard_size: int) -> tuple
   if shard_size <= 0:
     raise RuntimeError(f"ZeRO-2: invalid shard_size={shard_size}")
 
-  # Default: 2 GiB per dtype/group. Net win vs allocating padded_total for flat_grad.
-  chunk_mb = int(os.getenv("NMOE_ZERO2_RS_CHUNK_MB", "2048"))
+  # Default: smaller chunks for latency-heavy TCP collectives.
+  # 512 MB total RS input per chunk ~= 32 MB/rank shard at world=16 (bf16),
+  # which balances launch overhead vs. long NCCL stream stalls on Ethernet.
+  default_chunk_mb = "512" if world >= 8 else "1024"
+  chunk_mb = int(os.getenv("NMOE_ZERO2_RS_CHUNK_MB", default_chunk_mb))
   if chunk_mb <= 0:
     raise RuntimeError(f"NMOE_ZERO2_RS_CHUNK_MB must be > 0 (got {chunk_mb})")
   bytes_per_elem = torch.empty((), dtype=dtype).element_size()

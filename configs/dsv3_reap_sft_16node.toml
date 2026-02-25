@@ -106,16 +106,16 @@ eco_max_pending_allreduce_mb = 2048    # Allow multiple in-flight expert payload
 eco_max_pending_allreduce_ops = 0      # Auto-size queue depth from payload size + byte budget
 eco_comm_stall_warn_s = 15.0
 eco_comm_debug = false
-gradient_checkpointing = false   # B200 memory headroom at seq_len=1024; avoids checkpoint replay overhead/instability
+gradient_checkpointing = true    # Enable higher compute density (larger micro-batch) without OOM at seq_len=1024
 
 # =============================================================================
 # Training
 # =============================================================================
 steps = 10000
 dtype = "nvfp4"
-batch_size = 64                   # Global batch size — reduced from 128 to prevent OOM on B200 GPUs
-seq_len = 1024                   # Reduced from 2048 to further reduce activation memory (OOM fix)
-gradient_accumulation_steps = 4  # 64 global / 16 DP / 4 accum = 1 micro-batch per GPU
+batch_size = 128                  # Increase per-step compute to improve compute:comm ratio on DP-over-TCP runs
+seq_len = 1024                    # Keep sequence length conservative while raising global batch
+gradient_accumulation_steps = 4   # 128 global / 16 DP / 4 accum = 2 micro-batches per GPU
 resume = true
 resume_step = 0                  # Force clean import checkpoint (iter_0000000); avoid unstable latest local step drift
 grad_clip = 1.0
@@ -139,7 +139,7 @@ sft_packing_enabled = false      # Disabled for debugging - test basic SFT first
 
 # RDEP capacity override (worst-case token-expert dispatch slots per GPU)
 # Set to 0 to use auto-computed capacity: micro_batch * seq_len * K * ep_size
-# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 64 / (16 * 4) = 1
-# T per forward = micro_batch * seq_len = 1 * 1024 = 1,024
-# Auto-compute: 1024 * 8 * 8 = 65,536
+# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 128 / (16 * 4) = 2
+# T per forward = micro_batch * seq_len = 2 * 1024 = 2,048
+# Auto-compute: 2,048 * 8 * 8 = 131,072
 rdep_capacity = 0

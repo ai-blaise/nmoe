@@ -33,8 +33,10 @@ _NVTX_ENABLED = (
 )
 _VALIDATE_CU_SEQLENS = _env_flag("NMOE_VALIDATE_CU_SEQLENS", "0")
 _ROUTER_LOADS_EP_ALLREDUCE = _env_flag("NMOE_ROUTER_LOADS_EP_ALLREDUCE", "0")
-_COMPILE_RESIDUAL_ATTN = _env_flag("NMOE_COMPILE_RESIDUAL_ATTN", "1")
-_COMPILE_RESIDUAL_FFN = _env_flag("NMOE_COMPILE_RESIDUAL_FFN", "1")
+# Default-off: these wrappers frequently graph-break around opaque CUDA ops
+# and can add compile/runtime overhead without real fusion wins.
+_COMPILE_RESIDUAL_ATTN = _env_flag("NMOE_COMPILE_RESIDUAL_ATTN", "0")
+_COMPILE_RESIDUAL_FFN = _env_flag("NMOE_COMPILE_RESIDUAL_FFN", "0")
 _NULL_NVTX_CTX = nullcontext()
 
 
@@ -263,7 +265,11 @@ class MLP(nn.Module):
 
   @record_function("mlp")
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    up = self.w1(x)
+    gate = self.w3(x)
+    hidden = F.silu(up)
+    hidden.mul_(gate)
+    return self.w2(hidden)
 
 
 class Router(nn.Module):

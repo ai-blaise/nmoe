@@ -97,11 +97,13 @@ eco_fused_backward = true        # Fuse optimizer into backward — CUDA kernel 
 eco_require_cuda = true          # Hard-fail if ECO CUDA bindings are missing (no Python fallback)
 eco_factored_v = true            # Adafactor-style factored v (saves 38 GiB/GPU vs full FP8 v)
 eco_allreduce_mode = "async"     # Async overlap with bounded in-flight queue for 16-node TCP stability
+eco_async_accumulation = true    # Keep all accumulation micro-steps on async DP all-reduce path
+eco_sync_bootstrap_steps = 0     # Disable forced sync bootstrap; avoid step-0 backward stall on 16-node TCP
 eco_allreduce_dtype = "bf16"     # Socket-mode speed path: halve DP all-reduce wire bytes vs FP32
-eco_allreduce_chunk_mb = 16      # Keep chunks modest on MTU-1460 gVNIC to reduce long-tail stalls
-eco_allreduce_chunk_threshold_mb = 32  # Skip chunking for very small payloads; chunk only large collectives
-eco_max_pending_allreduce_mb = 1024
-eco_max_pending_allreduce_ops = 1
+eco_allreduce_chunk_mb = 64      # Reduce collective launch count for large expert gradient payloads
+eco_allreduce_chunk_threshold_mb = 64  # Single all-reduce below 64MB; chunk only large payloads
+eco_max_pending_allreduce_mb = 2048    # Allow multiple in-flight expert payloads for comm/compute overlap
+eco_max_pending_allreduce_ops = 0      # Auto-size queue depth from payload size + byte budget
 eco_comm_stall_warn_s = 15.0
 eco_comm_debug = false
 gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a time
@@ -111,9 +113,9 @@ gradient_checkpointing = true    # Required: keeps 1 layer BF16 scratch at a tim
 # =============================================================================
 steps = 10000
 dtype = "nvfp4"
-batch_size = 64                   # Global batch size — reduced from 128 to prevent OOM on B200 GPUs
-seq_len = 1024                   # Reduced from 2048 to further reduce activation memory (OOM fix)
-gradient_accumulation_steps = 4  # 64 global / 16 DP / 4 accum = 1 micro-batch per GPU
+batch_size = 128                  # Increase per-step compute to improve compute:comm ratio on DP-over-TCP runs
+seq_len = 1024                    # Keep sequence length conservative while raising global batch
+gradient_accumulation_steps = 4   # 128 global / 16 DP / 4 accum = 2 micro-batches per GPU
 resume = false
 resume_step = 0                  # Force clean import checkpoint (iter_0000000); avoid unstable latest local step drift
 grad_clip = 1.0
@@ -137,7 +139,7 @@ sft_packing_enabled = false      # Disabled for debugging - test basic SFT first
 
 # RDEP capacity override (worst-case token-expert dispatch slots per GPU)
 # Set to 0 to use auto-computed capacity: micro_batch * seq_len * K * ep_size
-# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 64 / (16 * 4) = 1
-# T per forward = micro_batch * seq_len = 1 * 1024 = 1,024
-# Auto-compute: 1024 * 8 * 8 = 65,536
+# micro_batch = batch_size / (dp_size * gradient_accumulation_steps) = 128 / (16 * 4) = 2
+# T per forward = micro_batch * seq_len = 2 * 1024 = 2,048
+# Auto-compute: 2,048 * 8 * 8 = 131,072
 rdep_capacity = 0

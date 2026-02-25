@@ -277,6 +277,16 @@ class FusedBackwardECO:
         max_pending_ops = int(getattr(cfg, 'eco_max_pending_allreduce_ops', 0))
         if max_pending_ops < 0:
             raise ValueError(f"eco_max_pending_allreduce_ops must be >= 0, got {max_pending_ops}")
+        if self._allreduce_mode == 'async' and max_pending_ops == 1:
+            logger.warning(
+                "eco_max_pending_allreduce_ops=1 serializes async DP all-reduce progress; "
+                "use 0 (auto) or >=2 for overlap."
+            )
+        if chunk_mb > 0 and chunk_mb < 32:
+            logger.warning(
+                "eco_allreduce_chunk_mb=%d is very small for large expert gradients and may add launch overhead.",
+                chunk_mb,
+            )
         self._stall_warn_s = float(getattr(cfg, 'eco_comm_stall_warn_s', 30.0))
         if self._stall_warn_s <= 0:
             raise ValueError(f"eco_comm_stall_warn_s must be > 0, got {self._stall_warn_s}")
