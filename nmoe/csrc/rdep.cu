@@ -531,6 +531,13 @@ __host__ __forceinline__ bool complete_device_int_read_blocking(
     if (q == cudaErrorNotReady) {
         const int timeout_ms = rdep_counter_wait_timeout_ms();
         const auto t0 = std::chrono::steady_clock::now();
+        int spin_rounds = 0;
+        // Keep counter handoff latency low on the hot dispatch path:
+        // 1) short spin/yield while the event is expected imminently
+        // 2) micro-sleeps with bounded backoff to avoid burning a full CPU core
+        int sleep_us = 20;
+        constexpr int kSpinYieldRounds = 128;
+        constexpr int kSleepUsCap = 200;
         while (q == cudaErrorNotReady) {
             if (timeout_ms > 0) {
                 const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -548,7 +555,15 @@ __host__ __forceinline__ bool complete_device_int_read_blocking(
                     return false;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (spin_rounds < kSpinYieldRounds) {
+                ++spin_rounds;
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+                if (sleep_us < kSleepUsCap) {
+                    sleep_us = std::min(kSleepUsCap, sleep_us + 20);
+                }
+            }
             q = cudaEventQuery(st->ready);
         }
         if (q != cudaSuccess) {

@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 from nmoe.csrc import rdep as _C
-from nmoe.blockscaled.grouped import expert_blockscaled
+from nmoe.blockscaled.grouped import expert_blockscaled, grouped_mm_blockscaled_bf16
 from nmoe.cuda_errors import cuda_error_context
 
 if TYPE_CHECKING:
@@ -934,17 +934,17 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         W1 = dequant_nvfp4_to_bf16_transient(
           moe_ref._W1_packed, moe_ref._W1_scale, moe_ref._W1_gs, gs, transpose=True)
         _require_finite("backward.W1_dequant", W1)
-        H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
+        H1 = grouped_mm_blockscaled_bf16(Xe_pad, W1, offs_pad, profile=rdep_profile)
         _require_finite("backward.H1", H1)
 
         W3 = dequant_nvfp4_to_bf16_transient(
           moe_ref._W3_packed, moe_ref._W3_scale, moe_ref._W3_gs, gs, transpose=True)
         _require_finite("backward.W3_dequant", W3)
-        H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+        H3 = grouped_mm_blockscaled_bf16(Xe_pad, W3, offs_pad, profile=rdep_profile)
         _require_finite("backward.H3", H3)
       else:
-        H1 = torch._grouped_mm(Xe_pad, W1, offs=offs_pad)
-        H3 = torch._grouped_mm(Xe_pad, W3, offs=offs_pad)
+        H1 = grouped_mm_blockscaled_bf16(Xe_pad, W1, offs_pad, profile=rdep_profile)
+        H3 = grouped_mm_blockscaled_bf16(Xe_pad, W3, offs_pad, profile=rdep_profile)
         _require_finite("backward.H1", H1)
         _require_finite("backward.H3", H3)
 
@@ -955,12 +955,17 @@ class _MoEBlockscaledFused(torch.autograd.Function):
           moe_ref._W2_packed, moe_ref._W2_scale, moe_ref._W2_gs, gs, transpose=False)
         _require_finite("backward.W2_dequant_t", W2_t)
         Dff = int(W2_t.size(2))
-        dA = torch._grouped_mm(dYe_pad, W2_t, offs=offs_pad)
+        dA = grouped_mm_blockscaled_bf16(dYe_pad, W2_t, offs_pad, profile=rdep_profile)
         _require_finite("backward.dA", dA)
         del W2_t
       else:
         Dff = int(W2.size(1))
-        dA = torch._grouped_mm(dYe_pad, W2.transpose(1, 2), offs=offs_pad)
+        dA = grouped_mm_blockscaled_bf16(
+          dYe_pad,
+          W2.transpose(1, 2),
+          offs_pad,
+          profile=rdep_profile,
+        )
         _require_finite("backward.dA", dA)
 
       A = torch.empty_like(H1)
@@ -1040,7 +1045,12 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         del dW2  # Free ~448 MiB
 
         # Phase B: dX from W1.T using already-dequantized W1.
-        dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
+        dX_pad = grouped_mm_blockscaled_bf16(
+          dH1,
+          W1.transpose(1, 2),
+          offs_pad,
+          profile=rdep_profile,
+        )
         _require_finite("backward.dX_pad.part1", dX_pad)
         del W1
 
@@ -1072,7 +1082,14 @@ class _MoEBlockscaledFused(torch.autograd.Function):
         # Phase E: dX += W3.T contribution before fused_update modifies buffers.
         # Reuse already-dequantized W3.
         # Xe_pad freed above; now we have room for grouped_mm temp (~1.23 GiB).
-        dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+        dX_pad.add_(
+          grouped_mm_blockscaled_bf16(
+            dH3,
+            W3.transpose(1, 2),
+            offs_pad,
+            profile=rdep_profile,
+          )
+        )
         _require_finite("backward.dX_pad.part2", dX_pad)
         del W3, dH3
 
@@ -1117,8 +1134,20 @@ class _MoEBlockscaledFused(torch.autograd.Function):
           stream,
         )
 
-        dX_pad = torch._grouped_mm(dH1, W1.transpose(1, 2), offs=offs_pad)
-        dX_pad.add_(torch._grouped_mm(dH3, W3.transpose(1, 2), offs=offs_pad))
+        dX_pad = grouped_mm_blockscaled_bf16(
+          dH1,
+          W1.transpose(1, 2),
+          offs_pad,
+          profile=rdep_profile,
+        )
+        dX_pad.add_(
+          grouped_mm_blockscaled_bf16(
+            dH3,
+            W3.transpose(1, 2),
+            offs_pad,
+            profile=rdep_profile,
+          )
+        )
         _require_finite("backward.dX_pad", dX_pad)
         del W1, W3, A, dH1, dH3, Xe_pad, dYe_pad
 

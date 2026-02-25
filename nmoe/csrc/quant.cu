@@ -2170,7 +2170,8 @@ __global__ void k_build_grouped_gemm_metadata(
     int64_t A_base,  int64_t A_row_bytes,                   // A_pad base ptr and byte stride per row
     int64_t B_base,  int64_t B_expert_bytes,                // B stacked: B[e] = B_base + e*B_expert_bytes
     int64_t C_base,  int64_t C_row_bytes,                   // C_pad base ptr and byte stride per row
-    int64_t SFA_base, int64_t SFA_row_bytes,                // SFA packed: SFA row byte stride (SFA_ptr = base + offs[e]*SFA_row_bytes)
+    int64_t SFA_base, int64_t SFA_row_bytes,                // SFA packed-by-offs: SFA_ptr = base + offs[e]*SFA_row_bytes
+    int64_t SFA_expert_bytes,                               // SFA expert-major: SFA_ptr = base + e*SFA_expert_bytes (0 => packed-by-offs mode)
     int64_t SFB_base, int64_t SFB_expert_bytes,             // SFB stacked: SFB[e] = SFB_base + e*SFB_expert_bytes
     // Tensor metadata - ELEMENT strides for CUTLASS
     int32_t A_stride0_elem, int32_t A_stride1_elem,         // A element strides
@@ -2212,9 +2213,13 @@ __global__ void k_build_grouped_gemm_metadata(
     ptrs_abc[e * 3 + 2] = C_base + static_cast<int64_t>(start) * C_row_bytes;
 
     // ptrs_sfasfb[e] = (SFA_ptr, SFB_ptr)
-    // Activation SFA is stored packed by padded row: [M_pad, sf_k_pad] (MMA swizzled).
-    // offs[] is 128-aligned, so each expert's slice is a contiguous swizzled chunk.
-    ptrs_sfasfb[e * 2 + 0] = SFA_base + static_cast<int64_t>(start) * SFA_row_bytes;
+    // Two SFA layouts are supported:
+    //  - packed-by-offs: pointer advances by row stride using offs[e]
+    //  - expert-major fixed stride: pointer advances by expert index
+    //    (used by backward grouped-mm helpers with quant_*_sf_strided_mma output)
+    ptrs_sfasfb[e * 2 + 0] = (SFA_expert_bytes > 0)
+        ? (SFA_base + static_cast<int64_t>(e) * SFA_expert_bytes)
+        : (SFA_base + static_cast<int64_t>(start) * SFA_row_bytes);
     ptrs_sfasfb[e * 2 + 1] = SFB_base + static_cast<int64_t>(e) * SFB_expert_bytes;
 }
 
@@ -2224,7 +2229,8 @@ inline cudaError_t launch_build_grouped_gemm_metadata(
     int64_t A_base, int64_t A_row_bytes,
     int64_t B_base, int64_t B_expert_bytes,
     int64_t C_base, int64_t C_row_bytes,
-    int64_t SFA_base, int64_t SFA_row_bytes,     // SFA uses padded-row indexing
+    int64_t SFA_base, int64_t SFA_row_bytes,     // packed-by-offs mode
+    int64_t SFA_expert_bytes,                    // expert-major mode (0 => packed-by-offs)
     int64_t SFB_base, int64_t SFB_expert_bytes,
     // Element strides for CUTLASS
     int32_t A_stride0_elem, int32_t A_stride1_elem,
@@ -2242,6 +2248,7 @@ inline cudaError_t launch_build_grouped_gemm_metadata(
         B_base, B_expert_bytes,
         C_base, C_row_bytes,
         SFA_base, SFA_row_bytes,
+        SFA_expert_bytes,
         SFB_base, SFB_expert_bytes,
         A_stride0_elem, A_stride1_elem,
         B_stride0_elem, B_stride1_elem,
@@ -3085,6 +3092,7 @@ cudaError_t build_grouped_gemm_metadata(
     int64_t B_base, int64_t B_expert_bytes,
     int64_t C_base, int64_t C_row_bytes,
     int64_t SFA_base, int64_t SFA_row_bytes,
+    int64_t SFA_expert_bytes,
     int64_t SFB_base, int64_t SFB_expert_bytes,
     // Element strides for CUTLASS
     int32_t A_stride0_elem, int32_t A_stride1_elem,
@@ -3101,6 +3109,7 @@ cudaError_t build_grouped_gemm_metadata(
         B_base, B_expert_bytes,
         C_base, C_row_bytes,
         SFA_base, SFA_row_bytes,
+        SFA_expert_bytes,
         SFB_base, SFB_expert_bytes,
         A_stride0_elem, A_stride1_elem,
         B_stride0_elem, B_stride1_elem,

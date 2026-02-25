@@ -953,7 +953,8 @@ class Transformer(nn.Module):
 
   @record_function("transformer")
   def forward(self, tokens: torch.Tensor,
-              cu_seqlens: list[torch.Tensor] | None = None) -> torch.Tensor:
+              cu_seqlens: list[torch.Tensor] | None = None,
+              return_hidden: bool = False) -> torch.Tensor:
     """Forward pass through the full transformer.
 
     Args:
@@ -961,6 +962,8 @@ class Transformer(nn.Module):
       cu_seqlens: Optional list of B int32 tensors for packed sequence attention.
                   When provided, attention layers use document-isolated causal masking
                   so tokens from different packed documents cannot attend to each other.
+      return_hidden: When True, return post-norm hidden states [B, S, D] and
+                     skip lm_head projection (training fused projected-CE path).
     """
     with record_function("embedding"), _nvtx("model/embed"):
       x = self.embedding(tokens) * self.mup_scale_factor
@@ -1049,6 +1052,8 @@ class Transformer(nn.Module):
               m.last_loads = l
     with record_function("norm_f"), _nvtx("model/norm_f"):
       x = self.norm(x)
+    if return_hidden:
+      return x
     # Dynamic amax scaling handles range - no clamp needed (TorchTitan/Megatron pattern)
     with record_function("lm_head"), _nvtx("model/lm_head"):
       logits = self.lm_head(x) * self.logits_scale_factor

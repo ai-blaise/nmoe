@@ -32,7 +32,7 @@ from nmoe.experiments import ExperimentTracker
 from nmoe import runtime
 from nmoe.eval.hooks import maybe_schedule_eval
 from nmoe.fused_grad_clip import fused_clip_grad_norm_, fused_grad_norm_
-from nmoe.fused_ce_loss import simple_fused_masked_ce_loss
+from nmoe.fused_ce_loss import simple_fused_masked_ce_loss, chunked_projected_masked_ce_loss
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +42,13 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 def _env_flag(name: str, default: str = "0") -> bool:
   return os.getenv(name, default) in ("1", "true", "True")
+
+
+_USE_CHUNKED_PROJECTED_CE = _env_flag("NMOE_USE_CHUNKED_PROJECTED_CE", "1")
+_CHUNKED_PROJECTED_CE_CHUNK = max(
+  512,
+  int(os.getenv("NMOE_CHUNKED_PROJECTED_CE_CHUNK", "4096")),
+)
 
 
 def _iter_tensors(x):
@@ -879,8 +886,13 @@ def train(cfg: Config):
             )
 
           with nvtx_ctx('train/fwd_total'), time_ctx('time_ms/fwd_total'):
+            logits = None
+            hidden = None
             try:
-              logits = model(inputs, cu_seqlens=cu_seqlens)
+              if _USE_CHUNKED_PROJECTED_CE:
+                hidden = model(inputs, cu_seqlens=cu_seqlens, return_hidden=True)
+              else:
+                logits = model(inputs, cu_seqlens=cu_seqlens)
             except RuntimeError as e:
               if nan_debug_scope:
                 raise RuntimeError(
@@ -891,23 +903,25 @@ def train(cfg: Config):
             print(f"[HB] step={step_num} micro={micro_step} stage=fwd_done", flush=True)
 
           if nan_debug_scope:
-            numel, finite, nan, inf = _tensor_finite_stats(logits)
+            dbg_tensor = hidden if _USE_CHUNKED_PROJECTED_CE else logits
+            dbg_name = "hidden" if _USE_CHUNKED_PROJECTED_CE else "logits"
+            numel, finite, nan, inf = _tensor_finite_stats(dbg_tensor)
             if finite == numel and numel > 0:
-              logits_f = logits.float()
-              lmin = float(logits_f.amin().item())
-              lmax = float(logits_f.amax().item())
+              dbg_f = dbg_tensor.float()
+              lmin = float(dbg_f.amin().item())
+              lmax = float(dbg_f.amax().item())
             else:
               lmin = float("nan")
               lmax = float("nan")
             print(
               f"[NANDBG][rank={rank}] step={step_num} micro={micro_step} "
-              f"logits shape={tuple(logits.shape)} dtype={logits.dtype} "
+              f"{dbg_name} shape={tuple(dbg_tensor.shape)} dtype={dbg_tensor.dtype} "
               f"finite={finite}/{numel} nan={nan} inf={inf} min={lmin:.6g} max={lmax:.6g}",
               flush=True,
             )
             if nan > 0 or inf > 0:
               raise RuntimeError(
-                f"[NANDBG][rank={rank}] non-finite logits at step={step_num}, micro={micro_step}"
+                f"[NANDBG][rank={rank}] non-finite {dbg_name} at step={step_num}, micro={micro_step}"
               )
 
           # Fail-fast on token drops (indicates expert load collapse)
@@ -929,17 +943,32 @@ def train(cfg: Config):
               )
 
           with nvtx_ctx('train/loss'), time_ctx('time_ms/loss'):
-            # Fused masked cross-entropy loss: replaces ~12 kernels with ~6-7 kernels
-            # - FP32 cast for numerical stability (BF16 softmax over 129K vocab fails)
-            # - PyTorch's optimized cross_entropy (cuDNN backend)
-            # - torch.dot for fused mask*loss+sum (1 kernel vs 2)
-            loss = simple_fused_masked_ce_loss(
-              logits=logits,
-              targets=targets,
-              mask=loss_mask,
-              vocab_size=cfg.vocab_size,
-              eos_token_id=cfg.eos_token_id,
-            )
+            if _USE_CHUNKED_PROJECTED_CE:
+              if hidden is None:
+                raise RuntimeError("Chunked projected CE requires hidden activations from model.forward.")
+              loss = chunked_projected_masked_ce_loss(
+                hidden=hidden,
+                lm_head_weight=model.lm_head.weight,
+                targets=targets,
+                mask=loss_mask,
+                eos_token_id=cfg.eos_token_id,
+                logits_scale_factor=float(model.logits_scale_factor),
+                chunk_size=_CHUNKED_PROJECTED_CE_CHUNK,
+              )
+            else:
+              # Fused masked cross-entropy loss: replaces ~12 kernels with ~6-7 kernels
+              # - FP32 cast for numerical stability (BF16 softmax over 129K vocab fails)
+              # - PyTorch's optimized cross_entropy (cuDNN backend)
+              # - torch.dot for fused mask*loss+sum (1 kernel vs 2)
+              if logits is None:
+                raise RuntimeError("simple_fused_masked_ce_loss requires logits from model.forward.")
+              loss = simple_fused_masked_ce_loss(
+                logits=logits,
+                targets=targets,
+                mask=loss_mask,
+                vocab_size=cfg.vocab_size,
+                eos_token_id=cfg.eos_token_id,
+              )
             # Token-weight loss across DP ranks when supervised token counts differ.
             # Per-rank CE is normalized by local mask sum, while gradients are reduced
             # with DP AVG. Without this correction, sparse ranks are overweighted.

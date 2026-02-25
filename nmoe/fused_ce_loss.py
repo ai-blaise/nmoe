@@ -373,6 +373,158 @@ def simple_fused_masked_ce_loss(
         return loss
 
 
+class _ChunkedProjectedMaskedCELossFunction(torch.autograd.Function):
+    """Projected masked CE without materializing full [N, V] logits."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        targets: torch.Tensor,
+        mask: torch.Tensor,
+        logits_scale_factor: float,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        with _nvtx("fused_ce/chunked_projected_forward"):
+            if hidden.ndim < 2:
+                raise ValueError(f"hidden must have at least 2 dims, got shape={tuple(hidden.shape)}")
+            if lm_head_weight.ndim != 2:
+                raise ValueError(
+                    f"lm_head_weight must be [V, D], got shape={tuple(lm_head_weight.shape)}"
+                )
+
+            orig_shape = hidden.shape
+            N = int(targets.numel())
+            D = int(orig_shape[-1])
+            V = int(lm_head_weight.shape[0])
+            if int(lm_head_weight.shape[1]) != D:
+                raise ValueError(
+                    f"hidden dim {D} must match lm_head_weight dim {int(lm_head_weight.shape[1])}"
+                )
+
+            hidden_2d = hidden.reshape(N, D)
+            targets_1d = targets.reshape(N).to(dtype=torch.long)
+            mask_1d = mask.reshape(N)
+            if mask_1d.dtype != torch.float32:
+                mask_1d = mask_1d.float()
+
+            chunk = max(1, min(int(chunk_size), V))
+            scale = float(logits_scale_factor)
+
+            hidden_f32 = hidden_2d.float()
+            lse_max = torch.full((N,), float("-inf"), device=hidden.device, dtype=torch.float32)
+            lse_sum = torch.zeros((N,), device=hidden.device, dtype=torch.float32)
+
+            for start in range(0, V, chunk):
+                end = min(start + chunk, V)
+                w_chunk = lm_head_weight[start:end]
+                logits_chunk = torch.matmul(hidden_f32, w_chunk.t().float())
+                if scale != 1.0:
+                    logits_chunk.mul_(scale)
+                chunk_max = logits_chunk.max(dim=1).values
+                new_max = torch.maximum(lse_max, chunk_max)
+                lse_sum.mul_(torch.exp(lse_max - new_max))
+                lse_sum.add_(torch.exp(logits_chunk - new_max.unsqueeze(1)).sum(dim=1))
+                lse_max = new_max
+
+            lse = lse_max + torch.log(lse_sum.clamp_min(1e-20))
+            target_rows = lm_head_weight.index_select(0, targets_1d).float()
+            target_logits = (hidden_f32 * target_rows).sum(dim=1)
+            if scale != 1.0:
+                target_logits.mul_(scale)
+
+            loss_unreduced = lse - target_logits
+            masked_sum = torch.dot(loss_unreduced, mask_1d)
+            mask_sum = mask_1d.sum().clamp(min=1.0)
+            loss = masked_sum / mask_sum
+
+            ctx.save_for_backward(hidden_2d, lm_head_weight, targets_1d, mask_1d, lse)
+            ctx.mask_sum = mask_sum
+            ctx.logits_scale_factor = scale
+            ctx.chunk_size = chunk
+            ctx.original_hidden_shape = orig_shape
+            return loss
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        with _nvtx("fused_ce/chunked_projected_backward"):
+            hidden_2d, lm_head_weight, targets_1d, mask_1d, lse = ctx.saved_tensors
+            N, D = hidden_2d.shape
+            V = int(lm_head_weight.shape[0])
+            chunk = int(ctx.chunk_size)
+            scale = float(ctx.logits_scale_factor)
+
+            hidden_f32 = hidden_2d.float()
+            row_scale = (mask_1d / ctx.mask_sum).to(dtype=torch.float32)
+            row_scale.mul_(grad_output.to(dtype=torch.float32))
+
+            grad_hidden = torch.zeros((N, D), device=hidden_2d.device, dtype=torch.float32)
+            grad_weight = torch.zeros_like(lm_head_weight)
+
+            for start in range(0, V, chunk):
+                end = min(start + chunk, V)
+                w_chunk = lm_head_weight[start:end]
+                w_chunk_f32 = w_chunk.float()
+
+                logits_chunk = torch.matmul(hidden_f32, w_chunk_f32.t())
+                if scale != 1.0:
+                    logits_chunk.mul_(scale)
+                probs = torch.exp(logits_chunk - lse.unsqueeze(1))
+                probs.mul_(row_scale.unsqueeze(1))
+
+                grad_hidden.add_(torch.matmul(probs, w_chunk_f32), alpha=scale)
+
+                grad_w_chunk = torch.matmul(probs.t(), hidden_f32)
+                if scale != 1.0:
+                    grad_w_chunk.mul_(scale)
+
+                in_chunk = (targets_1d >= start) & (targets_1d < end)
+                if bool(in_chunk.any().item()):
+                    local_idx = targets_1d[in_chunk] - start
+                    coeff = row_scale[in_chunk]
+                    hidden_sel = hidden_f32[in_chunk]
+                    grad_w_chunk.index_add_(
+                        0,
+                        local_idx,
+                        (-coeff.unsqueeze(1) * hidden_sel * scale),
+                    )
+                    grad_hidden[in_chunk].add_(
+                        -coeff.unsqueeze(1) * w_chunk_f32.index_select(0, local_idx) * scale
+                    )
+
+                grad_weight[start:end].add_(grad_w_chunk.to(dtype=grad_weight.dtype))
+
+            grad_hidden = grad_hidden.to(dtype=hidden_2d.dtype).reshape(ctx.original_hidden_shape)
+            return grad_hidden, grad_weight, None, None, None, None
+
+
+def chunked_projected_masked_ce_loss(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    targets: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    eos_token_id: Optional[int] = None,
+    *,
+    logits_scale_factor: float = 1.0,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Masked CE from hidden states + lm_head weights with chunked vocab projection."""
+    with _nvtx("fused_ce/chunked_projected_loss"):
+        if mask is None:
+            if eos_token_id is None:
+                raise ValueError("Either mask or eos_token_id must be provided")
+            mask = (targets != eos_token_id).float()
+        return _ChunkedProjectedMaskedCELossFunction.apply(
+            hidden,
+            lm_head_weight,
+            targets,
+            mask,
+            float(logits_scale_factor),
+            int(chunk_size),
+        )
+
+
 # ============================================================================
 # Utility functions
 # ============================================================================

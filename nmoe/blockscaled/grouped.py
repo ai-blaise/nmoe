@@ -365,7 +365,12 @@ def _wrap_uint8_as_sf(
     return cute_tensor, torch_back
 
 
-__all__ = ["quantize_weights", "expert_blockscaled"]
+__all__ = [
+    "quantize_weights",
+    "expert_blockscaled",
+    "quantize_grouped_rhs_bf16",
+    "grouped_mm_blockscaled_bf16",
+]
 
 
 # -----------------------------------------------------------------------------
@@ -2130,6 +2135,7 @@ def run_grouped_blockscaled_strided(
     fuse_swiglu_quant: bool = False,
     out_act: torch.Tensor | None = None,     # fp8: [M_pad, Dff//2] uint16; nvfp4: [M_pad, Dff//2] uint8
     out_sf_mma: torch.Tensor | None = None,  # [M_pad, sf_k] uint8 MMA layout (packed by offs)
+    sfa_expert_bytes: int = 0,               # >0 means SFA_pad is [E, M_e_stride, sf_k] expert-major
 ) -> None:
     """Strided grouped blockscaled GEMM (GPU metadata builder).
 
@@ -2178,33 +2184,52 @@ def run_grouped_blockscaled_strided(
     c_dtype_cutlass = cutlass.BFloat16 if C_pad.dtype == torch.bfloat16 else cutlass.Float16
 
     # One clear path: single tiler + cluster shape + tensormap strategy.
-    mma_tiler_mn = (128, 128)
+    # On SM100 we run the production grouped kernel with 2-CTA instructions.
+    # The logical CTA tile in M is halved when use_2cta=True.
+    mma_tiler_mn = (256, 128)
     cluster_shape_mn = (1, 1)
     tensormap_update_smem = True
-    use_2cta = False
+    use_2cta = True
 
     # Tile sizes used for total_num_clusters sizing.
-    ct_m = mma_tiler_mn[0] * cluster_shape_mn[0]
+    ct_m = (mma_tiler_mn[0] // (2 if use_2cta else 1)) * cluster_shape_mn[0]
     ct_n = mma_tiler_mn[1] * cluster_shape_mn[1]
 
-    # Packed SFA layout (production): [M_pad, sf_k_pad] MMA-swizzled bytes, where
-    # each expert's swizzled chunk is packed back-to-back using offs (no E*capacity allocation).
-    if not (SFA_pad.is_cuda and SFA_pad.dtype == torch.uint8 and SFA_pad.ndim in (2, 3)):
+    # SFA layout options:
+    # 1) packed-by-offs (default): [M_pad, sf_k_pad] bytes with per-expert chunks back-to-back.
+    # 2) expert-major (sfa_expert_bytes>0): [E, M_e_stride, sf_k] bytes, one fixed-stride
+    #    chunk per expert (used by backward grouped-mm helpers).
+    if not (SFA_pad.is_cuda and SFA_pad.dtype == torch.uint8):
         raise ValueError(
-            "SFA_pad must be a uint8 CUDA tensor (packed by offs, MMA layout). "
+            "SFA_pad must be a uint8 CUDA tensor. "
             f"Got device={SFA_pad.device} dtype={SFA_pad.dtype} shape={tuple(SFA_pad.shape)}."
         )
-    if SFA_pad.ndim == 3:
-        if int(SFA_pad.shape[2]) != 1:
-            raise ValueError(f"SFA_pad must have trailing singleton dim if 3D. Got shape={tuple(SFA_pad.shape)}.")
-        if int(SFA_pad.shape[0]) != int(M_pad):
-            raise ValueError(f"SFA_pad.shape[0] must equal M_pad={M_pad}. Got {int(SFA_pad.shape[0])}.")
-        # Drop last dim for simpler checks/strides (no copy).
-        SFA_pad = SFA_pad.squeeze(-1)
+    if int(sfa_expert_bytes) > 0:
+        if SFA_pad.ndim != 3:
+            raise ValueError(
+                "Expert-major SFA requires SFA_pad shape [E, M_e_stride, sf_k]. "
+                f"Got shape={tuple(SFA_pad.shape)}."
+            )
+        if int(SFA_pad.shape[0]) != int(E):
+            raise ValueError(f"Expert-major SFA requires SFA_pad.shape[0]==E={E}.")
+        SFA_row_bytes = 0
     else:
-        if int(SFA_pad.shape[0]) != int(M_pad):
-            raise ValueError(f"SFA_pad.shape[0] must equal M_pad={M_pad}. Got {int(SFA_pad.shape[0])}.")
-    SFA_row_bytes = int(SFA_pad.stride(0))  # uint8 => element stride is byte stride
+        if SFA_pad.ndim not in (2, 3):
+            raise ValueError(
+                "Packed-by-offs SFA requires [M_pad, sf_k_pad] or [M_pad, sf_k_pad, 1]. "
+                f"Got shape={tuple(SFA_pad.shape)}."
+            )
+        if SFA_pad.ndim == 3:
+            if int(SFA_pad.shape[2]) != 1:
+                raise ValueError(f"SFA_pad must have trailing singleton dim if 3D. Got shape={tuple(SFA_pad.shape)}.")
+            if int(SFA_pad.shape[0]) != int(M_pad):
+                raise ValueError(f"SFA_pad.shape[0] must equal M_pad={M_pad}. Got {int(SFA_pad.shape[0])}.")
+            # Drop last dim for simpler checks/strides (no copy).
+            SFA_pad = SFA_pad.squeeze(-1)
+        else:
+            if int(SFA_pad.shape[0]) != int(M_pad):
+                raise ValueError(f"SFA_pad.shape[0] must equal M_pad={M_pad}. Got {int(SFA_pad.shape[0])}.")
+        SFA_row_bytes = int(SFA_pad.stride(0))  # uint8 => element stride is byte stride
 
     out_act_base_ptr = 0
     out_sf_base_ptr = 0
@@ -2435,7 +2460,7 @@ def run_grouped_blockscaled_strided(
     # Argument order must match binding:
     # offs_ptr, E,
     # A_base, A_row_bytes, B_base, B_expert_bytes, C_base, C_row_bytes,
-    # SFA_base, SFA_row_bytes, SFB_base, SFB_expert_bytes,
+    # SFA_base, SFA_row_bytes, SFA_expert_bytes, SFB_base, SFB_expert_bytes,
     # A_stride0_elem, A_stride1_elem, B_stride0_elem, B_stride1_elem, C_stride0_elem, C_stride1_elem,
     # N, K, sizes_ptr, strides_ptr, ptrs_abc_ptr, ptrs_sfasfb_ptr, stream
 
@@ -2445,7 +2470,7 @@ def run_grouped_blockscaled_strided(
         A_pad.data_ptr(), A_row_bytes,
         B_stacked.data_ptr(), B_expert_bytes,
         C_pad.data_ptr(), C_row_bytes,
-        SFA_pad.data_ptr(), SFA_row_bytes,  # packed SFA: base + offs[e]*row_bytes
+        SFA_pad.data_ptr(), SFA_row_bytes, int(sfa_expert_bytes),
         SFB_stacked.data_ptr(), SFB_expert_bytes,
         # Element strides for CUTLASS
         A_stride0_elem, A_stride1_elem,
@@ -2473,6 +2498,237 @@ def run_grouped_blockscaled_strided(
         cutlass.Int32(total_num_clusters),
         tensormap_cute, max_active_clusters, cu_stream,
     )
+
+
+@dataclass
+class QuantizedGroupedRHS:
+    """Quantized grouped-MM RHS cache for blockscaled backward GEMMs."""
+
+    B_q: torch.Tensor
+    B_sf_mma: torch.Tensor
+    E: int
+    K: int
+    N: int
+    profile: str
+
+
+def _normalize_offs_with_leading_zero(offs: torch.Tensor, E: int) -> torch.Tensor:
+    if offs.ndim != 1:
+        raise ValueError(f"offs must be 1D. Got shape={tuple(offs.shape)}.")
+    if int(offs.numel()) == int(E + 1):
+        if offs.dtype != torch.int32:
+            offs = offs.to(dtype=torch.int32)
+        return offs if offs.is_contiguous() else offs.contiguous()
+    if int(offs.numel()) == int(E):
+        offs_e1 = torch.empty((E + 1,), device=offs.device, dtype=torch.int32)
+        offs_e1[:1].zero_()
+        if offs.dtype == torch.int32:
+            offs_e1[1:].copy_(offs)
+        else:
+            offs_e1[1:].copy_(offs.to(dtype=torch.int32))
+        return offs_e1
+    raise ValueError(f"offs must have shape [{E}] or [{E + 1}], got {tuple(offs.shape)}.")
+
+
+def _quantize_grouped_lhs_bf16(
+    A_mk: torch.Tensor,
+    offs_e1: torch.Tensor,
+    *,
+    profile: str,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Quantize BF16 grouped-MM LHS to blockscaled format with expert-major SF."""
+    if not (A_mk.is_cuda and A_mk.dtype == torch.bfloat16 and A_mk.ndim == 2):
+        raise ValueError(
+            "A_mk must be a CUDA BF16 tensor with shape [M_pad, K]. "
+            f"Got device={A_mk.device} dtype={A_mk.dtype} shape={tuple(A_mk.shape)}."
+        )
+    A_mk = A_mk if A_mk.is_contiguous() else A_mk.contiguous()
+    offs_e1 = _normalize_offs_with_leading_zero(offs_e1, int(offs_e1.numel()) - 1)
+    if offs_e1.device != A_mk.device:
+        raise ValueError("offs and A_mk must be on the same CUDA device.")
+
+    M_pad, K = int(A_mk.shape[0]), int(A_mk.shape[1])
+    if (K & 127) != 0:
+        raise ValueError(f"K must be a multiple of 128 for blockscaled quantization. Got K={K}.")
+    sf_k = K // 32
+    if (sf_k & 3) != 0:
+        raise ValueError(f"sf_k must be a multiple of 4. Got sf_k={sf_k}.")
+
+    E = int(offs_e1.numel()) - 1
+    if E <= 0:
+        raise ValueError("offs must contain at least one expert.")
+    if M_pad <= 0:
+        raise ValueError("A_mk must have M_pad>0.")
+
+    m_per_expert = offs_e1[1:] - offs_e1[:-1]
+    max_m_local = int(m_per_expert.max().item())
+    M_e_stride = ((max_m_local + 127) // 128) * 128
+    if M_e_stride <= 0:
+        M_e_stride = 128
+
+    stream = _current_torch_stream_or_none(A_mk.device)
+    SFA_expert = torch.empty((E, M_e_stride, sf_k), device=A_mk.device, dtype=torch.uint8)
+
+    if profile == "fp8":
+        A_u16 = torch.empty((M_pad, K // 2), device=A_mk.device, dtype=torch.uint16)
+        rdep.quant_fp8_sf_strided_mma(
+            A_mk.data_ptr(), K,
+            A_u16.data_ptr(), K // 2,
+            SFA_expert.data_ptr(),
+            offs_e1.data_ptr(), E, M_e_stride,
+            M_pad, K,
+            stream,
+        )
+        A_q = A_u16.view(torch.uint8).view(M_pad, K, 1).view(torch.float8_e4m3fn)
+    elif profile == "nvfp4":
+        A_u16 = torch.empty((M_pad, K // 4), device=A_mk.device, dtype=torch.uint16)
+        rdep.quant_nvfp4_sf_strided_mma(
+            A_mk.data_ptr(), K,
+            A_u16.data_ptr(), K // 4,
+            SFA_expert.data_ptr(),
+            offs_e1.data_ptr(), E, M_e_stride,
+            M_pad, K,
+            stream,
+        )
+        A_q = A_u16.view(torch.uint8).view(M_pad, K // 2, 1)
+    else:
+        raise ValueError("profile must be 'fp8' or 'nvfp4'")
+
+    # uint8 tensor => stride(0) is already in bytes.
+    sfa_expert_bytes = int(SFA_expert.stride(0))
+    return A_q, SFA_expert, sfa_expert_bytes
+
+
+def quantize_grouped_rhs_bf16(
+    B_kn: torch.Tensor,
+    *,
+    profile: str,
+) -> QuantizedGroupedRHS:
+    """Quantize grouped-MM RHS BF16 weights to blockscaled MMA format.
+
+    Args:
+        B_kn: [E, K, N] BF16 stacked matrices (torch._grouped_mm convention).
+        profile: 'fp8' or 'nvfp4'
+    """
+    if not (B_kn.is_cuda and B_kn.dtype == torch.bfloat16 and B_kn.ndim == 3):
+        raise ValueError(
+            "B_kn must be a CUDA BF16 tensor with shape [E, K, N]. "
+            f"Got device={B_kn.device} dtype={B_kn.dtype} shape={tuple(B_kn.shape)}."
+        )
+    E, K, N = int(B_kn.shape[0]), int(B_kn.shape[1]), int(B_kn.shape[2])
+    if E <= 0:
+        raise ValueError("B_kn must have E>0.")
+    if (K & 127) != 0:
+        raise ValueError(f"K must be a multiple of 128. Got K={K}.")
+    if (N & 127) != 0:
+        raise ValueError(f"N must be a multiple of 128. Got N={N}.")
+    sf_k = K // 32
+    if (sf_k & 3) != 0:
+        raise ValueError(f"sf_k must be a multiple of 4. Got sf_k={sf_k}.")
+
+    B_nk = B_kn.transpose(1, 2).contiguous()  # [E, N, K] for grouped blockscaled GEMM
+    stream = _current_torch_stream_or_none(B_kn.device)
+    offs = torch.arange(0, (E + 1) * N, step=N, device=B_kn.device, dtype=torch.int32)
+
+    if profile == "fp8":
+        B_u16 = torch.empty((E * N, K // 2), device=B_kn.device, dtype=torch.uint16)
+        B_sf = torch.empty((E, N, sf_k), device=B_kn.device, dtype=torch.uint8)
+        rdep.quant_fp8_sf_strided_mma(
+            B_nk.view(E * N, K).data_ptr(), K,
+            B_u16.data_ptr(), K // 2,
+            B_sf.data_ptr(),
+            offs.data_ptr(), E, N,
+            E * N, K,
+            stream,
+        )
+        B_q = B_u16.view(torch.uint8).view(E, N, K, 1).view(torch.float8_e4m3fn)
+    elif profile == "nvfp4":
+        B_u16 = torch.empty((E * N, K // 4), device=B_kn.device, dtype=torch.uint16)
+        B_sf = torch.empty((E, N, sf_k), device=B_kn.device, dtype=torch.uint8)
+        rdep.quant_nvfp4_sf_strided_mma(
+            B_nk.view(E * N, K).data_ptr(), K,
+            B_u16.data_ptr(), K // 4,
+            B_sf.data_ptr(),
+            offs.data_ptr(), E, N,
+            E * N, K,
+            stream,
+        )
+        B_q = B_u16.view(torch.uint8).view(E, N, K // 2, 1)
+    else:
+        raise ValueError("profile must be 'fp8' or 'nvfp4'")
+
+    return QuantizedGroupedRHS(
+        B_q=B_q,
+        B_sf_mma=B_sf.view(E, N, sf_k, 1),
+        E=E,
+        K=K,
+        N=N,
+        profile=profile,
+    )
+
+
+def grouped_mm_blockscaled_bf16(
+    A_mk: torch.Tensor,
+    B_kn: torch.Tensor | QuantizedGroupedRHS,
+    offs: torch.Tensor,
+    *,
+    profile: str,
+) -> torch.Tensor:
+    """Blockscaled replacement for torch._grouped_mm(A_mk, B_kn, offs=...).
+
+    Args:
+        A_mk: [M_pad, K] BF16 activations.
+        B_kn: [E, K, N] BF16 weights or pre-quantized QuantizedGroupedRHS.
+        offs: [E] or [E+1] cumulative offsets.
+        profile: 'fp8' or 'nvfp4'
+
+    Returns:
+        [M_pad, N] BF16 output.
+    """
+    if not (A_mk.is_cuda and A_mk.dtype == torch.bfloat16 and A_mk.ndim == 2):
+        raise ValueError(
+            "A_mk must be CUDA BF16 [M_pad, K]. "
+            f"Got device={A_mk.device} dtype={A_mk.dtype} shape={tuple(A_mk.shape)}."
+        )
+    A_mk = A_mk if A_mk.is_contiguous() else A_mk.contiguous()
+
+    if isinstance(B_kn, QuantizedGroupedRHS):
+        rhs = B_kn
+        if rhs.profile != profile:
+            raise ValueError(f"RHS profile mismatch: rhs.profile={rhs.profile}, requested={profile}.")
+        E = int(rhs.E)
+        K_rhs = int(rhs.K)
+        N = int(rhs.N)
+    else:
+        rhs = quantize_grouped_rhs_bf16(B_kn, profile=profile)
+        E = int(rhs.E)
+        K_rhs = int(rhs.K)
+        N = int(rhs.N)
+
+    if int(A_mk.shape[1]) != int(K_rhs):
+        raise ValueError(f"A_mk K mismatch: expected {K_rhs}, got {int(A_mk.shape[1])}.")
+
+    offs_e1 = _normalize_offs_with_leading_zero(offs, E)
+    if offs_e1.device != A_mk.device:
+        raise ValueError("offs must be on same CUDA device as A_mk.")
+
+    A_q, SFA_expert, sfa_expert_bytes = _quantize_grouped_lhs_bf16(
+        A_mk, offs_e1, profile=profile
+    )
+    C_pad = torch.empty((int(A_mk.shape[0]), N, 1), device=A_mk.device, dtype=torch.bfloat16)
+    run_grouped_blockscaled_strided(
+        A_q,
+        SFA_expert,
+        rhs.B_q,
+        rhs.B_sf_mma,
+        C_pad,
+        offs_e1,
+        profile=profile,
+        N=N,
+        K=K_rhs,
+        sfa_expert_bytes=sfa_expert_bytes,
+    )
+    return C_pad.squeeze(-1)
 
 
 @dataclass
