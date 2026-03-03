@@ -36,13 +36,18 @@ TASKS: dict[str, type] = {
 
 
 def _init_dist() -> tuple[int, int]:
+    """Initialize distributed training with NCCL backend (B200 cluster only).
+
+    CUDA is required - this eval runner targets B200 infrastructure exclusively.
+    No gloo/TCP fallback is provided.
+    """
     if "RANK" in os.environ and not dist.is_initialized():
-        if torch.cuda.is_available():
-            backend = "nccl"
-        else:
-            backend = "gloo"
-            logging.getLogger(__name__).warning("CUDA not available, falling back to gloo backend")
-        dist.init_process_group(backend=backend)
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is required for distributed eval on B200 cluster. "
+                "Gloo/TCP fallback has been removed."
+            )
+        dist.init_process_group(backend="nccl")
     rank = dist.get_rank() if dist.is_initialized() else 0
     world = dist.get_world_size() if dist.is_initialized() else 1
     return int(rank), int(world)

@@ -2,6 +2,13 @@
 
 Handles platform checks, distributed setup, seeds, and EP/DP process groups.
 Seamlessly supports single GPU, single-node multi-GPU, and multi-node training.
+
+B200 Cluster Configuration (16x nodes, 8x GPUs per node, 8x RDMA NICs per node):
+- CUDA 13.1, Driver 590.48
+- Python 3.12, PyTorch 2.9.1+cu130
+- Blackwell architecture: sm_100 (compute capability 10.0)
+- 8x 200GB/s NVLink per GPU (NVSwitch interconnect)
+- 8x ~400 Gbps RDMA NICs per node (mlx5_0-mlx5_7, MTU 8896)
 """
 import logging
 import os
@@ -9,6 +16,166 @@ import sys
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
+
+# =============================================================================
+# B200 CLUSTER MAXIMUM PERFORMANCE SETTINGS (HARD-CODED - NO FALLBACKS)
+# Optimized for: 16 nodes x 8 B200 GPUs x 8 RDMA NICs = 128 GPUs
+# Source of truth: infrastructure/install_packages.sh + cluster.yaml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# NCCL NETWORK TRANSPORT (8x mlx5 RDMA NICs per node, MTU 8896)
+# -----------------------------------------------------------------------------
+os.environ["NCCL_NET"] = "IB"                    # Force InfiniBand (not Socket/TCP)
+os.environ["NCCL_IB_DISABLE"] = "0"              # InfiniBand enabled
+os.environ["NCCL_SHM_DISABLE"] = "0"             # Shared memory for intra-node
+os.environ["NCCL_IB_HCA"] = "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7"
+os.environ["NCCL_IB_GID_INDEX"] = "3"            # RoCEv2 GID index
+
+# GPUDirect RDMA: Level 2 = PHB (same PCIe root complex as GPU)
+# B200 NVSwitch topology: GPU-to-NIC via PCIe switch, not NVLink
+os.environ["NCCL_NET_GDR_LEVEL"] = "2"           # PHB level for B200
+os.environ["NCCL_NET_GDR_READ"] = "1"            # GPUDirect RDMA read path
+
+# -----------------------------------------------------------------------------
+# NCCL MULTI-RAIL RDMA TUNING (Critical for 8x NIC saturation)
+# -----------------------------------------------------------------------------
+# Channel count: 8 channels = 1 per RDMA NIC = maximum multi-rail utilization
+os.environ["NCCL_MIN_NCHANNELS"] = "8"           # Minimum 8 for 8-rail
+os.environ["NCCL_MAX_NCHANNELS"] = "16"          # Allow up to 16 for large collectives
+
+# Multi-rail balancing: CROSS_NIC=2 enables round-robin across all NICs
+# Without this, NCCL may prefer a single NIC per connection
+os.environ["NCCL_CROSS_NIC"] = "2"               # Round-robin multi-rail
+
+# Multiple Queue Pairs per connection for higher throughput
+# More QPs allow parallel RDMA operations on each NIC
+os.environ["NCCL_IB_QPS_PER_CONNECTION"] = "4"   # 4 QPs per connection
+os.environ["NCCL_IB_SPLIT_DATA_ON_QPS"] = "1"    # Split data across QPs
+
+# Large buffer for high-bandwidth 8-rail RDMA (512MB total)
+# Each rail gets ~64MB of buffer for deep pipelining
+os.environ["NCCL_BUFFSIZE"] = "536870912"        # 512MB (increased from 256MB)
+
+# -----------------------------------------------------------------------------
+# NCCL INFINIBAND TRANSPORT TUNING
+# -----------------------------------------------------------------------------
+# IB timeout: 20 = ~4 seconds (2^20 * 4.096us base)
+# Default 14 (~67ms) is too aggressive for large-scale RDMA
+os.environ["NCCL_IB_TIMEOUT"] = "20"             # ~4s timeout
+os.environ["NCCL_IB_RETRY_CNT"] = "7"            # 7 retries before failure
+
+# PCIe relaxed ordering: improves GPU-to-NIC DMA throughput
+os.environ["NCCL_IB_PCI_RELAXED_ORDERING"] = "1"
+
+# Disable adaptive routing (explicit multi-rail is better for this topology)
+os.environ["NCCL_IB_AR_THRESHOLD"] = "0"         # Disable AR
+
+# Traffic class for RDMA priority (default is fine for dedicated fabric)
+# os.environ["NCCL_IB_TC"] = "0"                 # Default TC
+# os.environ["NCCL_IB_SL"] = "0"                 # Default service level
+
+# -----------------------------------------------------------------------------
+# NCCL ALGORITHM AND PROTOCOL
+# -----------------------------------------------------------------------------
+# TREE algorithm for large 16-node all-reduce (better than RING for >8 nodes)
+os.environ["NCCL_ALGO"] = "TREE"
+# SIMPLE protocol for large messages (>256KB), LL128 for small messages
+# NCCL auto-selects, but SIMPLE is optimal for MoE large tensors
+os.environ["NCCL_PROTO"] = "SIMPLE"
+# 512 threads per NCCL block (optimal for B200 SM count)
+os.environ["NCCL_NTHREADS"] = "512"
+
+# -----------------------------------------------------------------------------
+# NCCL P2P / NVSwitch SETTINGS
+# -----------------------------------------------------------------------------
+# P2P via NVSwitch for intra-node GPU-to-GPU
+os.environ["NCCL_P2P_DISABLE"] = "0"             # P2P enabled
+os.environ["NCCL_P2P_LEVEL"] = "LOC"             # Local P2P (NVSwitch)
+
+# NVLink SHARP (NVLS): B200/NVSwitch native collective acceleration
+# Enables in-network reduction on NVSwitch for intra-node collectives
+os.environ["NCCL_NVLS_ENABLE"] = "1"             # NVLink SHARP enabled
+
+# CUDA Graph mixing support for NCCL operations
+os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "1"
+
+# -----------------------------------------------------------------------------
+# NCCL SOCKET SETTINGS (TCP backup path, not primary)
+# -----------------------------------------------------------------------------
+os.environ["NCCL_SOCKET_IFNAME"] = "eth0"        # GVNIC for control plane
+os.environ["NCCL_SOCKET_NTHREADS"] = "8"         # 8 socket threads
+os.environ["NCCL_NSOCKS_PERTHREAD"] = "8"        # 64 total TCP connections
+
+# -----------------------------------------------------------------------------
+# UCX SETTINGS FOR MULTI-RAIL RDMA TRANSPORT
+# -----------------------------------------------------------------------------
+# Transport selection: RC (Reliable Connection), UD (Unreliable Datagram),
+# SM (Shared Memory for intra-node), Self (loopback)
+os.environ["UCX_TLS"] = "rc,ud,sm,self"
+
+# All 8 RDMA NICs with port 1
+os.environ["UCX_NET_DEVICES"] = "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1"
+
+# Maximum 8 rails for rendezvous protocol (matches NIC count)
+os.environ["UCX_MAX_RNDV_RAILS"] = "8"
+os.environ["UCX_IB_GID_INDEX"] = "3"             # RoCEv2 GID
+
+# Rendezvous threshold: 8KB (switch to zero-copy for larger messages)
+os.environ["UCX_RNDV_THRESH"] = "8192"
+
+# Direct memory registration (no caching, better for large GPU allocations)
+os.environ["UCX_REG_METHODS"] = "direct"
+os.environ["UCX_MEMTYPE_CACHE"] = "n"            # Disable memtype cache
+
+# MLX5 DevX acceleration
+os.environ["UCX_IB_MLX5_DEVX"] = "y"
+
+# UCX queue depths for high-throughput RDMA
+os.environ["UCX_RC_TX_QUEUE_LEN"] = "4096"       # Send queue depth
+os.environ["UCX_RC_RX_QUEUE_LEN"] = "4096"       # Receive queue depth
+
+# Inline data for small messages (reduce latency)
+os.environ["UCX_IB_TX_INLINE"] = "128"           # Inline send threshold
+os.environ["UCX_IB_RX_INLINE"] = "128"           # Inline receive threshold
+
+# DC (Dynamic Connection) polling for scalability
+os.environ["UCX_DC_TX_POLL_BUDGET"] = "256"      # TX polling budget
+
+# -----------------------------------------------------------------------------
+# CUDA / GPU SETTINGS
+# -----------------------------------------------------------------------------
+# CUDA architecture for Blackwell B200 (sm_100)
+os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0"
+
+# Maximum CUDA device connections: higher value enables more async kernel overlap
+# Default is 8, but 16 allows better overlap for MoE dispatch/combine
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "16"
+
+# CUDA memory allocator: expandable segments + max split size
+# max_split_size_mb prevents fragmentation from large tensor allocations
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:512"
+)
+
+# -----------------------------------------------------------------------------
+# PYTORCH DISTRIBUTED SETTINGS
+# -----------------------------------------------------------------------------
+# Async error handling for NCCL (detect hangs without blocking)
+os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
+
+# Avoid record_streams for NCCL to reduce memory overhead
+os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
+
+# Enable high-priority CUDA streams for NCCL
+os.environ["TORCH_NCCL_HIGH_PRIORITY"] = "1"
+
+# Coalesced reduce for better performance with many small tensors
+os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "1"
+
+# =============================================================================
+
 import torch
 import torch.distributed as dist
 

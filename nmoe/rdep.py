@@ -89,7 +89,17 @@ _CPU_PG_WORLD: int | None = None
 
 
 def _cpu_pg():
-    """CPU-only process group for bootstrap collectives (Gloo)."""
+    """CPU-only process group for bootstrap collectives (Gloo backend).
+
+    NOTE: Gloo is intentionally used here (not NCCL) because this group handles
+    CPU tensor/object exchange during NVSHMEM/IPC bootstrap. NCCL requires GPU
+    buffers and cannot be used for CPU-side coordination. This is the correct
+    pattern for distributed systems that need CPU-side collective before GPU
+    collectives are available.
+
+    B200 cluster: All GPU collectives use NCCL over InfiniBand (RDMA).
+    This Gloo group is only for initial IPC handle exchange.
+    """
     global _CPU_PG, _CPU_PG_WORLD
     if not dist.is_initialized():
         return None
