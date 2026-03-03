@@ -100,9 +100,33 @@ os.environ["NCCL_NVLS_ENABLE"] = "1"             # NVLink SHARP enabled
 # CUDA Graph mixing support for NCCL operations
 os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "1"
 
-# Gloo rendezvous/control plane uses GVNIC (eth0), not RDMA
+# -----------------------------------------------------------------------------
+# GLOO TRANSPORT FOR CPU COLLECTIVES
+# -----------------------------------------------------------------------------
+# Gloo is used for CPU-side object exchange during NVSHMEM/IPC bootstrap.
+# Performance hierarchy (B200 cluster with 8x mlx5 RDMA NICs):
+#
+# 1. NCCL-based RDMA collectives (NMOE_RDMA_COLLECTIVES=1, default)
+#    - Serializes objects to GPU tensors, uses NCCL all_gather/broadcast
+#    - ~10us latency (uses RDMA over InfiniBand via NCCL)
+#    - Enabled by default in nmoe/rdma_collectives.py
+#
+# 2. Gloo over IPoIB (if ib0/ibs0 interface exists)
+#    - IP over InfiniBand, ~50us latency
+#    - Automatically detected by nmoe/rdep.py:_cpu_pg()
+#
+# 3. Gloo over TCP (eth0, GVNIC fallback)
+#    - TCP over Google Virtual NIC, ~100us latency
+#    - Used only if IPoIB not available and RDMA collectives disabled
+#
 # NOTE: No NCCL_SOCKET_* settings - IB must work or training crashes (no TCP fallback)
-os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+# The GLOO_SOCKET_IFNAME is set dynamically by _cpu_pg() after IPoIB detection.
+# Default to eth0 here; rdep.py will override if IPoIB is found.
+os.environ.setdefault("GLOO_SOCKET_IFNAME", "eth0")
+
+# Enable RDMA collectives for CPU object exchange (uses NCCL instead of Gloo)
+# Set to "0" to fall back to Gloo (useful for debugging or if NCCL init fails)
+os.environ.setdefault("NMOE_RDMA_COLLECTIVES", "1")
 
 # -----------------------------------------------------------------------------
 # NCCL TIMEOUT SETTINGS

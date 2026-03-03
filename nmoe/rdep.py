@@ -3,7 +3,7 @@ import os
 import socket
 from contextlib import nullcontext
 from datetime import timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -22,6 +22,11 @@ from .cuda_errors import (
     cuda_error_context,
 )
 from .nccl_watchdog import get_watchdog
+from .rdma_collectives import (
+    RDMACollectives,
+    detect_ipoib_interface,
+    get_optimal_gloo_interface,
+)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -86,6 +91,7 @@ def _get_group_rank(group: Optional[ProcessGroup] = None) -> int:
 
 _CPU_PG = None
 _CPU_PG_WORLD: int | None = None
+_USE_RDMA_COLLECTIVES: bool = _env_flag("NMOE_RDMA_COLLECTIVES", "1")
 
 
 def _cpu_pg():
@@ -97,8 +103,12 @@ def _cpu_pg():
     pattern for distributed systems that need CPU-side collective before GPU
     collectives are available.
 
-    B200 cluster: All GPU collectives use NCCL over InfiniBand (RDMA).
-    This Gloo group is only for initial IPC handle exchange.
+    B200 cluster optimization:
+    - If IPoIB (ib0) is available: Use Gloo over IPoIB (~50us latency)
+    - Otherwise: Fall back to Gloo over GVNIC/eth0 (~100us latency)
+
+    For even faster bootstrap, set NMOE_RDMA_COLLECTIVES=1 (default) to use
+    NCCL-based tensor exchange instead of Gloo object exchange.
     """
     global _CPU_PG, _CPU_PG_WORLD
     if not dist.is_initialized():
@@ -107,9 +117,40 @@ def _cpu_pg():
     if world <= 1:
         return None
     if _CPU_PG is None or _CPU_PG_WORLD != world:
+        # Detect optimal interface for Gloo (IPoIB > GVNIC)
+        ipoib_if = detect_ipoib_interface()
+        if ipoib_if:
+            # Use IPoIB for faster Gloo transport
+            os.environ["GLOO_SOCKET_IFNAME"] = ipoib_if
+            _rdep_logger.info(
+                "Using IPoIB interface %s for Gloo (RDMA over IP, ~50us latency)",
+                ipoib_if,
+            )
+        else:
+            # Fall back to GVNIC
+            _rdep_logger.debug(
+                "No IPoIB interface found, using eth0 for Gloo (~100us latency)"
+            )
         _CPU_PG = dist.new_group(backend="gloo", timeout=timedelta(seconds=1800))
         _CPU_PG_WORLD = world
     return _CPU_PG
+
+
+def _get_rdma_collectives(device: torch.device) -> Optional[RDMACollectives]:
+    """Get RDMA collectives instance for NCCL-based object exchange.
+
+    When NMOE_RDMA_COLLECTIVES=1 (default), this returns an RDMACollectives
+    instance that uses NCCL (RDMA) for object broadcast/gather operations.
+
+    Returns:
+        RDMACollectives instance if enabled, None otherwise.
+    """
+    if not _USE_RDMA_COLLECTIVES:
+        return None
+    if not dist.is_initialized():
+        return None
+    # Use the default NCCL group for RDMA collectives
+    return RDMACollectives(nccl_group=None, device=device)
 
 
 class Rdep:
@@ -239,16 +280,39 @@ class Rdep:
         )
 
     def _setup_hybrid(self):
-        """Set up NVSHMEM for multi-node hybrid mode with CUDA error checking."""
+        """Set up NVSHMEM for multi-node hybrid mode with CUDA error checking.
+
+        RDMA Optimization (NMOE_RDMA_COLLECTIVES=1, default):
+        Instead of using Gloo over TCP (~100us latency), this method uses
+        NCCL-based tensor exchange for object collectives (~10us latency).
+        The NCCL backend already uses RDMA over InfiniBand.
+
+        Fallback (NMOE_RDMA_COLLECTIVES=0):
+        Uses Gloo backend with IPoIB detection for ~50us latency if IPoIB
+        interfaces are available, otherwise ~100us over GVNIC/eth0.
+        """
         global_world = dist.get_world_size() if dist.is_initialized() else self.world
         global_rank = dist.get_rank() if dist.is_initialized() else self.rank
         if self.world != global_world or self.rank != global_rank:
             raise RuntimeError(
                 "[RDEP] Hybrid mode currently requires EP group == global WORLD group."
             )
-        cpu_pg = _cpu_pg()
-        if cpu_pg is None:
-            raise RuntimeError("[RDEP] internal error: expected dist to be initialized for hybrid bootstrap")
+
+        # Get RDMA collectives (NCCL-based) if enabled, else use Gloo
+        rdma = _get_rdma_collectives(self._device)
+        use_rdma = rdma is not None
+
+        # Gloo fallback for when RDMA collectives are disabled
+        cpu_pg = None
+        if not use_rdma:
+            cpu_pg = _cpu_pg()
+            if cpu_pg is None:
+                raise RuntimeError("[RDEP] internal error: expected dist to be initialized for hybrid bootstrap")
+
+        if self.rank == 0 and use_rdma:
+            _rdep_logger.info("Using NCCL-based RDMA collectives for hybrid bootstrap (~10us latency)")
+        elif self.rank == 0 and not use_rdma:
+            _rdep_logger.info("Using Gloo for hybrid bootstrap (set NMOE_RDMA_COLLECTIVES=1 for RDMA)")
 
         try:
             uid_size = _C.nvshmem_get_uid_size()
@@ -263,10 +327,16 @@ class Rdep:
                     uid = None
 
                 if self.rank == 0:
-                    _rdep_logger.info("rank=%d: Broadcasting UID via CPU...", self.rank)
-                uid_list = [uid]
-                dist.broadcast_object_list(uid_list, src=0, group=cpu_pg)
-                uid = uid_list[0]
+                    _rdep_logger.info("rank=%d: Broadcasting UID via %s...", self.rank, "NCCL/RDMA" if use_rdma else "Gloo")
+
+                # Broadcast UID from rank 0 to all ranks
+                if use_rdma:
+                    uid = rdma.broadcast_object(uid, src=0)
+                else:
+                    uid_list = [uid]
+                    dist.broadcast_object_list(uid_list, src=0, group=cpu_pg)
+                    uid = uid_list[0]
+
                 if self.rank == 0:
                     _rdep_logger.info("rank=%d: UID broadcast complete", self.rank)
                 if self.rank == 0:
@@ -289,13 +359,22 @@ class Rdep:
             my_host = socket.gethostname()
 
             with _nvtx("rdep/hybrid_allgather"):
-                all_hosts = [None] * self.world
-                dist.all_gather_object(all_hosts, my_host, group=cpu_pg)
+                # Gather hostnames and local ranks from all ranks
+                if use_rdma:
+                    all_hosts = rdma.all_gather_object(my_host)
+                else:
+                    all_hosts = [None] * self.world
+                    dist.all_gather_object(all_hosts, my_host, group=cpu_pg)
+
                 local_rank_env = os.environ.get("LOCAL_RANK")
                 if local_rank_env is None:
                     raise RuntimeError("[RDEP] LOCAL_RANK must be set for hybrid IPC-handle mapping.")
-                all_local_ranks = [None] * self.world
-                dist.all_gather_object(all_local_ranks, int(local_rank_env), group=cpu_pg)
+
+                if use_rdma:
+                    all_local_ranks = rdma.all_gather_object(int(local_rank_env))
+                else:
+                    all_local_ranks = [None] * self.world
+                    dist.all_gather_object(all_local_ranks, int(local_rank_env), group=cpu_pg)
 
                 local_entries = []
                 for r in range(self.world):
@@ -318,25 +397,41 @@ class Rdep:
 
             with _nvtx("rdep/hybrid_open"):
                 if use_bf16_hybrid:
-                    all_handles_bf16 = [None] * self.world
                     with cuda_error_context("nvshmem_get_ipc_handle_bf16"):
                         local_handle_bf16 = _C.nvshmem_get_ipc_handle_bf16()
-                    dist.all_gather_object(all_handles_bf16, local_handle_bf16, group=cpu_pg)
+
+                    # All-gather IPC handles using RDMA or Gloo
+                    if use_rdma:
+                        all_handles_bf16 = rdma.all_gather_object(local_handle_bf16)
+                    else:
+                        all_handles_bf16 = [None] * self.world
+                        dist.all_gather_object(all_handles_bf16, local_handle_bf16, group=cpu_pg)
+
                     local_handles_bf16_np = np.concatenate([all_handles_bf16[r] for r in local_peer_ranks])
                     with cuda_error_context("nvshmem_open_ipc_handles_bf16"):
                         _C.nvshmem_open_ipc_handles_bf16(local_handles_bf16_np, self.local_world)
                         _C.nvshmem_sync_ipc_buffer_ptrs_bf16()
                 else:
-                    all_handles_block = [None] * self.world
                     with cuda_error_context("nvshmem_get_ipc_handle_blockscaled"):
                         local_handle_block = _C.nvshmem_get_ipc_handle_blockscaled()
-                    dist.all_gather_object(all_handles_block, local_handle_block, group=cpu_pg)
+
+                    # All-gather IPC handles using RDMA or Gloo
+                    if use_rdma:
+                        all_handles_block = rdma.all_gather_object(local_handle_block)
+                    else:
+                        all_handles_block = [None] * self.world
+                        dist.all_gather_object(all_handles_block, local_handle_block, group=cpu_pg)
+
                     local_handles_block_np = np.concatenate([all_handles_block[r] for r in local_peer_ranks])
                     with cuda_error_context("nvshmem_open_ipc_handles_blockscaled"):
                         _C.nvshmem_open_ipc_handles_blockscaled(local_handles_block_np, self.local_world)
                         _C.nvshmem_sync_ipc_buffer_ptrs_blockscaled()
 
-            dist.barrier(group=cpu_pg)
+            # Final barrier
+            if use_rdma:
+                rdma.barrier()
+            else:
+                dist.barrier(group=cpu_pg)
 
         except CudaError as e:
             raise NvshmemError(
