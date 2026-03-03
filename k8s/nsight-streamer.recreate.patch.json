@@ -1,4 +1,0 @@
-[
-  {"op":"replace","path":"/spec/strategy/type","value":"Recreate"},
-  {"op":"remove","path":"/spec/strategy/rollingUpdate"}
-]
