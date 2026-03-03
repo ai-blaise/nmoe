@@ -100,14 +100,8 @@ os.environ["NCCL_NVLS_ENABLE"] = "1"             # NVLink SHARP enabled
 # CUDA Graph mixing support for NCCL operations
 os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "1"
 
-# -----------------------------------------------------------------------------
-# NCCL SOCKET SETTINGS (TCP backup path, not primary)
-# -----------------------------------------------------------------------------
-os.environ["NCCL_SOCKET_IFNAME"] = "eth0"        # GVNIC for control plane
-os.environ["NCCL_SOCKET_NTHREADS"] = "8"         # 8 socket threads
-os.environ["NCCL_NSOCKS_PERTHREAD"] = "8"        # 64 total TCP connections
-
 # Gloo rendezvous/control plane uses GVNIC (eth0), not RDMA
+# NOTE: No NCCL_SOCKET_* settings - IB must work or training crashes (no TCP fallback)
 os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
 
 # -----------------------------------------------------------------------------
