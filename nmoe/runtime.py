@@ -8,7 +8,9 @@ B200 Cluster Configuration (16x nodes, 8x GPUs per node, 8x RDMA NICs per node):
 - Python 3.12, PyTorch 2.9.1+cu130
 - Blackwell architecture: sm_100 (compute capability 10.0)
 - 8x 200GB/s NVLink per GPU (NVSwitch interconnect)
-- 8x ~400 Gbps RDMA NICs per node (mlx5_0-mlx5_7, MTU 8896)
+- 8x Mellanox ConnectX-7 @ 400 Gbps (RoCE transport, MTU 8896)
+  Interfaces: gpu0rdma0 through gpu7rdma0
+  Underlying devices: mlx5_0 through mlx5_7
 """
 import logging
 import os
@@ -24,10 +26,11 @@ from pathlib import Path
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# NCCL NETWORK TRANSPORT (8x mlx5 RDMA NICs per node, MTU 8896)
+# NCCL NETWORK TRANSPORT (8x mlx5 RoCE NICs per node, MTU 8896)
+# NOTE: NCCL_NET=IB works for both InfiniBand and RoCE (same mlx5 driver)
 # -----------------------------------------------------------------------------
-os.environ["NCCL_NET"] = "IB"                    # Force InfiniBand (not Socket/TCP)
-os.environ["NCCL_IB_DISABLE"] = "0"              # InfiniBand enabled
+os.environ["NCCL_NET"] = "IB"                    # Force RDMA (works for IB and RoCE)
+os.environ["NCCL_IB_DISABLE"] = "0"              # RDMA enabled
 os.environ["NCCL_SHM_DISABLE"] = "0"             # Shared memory for intra-node
 os.environ["NCCL_IB_HCA"] = "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7"
 os.environ["NCCL_IB_GID_INDEX"] = "3"            # RoCEv2 GID index
@@ -38,7 +41,7 @@ os.environ["NCCL_NET_GDR_LEVEL"] = "2"           # PHB level for B200
 os.environ["NCCL_NET_GDR_READ"] = "1"            # GPUDirect RDMA read path
 
 # -----------------------------------------------------------------------------
-# NCCL MULTI-RAIL RDMA TUNING (Critical for 8x NIC saturation)
+# NCCL MULTI-RAIL RoCE TUNING (Critical for 8x NIC saturation)
 # -----------------------------------------------------------------------------
 # Channel count: 8 channels = 1 per RDMA NIC = maximum multi-rail utilization
 os.environ["NCCL_MIN_NCHANNELS"] = "8"           # Minimum 8 for 8-rail
@@ -58,7 +61,7 @@ os.environ["NCCL_IB_SPLIT_DATA_ON_QPS"] = "1"    # Split data across QPs
 os.environ["NCCL_BUFFSIZE"] = "536870912"        # 512MB (increased from 256MB)
 
 # -----------------------------------------------------------------------------
-# NCCL INFINIBAND TRANSPORT TUNING
+# NCCL RDMA/RoCE TRANSPORT TUNING (IB_* settings work for RoCE too)
 # -----------------------------------------------------------------------------
 # IB timeout: 20 = ~4 seconds (2^20 * 4.096us base)
 # Default 14 (~67ms) is too aggressive for large-scale RDMA
@@ -101,27 +104,24 @@ os.environ["NCCL_NVLS_ENABLE"] = "1"             # NVLink SHARP enabled
 os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "1"
 
 # -----------------------------------------------------------------------------
-# GLOO TRANSPORT FOR CPU COLLECTIVES
+# GLOO TRANSPORT FOR CPU COLLECTIVES (Control Plane Only)
 # -----------------------------------------------------------------------------
 # Gloo is used for CPU-side object exchange during NVSHMEM/IPC bootstrap.
-# Performance hierarchy (B200 cluster with 8x mlx5 RDMA NICs):
+# Performance hierarchy (B200 cluster with 8x ConnectX-7 RoCE NICs):
 #
 # 1. NCCL-based RDMA collectives (NMOE_RDMA_COLLECTIVES=1, default)
 #    - Serializes objects to GPU tensors, uses NCCL all_gather/broadcast
-#    - ~10us latency (uses RDMA over InfiniBand via NCCL)
+#    - ~10us latency (uses RDMA over RoCE via NCCL)
 #    - Enabled by default in nmoe/rdma_collectives.py
 #
-# 2. Gloo over IPoIB (if ib0/ibs0 interface exists)
-#    - IP over InfiniBand, ~50us latency
-#    - Automatically detected by nmoe/rdep.py:_cpu_pg()
-#
-# 3. Gloo over TCP (eth0, GVNIC fallback)
+# 2. Gloo over TCP (eth0, GVNIC)
 #    - TCP over Google Virtual NIC, ~100us latency
-#    - Used only if IPoIB not available and RDMA collectives disabled
+#    - Used only for control plane (torchrun rendezvous) when RDMA collectives disabled
 #
-# NOTE: No NCCL_SOCKET_* settings - IB must work or training crashes (no TCP fallback)
-# The GLOO_SOCKET_IFNAME is set dynamically by _cpu_pg() after IPoIB detection.
-# Default to eth0 here; rdep.py will override if IPoIB is found.
+# NOTE: RoCE clusters do NOT have IPoIB interfaces (no ib0/ibs0).
+# RoCE uses Ethernet interfaces (gpu0rdma0-gpu7rdma0) for RDMA data path.
+# Gloo cannot use RoCE directly - it uses TCP for control plane only.
+# Actual data transfer uses NCCL which handles RoCE natively via mlx5 driver.
 os.environ.setdefault("GLOO_SOCKET_IFNAME", "eth0")
 
 # Enable RDMA collectives for CPU object exchange (uses NCCL instead of Gloo)

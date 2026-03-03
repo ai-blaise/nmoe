@@ -22,11 +22,7 @@ from .cuda_errors import (
     cuda_error_context,
 )
 from .nccl_watchdog import get_watchdog
-from .rdma_collectives import (
-    RDMACollectives,
-    detect_ipoib_interface,
-    get_optimal_gloo_interface,
-)
+from .rdma_collectives import RDMACollectives
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -103,12 +99,13 @@ def _cpu_pg():
     pattern for distributed systems that need CPU-side collective before GPU
     collectives are available.
 
-    B200 cluster optimization:
-    - If IPoIB (ib0) is available: Use Gloo over IPoIB (~50us latency)
-    - Otherwise: Fall back to Gloo over GVNIC/eth0 (~100us latency)
+    B200 cluster (RoCE):
+    - Uses Gloo over TCP/eth0 for control plane (~100us latency)
+    - RoCE clusters have NO IPoIB interfaces (Ethernet-based RDMA)
+    - Actual RDMA data path uses NCCL via mlx5 driver
 
-    For even faster bootstrap, set NMOE_RDMA_COLLECTIVES=1 (default) to use
-    NCCL-based tensor exchange instead of Gloo object exchange.
+    For fast bootstrap, NMOE_RDMA_COLLECTIVES=1 (default) uses NCCL-based
+    tensor exchange instead of Gloo object exchange (~10us via RoCE).
     """
     global _CPU_PG, _CPU_PG_WORLD
     if not dist.is_initialized():
@@ -117,20 +114,11 @@ def _cpu_pg():
     if world <= 1:
         return None
     if _CPU_PG is None or _CPU_PG_WORLD != world:
-        # Detect optimal interface for Gloo (IPoIB > GVNIC)
-        ipoib_if = detect_ipoib_interface()
-        if ipoib_if:
-            # Use IPoIB for faster Gloo transport
-            os.environ["GLOO_SOCKET_IFNAME"] = ipoib_if
-            _rdep_logger.info(
-                "Using IPoIB interface %s for Gloo (RDMA over IP, ~50us latency)",
-                ipoib_if,
-            )
-        else:
-            # Fall back to GVNIC
-            _rdep_logger.debug(
-                "No IPoIB interface found, using eth0 for Gloo (~100us latency)"
-            )
+        # Use eth0 for Gloo control plane (RoCE clusters have no IPoIB)
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "eth0")
+        _rdep_logger.debug(
+            "Using eth0 for Gloo control plane (RoCE data path uses NCCL)"
+        )
         _CPU_PG = dist.new_group(backend="gloo", timeout=timedelta(seconds=1800))
         _CPU_PG_WORLD = world
     return _CPU_PG

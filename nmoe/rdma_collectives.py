@@ -4,7 +4,8 @@ This module provides NCCL-backed alternatives to Gloo's object collectives,
 enabling RDMA transport for CPU-side coordination during NVSHMEM/IPC bootstrap.
 
 Key insight: Gloo over TCP (eth0) has ~100us latency. By serializing Python
-objects to GPU tensors and using NCCL (which uses RDMA), we achieve ~10us latency.
+objects to GPU tensors and using NCCL (which uses RDMA over RoCE), we achieve
+~10us latency.
 
 Usage:
     from nmoe.rdma_collectives import broadcast_object_rdma, all_gather_object_rdma
@@ -16,8 +17,13 @@ Usage:
 
 Performance (16 nodes x 8 GPUs, 128 byte object):
     - Gloo TCP (eth0):    ~100us
-    - Gloo IPoIB (ib0):   ~50us  (if IPoIB configured)
-    - NCCL RDMA:          ~10us  (this module)
+    - NCCL RoCE:          ~10us  (this module, via mlx5 driver)
+
+Hardware: B200 cluster uses RoCE (RDMA over Converged Ethernet), not InfiniBand.
+- 8x Mellanox ConnectX-7 @ 400 Gbps per node
+- Interfaces: gpu0rdma0 through gpu7rdma0 (MTU 8896)
+- Underlying RDMA devices: mlx5_0 through mlx5_7
+- NO IPoIB interfaces (RoCE is Ethernet-based, not InfiniBand)
 """
 
 import io
@@ -199,74 +205,7 @@ def barrier_rdma(group: Optional[ProcessGroup] = None) -> None:
 
 
 # =============================================================================
-# IPoIB (IP over InfiniBand) Detection
-# =============================================================================
-
-
-def detect_ipoib_interface() -> Optional[str]:
-    """Detect available IPoIB interfaces on the system.
-
-    IPoIB provides IP networking over InfiniBand, giving ~50us latency
-    compared to ~100us for TCP over GVNIC.
-
-    Returns:
-        Interface name (e.g., "ib0", "ibs0") if found, None otherwise.
-    """
-    import subprocess
-
-    try:
-        # Check for IPoIB interfaces
-        result = subprocess.run(
-            ["ip", "link", "show"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return None
-
-        # Look for ib* or ibs* interfaces
-        for line in result.stdout.split("\n"):
-            # ip link show format: "N: ifname: <FLAGS>..."
-            if ": ib" in line.lower():
-                parts = line.split(":")
-                if len(parts) >= 2:
-                    ifname = parts[1].strip().split("@")[0]
-                    if ifname.startswith("ib"):
-                        return ifname
-
-        # Also check for Datagram mode interfaces (ibd*)
-        for line in result.stdout.split("\n"):
-            if ": ibd" in line.lower():
-                parts = line.split(":")
-                if len(parts) >= 2:
-                    ifname = parts[1].strip().split("@")[0]
-                    return ifname
-
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-
-    return None
-
-
-def get_optimal_gloo_interface() -> str:
-    """Get the optimal interface for Gloo based on available hardware.
-
-    Priority:
-    1. IPoIB interface (ib0, ibs0) - RDMA over IP, ~50us latency
-    2. GVNIC (eth0) - TCP fallback, ~100us latency
-
-    Returns:
-        Interface name to use for GLOO_SOCKET_IFNAME.
-    """
-    ipoib = detect_ipoib_interface()
-    if ipoib:
-        return ipoib
-    return "eth0"
-
-
-# =============================================================================
-# Combined API for RDEP Bootstrap
+# Combined API for RDEP Bootstrap (RoCE/NCCL-based)
 # =============================================================================
 
 
@@ -283,7 +222,7 @@ class RDMACollectives:
         all_hosts = rdma.all_gather_object(my_hostname)
 
     The class automatically uses NCCL for GPU tensor collectives,
-    providing RDMA transport on InfiniBand clusters.
+    providing RDMA transport via RoCE (ConnectX-7 mlx5 devices).
     """
 
     def __init__(

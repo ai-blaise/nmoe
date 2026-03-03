@@ -1,64 +1,101 @@
 #!/bin/bash
-# Check RDMA and IPoIB configuration on B200 cluster nodes
+# Check RDMA/RoCE configuration on B200 cluster nodes
 #
 # Usage: ./scripts/check_rdma.sh
 #
 # This script verifies:
-# 1. InfiniBand hardware (mlx5 devices)
-# 2. IPoIB interfaces (ib0, ibs0, etc.)
+# 1. RDMA hardware (mlx5 devices)
+# 2. RoCE interfaces (gpu0rdma0-gpu7rdma0)
 # 3. RDMA verbs availability
-# 4. PyTorch Gloo ibverbs support
+# 4. NCCL transport configuration
 #
-# Expected output on B200 cluster (8x mlx5 RDMA NICs):
-#   - 8x mlx5_N devices in ibstat
-#   - ib0-ib7 IPoIB interfaces (if configured)
-#   - RDMA verbs working (ibv_devinfo)
+# Expected output on B200 cluster (8x ConnectX-7 RoCE NICs):
+#   - 8x mlx5_N devices in ibv_devinfo
+#   - gpu0rdma0-gpu7rdma0 RoCE interfaces (MTU 8896)
+#   - RDMA verbs working
+#   - NO IPoIB interfaces (RoCE is Ethernet-based)
 
 set -euo pipefail
 
 echo "=============================================="
-echo "RDMA/IPoIB Configuration Check"
+echo "RDMA/RoCE Configuration Check (B200 Cluster)"
 echo "=============================================="
 echo ""
 
-# 1. Check InfiniBand hardware
-echo "1. InfiniBand Hardware (ibstat)"
-echo "----------------------------------------------"
-if command -v ibstat &> /dev/null; then
-    ibstat | head -40
-else
-    echo "   ibstat not found - install rdma-core/infiniband-diags"
-fi
-echo ""
-
-# 2. Check network interfaces for IPoIB
-echo "2. Network Interfaces (looking for IPoIB)"
-echo "----------------------------------------------"
-echo "   IPoIB interfaces (ib*, ibs*, ibd*):"
-ip link show 2>/dev/null | grep -E "^[0-9]+: (ib|ibs|ibd)" || echo "   No IPoIB interfaces found"
-echo ""
-echo "   All interfaces:"
-ip link show 2>/dev/null | grep -E "^[0-9]+:" | head -20
-echo ""
-
-# 3. Check RDMA devices
-echo "3. RDMA Devices (ibv_devinfo)"
+# 1. Check RDMA devices
+echo "1. RDMA Devices (ibv_devinfo)"
 echo "----------------------------------------------"
 if command -v ibv_devinfo &> /dev/null; then
-    ibv_devinfo 2>/dev/null | head -50 || echo "   No RDMA devices found"
+    RDMA_COUNT=$(ibv_devinfo 2>/dev/null | grep -c "mlx5_" || echo 0)
+    echo "   Found $RDMA_COUNT mlx5 RDMA devices (expected: 8)"
+    echo ""
+    ibv_devinfo 2>/dev/null | head -60 || echo "   No RDMA devices found"
 else
     echo "   ibv_devinfo not found - install rdma-core"
 fi
 echo ""
 
-# 4. Check mlx5 kernel modules
-echo "4. Mellanox Driver Modules"
+# 2. Check RoCE network interfaces (gpu0rdma0-gpu7rdma0)
+echo "2. RoCE Network Interfaces"
+echo "----------------------------------------------"
+echo "   Looking for gpuXrdma0 interfaces (RoCE over Ethernet):"
+ROCE_IFACES=$(ip link show 2>/dev/null | grep -E "^[0-9]+: gpu[0-7]rdma0" || true)
+if [ -n "$ROCE_IFACES" ]; then
+    echo "$ROCE_IFACES" | while read line; do
+        IFACE=$(echo "$line" | cut -d: -f2 | tr -d ' ')
+        MTU=$(ip link show "$IFACE" 2>/dev/null | grep -oP 'mtu \K[0-9]+' || echo "unknown")
+        STATE=$(ip link show "$IFACE" 2>/dev/null | grep -oP 'state \K\w+' || echo "unknown")
+        echo "   $IFACE: MTU=$MTU, state=$STATE"
+    done
+else
+    echo "   No gpuXrdma0 interfaces found"
+fi
+echo ""
+
+echo "   NOTE: RoCE clusters do NOT have IPoIB interfaces (no ib0/ibs0)"
+echo "   Checking for IPoIB (should be empty):"
+IPOIB_IFACES=$(ip link show 2>/dev/null | grep -E "^[0-9]+: (ib|ibs|ibd)" || true)
+if [ -n "$IPOIB_IFACES" ]; then
+    echo "   WARNING: IPoIB interfaces found (unexpected on RoCE cluster):"
+    echo "$IPOIB_IFACES"
+else
+    echo "   None found (correct for RoCE)"
+fi
+echo ""
+
+# 3. Check mlx5 kernel modules
+echo "3. Mellanox Driver Modules"
 echo "----------------------------------------------"
 lsmod | grep -E "mlx5|rdma|ib_" | head -20 || echo "   No mlx5/RDMA modules loaded"
 echo ""
 
-# 5. Check PyTorch Gloo configuration
-echo "5. PyTorch Gloo Configuration"
+# 4. Check RDMA device info for each mlx5 device
+echo "4. RDMA Device Details"
+echo "----------------------------------------------"
+for i in {0..7}; do
+    if ibv_devinfo mlx5_$i &>/dev/null 2>&1; then
+        PORT_STATE=$(ibv_devinfo mlx5_$i 2>/dev/null | grep -E "^\s+state:" | head -1 | awk '{print $2}')
+        LINK_LAYER=$(ibv_devinfo mlx5_$i 2>/dev/null | grep -E "^\s+link_layer:" | head -1 | awk '{print $2}')
+        echo "   mlx5_$i: $PORT_STATE ($LINK_LAYER)"
+    else
+        echo "   mlx5_$i: NOT FOUND"
+    fi
+done
+echo ""
+
+# 5. Check environment variables
+echo "5. Environment Variables"
+echo "----------------------------------------------"
+echo "   GLOO_SOCKET_IFNAME: ${GLOO_SOCKET_IFNAME:-not set (default: eth0)}"
+echo "   NMOE_RDMA_COLLECTIVES: ${NMOE_RDMA_COLLECTIVES:-not set (default: 1)}"
+echo "   NCCL_NET: ${NCCL_NET:-not set}"
+echo "   NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-not set}"
+echo "   NCCL_IB_HCA: ${NCCL_IB_HCA:-not set}"
+echo "   NCCL_IB_GID_INDEX: ${NCCL_IB_GID_INDEX:-not set (should be 3 for RoCEv2)}"
+echo ""
+
+# 6. Check PyTorch distributed backends
+echo "6. PyTorch Distributed Configuration"
 echo "----------------------------------------------"
 python3 -c "
 import torch
@@ -69,79 +106,53 @@ print(f'   CUDA available: {torch.cuda.is_available()}')
 print(f'   NCCL available: {dist.is_nccl_available()}')
 print(f'   Gloo available: {dist.is_gloo_available()}')
 
-# Check if Gloo was built with ibverbs
-# This is tricky - standard PyTorch pip packages do NOT include ibverbs
-# You need to build from source with USE_GLOO_IBVERBS=1
-try:
-    import torch._C
-    if hasattr(torch._C, '_distributed_c10d'):
-        print('   Gloo C10d module: loaded')
-except:
-    print('   Gloo C10d module: not available')
+if torch.cuda.is_available():
+    print(f'   GPU count: {torch.cuda.device_count()}')
+    print(f'   GPU 0: {torch.cuda.get_device_name(0)}')
 
 print('')
-print('   NOTE: Standard PyTorch packages do NOT include Gloo ibverbs.')
-print('   For native RDMA with Gloo, build PyTorch from source:')
-print('     USE_DISTRIBUTED=1 USE_GLOO_IBVERBS=1 python setup.py install')
-print('')
-print('   RECOMMENDED: Use NMOE_RDMA_COLLECTIVES=1 (default) which uses')
-print('   NCCL-based object exchange for RDMA transport.')
+print('   For RoCE clusters:')
+print('   - NCCL uses mlx5 driver for RDMA (handles RoCE natively)')
+print('   - Gloo uses TCP over eth0 for control plane only')
+print('   - NMOE_RDMA_COLLECTIVES=1 (default) uses NCCL for fast object exchange')
 " 2>/dev/null || echo "   Python check failed"
 echo ""
 
-# 6. Check environment variables
-echo "6. Environment Variables"
-echo "----------------------------------------------"
-echo "   GLOO_SOCKET_IFNAME: ${GLOO_SOCKET_IFNAME:-not set}"
-echo "   NMOE_RDMA_COLLECTIVES: ${NMOE_RDMA_COLLECTIVES:-not set (default: 1)}"
-echo "   NCCL_NET: ${NCCL_NET:-not set}"
-echo "   NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-not set}"
-echo "   NCCL_IB_HCA: ${NCCL_IB_HCA:-not set}"
-echo ""
-
-# 7. Check NCCL transport
-echo "7. NCCL Transport Test"
-echo "----------------------------------------------"
-python3 -c "
-import os
-os.environ['NCCL_DEBUG'] = 'INFO'
-os.environ['NCCL_DEBUG_SUBSYS'] = 'NET'
-
-import torch
-if torch.cuda.is_available():
-    # This will print NCCL initialization info
-    t = torch.zeros(1, device='cuda')
-    print('   CUDA tensor created - NCCL will use available transports')
-    print('   Check for \"NET/IB\" or \"NET/Socket\" in debug output')
-else:
-    print('   No CUDA device available')
-" 2>&1 | head -20 || echo "   NCCL test failed"
-echo ""
-
-# 8. Summary
+# 7. Summary
 echo "=============================================="
 echo "Summary"
 echo "=============================================="
 echo ""
 
-# Check IPoIB
-IPOIB_IF=$(ip link show 2>/dev/null | grep -E "^[0-9]+: ib" | head -1 | cut -d: -f2 | tr -d ' ')
-if [ -n "$IPOIB_IF" ]; then
-    echo "IPoIB:    AVAILABLE ($IPOIB_IF)"
-    echo "          Set GLOO_SOCKET_IFNAME=$IPOIB_IF for ~50us latency"
+# Check RDMA device count
+RDMA_COUNT=$(ibv_devinfo 2>/dev/null | grep -c "mlx5_" || echo 0)
+if [ "$RDMA_COUNT" -eq 8 ]; then
+    echo "RDMA Devices: OK (8/8 mlx5 devices found)"
+elif [ "$RDMA_COUNT" -gt 0 ]; then
+    echo "RDMA Devices: PARTIAL ($RDMA_COUNT/8 mlx5 devices found)"
 else
-    echo "IPoIB:    NOT CONFIGURED"
-    echo "          Using TCP over GVNIC (~100us latency)"
+    echo "RDMA Devices: NOT FOUND"
 fi
-echo ""
 
-# Check RDMA collectives recommendation
-echo "RECOMMENDATION:"
-echo "  For fastest CPU collectives, use NMOE_RDMA_COLLECTIVES=1 (default)"
-echo "  This uses NCCL-based object exchange (~10us latency over RDMA)"
+# Check RoCE interfaces
+ROCE_COUNT=$(ip link show 2>/dev/null | grep -cE "^[0-9]+: gpu[0-7]rdma0" || echo 0)
+if [ "$ROCE_COUNT" -eq 8 ]; then
+    echo "RoCE Interfaces: OK (8/8 gpuXrdma0 interfaces found)"
+elif [ "$ROCE_COUNT" -gt 0 ]; then
+    echo "RoCE Interfaces: PARTIAL ($ROCE_COUNT/8 gpuXrdma0 interfaces found)"
+else
+    echo "RoCE Interfaces: NOT FOUND"
+fi
+
 echo ""
-echo "  Performance hierarchy:"
-echo "    1. NCCL RDMA (NMOE_RDMA_COLLECTIVES=1):  ~10us"
-echo "    2. Gloo IPoIB (GLOO_SOCKET_IFNAME=ib0):  ~50us"
-echo "    3. Gloo TCP (GLOO_SOCKET_IFNAME=eth0):   ~100us"
+echo "CONFIGURATION:"
+echo "  This cluster uses RoCE (RDMA over Converged Ethernet)"
+echo "  - Data path: NCCL uses mlx5_0-mlx5_7 via RoCE"
+echo "  - Control path: Gloo uses eth0 via TCP"
+echo "  - NMOE_RDMA_COLLECTIVES=1 (default) for fast CPU object exchange"
+echo ""
+echo "  Performance:"
+echo "    - NCCL RoCE (data path):      ~10us, 400 Gbps per NIC"
+echo "    - NCCL RDMA collectives:      ~10us (object exchange)"
+echo "    - Gloo TCP (control plane):   ~100us (fallback only)"
 echo ""
