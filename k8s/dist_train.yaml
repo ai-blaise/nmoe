@@ -70,46 +70,116 @@ spec:
                 --master_port=$MASTER_PORT \
                 -m nmoe.train /data/configs/${CONFIG_NAME:-moonlight.toml}
           env:
+            # ─────────────────────────────────────────────────────────────────
+            # CUDA / PyTorch
+            # ─────────────────────────────────────────────────────────────────
             - name: PYTORCH_CUDA_ALLOC_CONF
-              value: "expandable_segments:True"
+              value: "expandable_segments:True,max_split_size_mb:512"
+            - name: CUDA_DEVICE_MAX_CONNECTIONS
+              value: "16"
+            - name: PYTHONFAULTHANDLER
+              value: "1"
+            # ─────────────────────────────────────────────────────────────────
+            # NCCL Network Transport — InfiniBand (8× mlx5 RDMA NICs)
+            # ─────────────────────────────────────────────────────────────────
             - name: NCCL_DEBUG
               value: "WARN"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,ENV"
             - name: NCCL_NET
-              value: "Socket"
+              value: "IB"
             - name: NCCL_IB_DISABLE
+              value: "0"
+            - name: NCCL_SHM_DISABLE
+              value: "0"
+            - name: NCCL_IB_HCA
+              value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7"
+            - name: NCCL_IB_GID_INDEX
+              value: "3"
+            # ─────────────────────────────────────────────────────────────────
+            # GPUDirect RDMA
+            # ─────────────────────────────────────────────────────────────────
+            - name: NCCL_NET_GDR_LEVEL
+              value: "2"
+            - name: NCCL_NET_GDR_READ
               value: "1"
+            # ─────────────────────────────────────────────────────────────────
+            # Multi-rail optimization (8× NIC saturation)
+            # ─────────────────────────────────────────────────────────────────
+            - name: NCCL_MIN_NCHANNELS
+              value: "8"
+            - name: NCCL_MAX_NCHANNELS
+              value: "16"
+            - name: NCCL_CROSS_NIC
+              value: "2"
+            - name: NCCL_IB_QPS_PER_CONNECTION
+              value: "4"
+            - name: NCCL_IB_SPLIT_DATA_ON_QPS
+              value: "1"
+            - name: NCCL_BUFFSIZE
+              value: "536870912"
+            # ─────────────────────────────────────────────────────────────────
+            # InfiniBand tuning
+            # ─────────────────────────────────────────────────────────────────
+            - name: NCCL_IB_TIMEOUT
+              value: "20"
+            - name: NCCL_IB_RETRY_CNT
+              value: "7"
+            - name: NCCL_IB_PCI_RELAXED_ORDERING
+              value: "1"
+            - name: NCCL_IB_AR_THRESHOLD
+              value: "0"
+            # ─────────────────────────────────────────────────────────────────
+            # Algorithm and protocol
+            # ─────────────────────────────────────────────────────────────────
+            - name: NCCL_ALGO
+              value: "TREE"
+            - name: NCCL_PROTO
+              value: "SIMPLE"
+            - name: NCCL_NTHREADS
+              value: "512"
+            # ─────────────────────────────────────────────────────────────────
+            # P2P / NVSwitch
+            # ─────────────────────────────────────────────────────────────────
             - name: NCCL_P2P_DISABLE
               value: "0"
             - name: NCCL_P2P_LEVEL
-              value: "NVL"
-            - name: NCCL_NET_GDR_LEVEL
-              value: "0"
+              value: "LOC"
             - name: NCCL_NVLS_ENABLE
-              value: "0"
+              value: "1"
+            - name: NCCL_GRAPH_MIXING_SUPPORT
+              value: "1"
+            # ─────────────────────────────────────────────────────────────────
+            # Socket (TCP backup for control plane)
+            # ─────────────────────────────────────────────────────────────────
             - name: NCCL_SOCKET_IFNAME
               value: "eth0"
+            - name: NCCL_SOCKET_NTHREADS
+              value: "8"
+            - name: NCCL_NSOCKS_PERTHREAD
+              value: "8"
             - name: GLOO_SOCKET_IFNAME
               value: "eth0"
-            - name: NCCL_SOCKET_NTHREADS
-              value: "4"
-            - name: NCCL_NSOCKS_PERTHREAD
-              value: "4"
-            - name: NCCL_BUFFSIZE
-              value: "16777216"
-            - name: NCCL_MIN_NCHANNELS
-              value: "4"
-            - name: NCCL_MAX_NCHANNELS
-              value: "8"
-            - name: NCCL_ALGO
-              value: "Tree,Ring"
-            - name: NCCL_PROTO
-              value: "Simple,LL128,LL"
-            - name: NCCL_CROSS_NIC
-              value: "0"
+            # ─────────────────────────────────────────────────────────────────
+            # Timeouts
+            # ─────────────────────────────────────────────────────────────────
+            - name: NCCL_TIMEOUT
+              value: "1800"
+            - name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC
+              value: "1800"
             - name: TORCH_NCCL_BLOCKING_WAIT
               value: "0"
+            - name: TORCH_NCCL_ASYNC_ERROR_HANDLING
+              value: "1"
+            - name: TORCH_NCCL_AVOID_RECORD_STREAMS
+              value: "1"
+            - name: TORCH_NCCL_HIGH_PRIORITY
+              value: "1"
+            # ─────────────────────────────────────────────────────────────────
+            # NMOE
+            # ─────────────────────────────────────────────────────────────────
             - name: NMOE_ZERO2_RS_CHUNK_MB
-              value: "512"
+              value: "128"
           securityContext:
             capabilities:
               add:

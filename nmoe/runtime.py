@@ -107,6 +107,18 @@ os.environ["NCCL_SOCKET_IFNAME"] = "eth0"        # GVNIC for control plane
 os.environ["NCCL_SOCKET_NTHREADS"] = "8"         # 8 socket threads
 os.environ["NCCL_NSOCKS_PERTHREAD"] = "8"        # 64 total TCP connections
 
+# Gloo rendezvous/control plane uses GVNIC (eth0), not RDMA
+os.environ["GLOO_SOCKET_IFNAME"] = "eth0"
+
+# -----------------------------------------------------------------------------
+# NCCL TIMEOUT SETTINGS
+# -----------------------------------------------------------------------------
+# 30-minute timeout for large-model init and long-running collectives
+os.environ["NCCL_TIMEOUT"] = "1800"
+os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = "1800"
+# Non-blocking wait for async error detection
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "0"
+
 # -----------------------------------------------------------------------------
 # UCX SETTINGS FOR MULTI-RAIL RDMA TRANSPORT
 # -----------------------------------------------------------------------------

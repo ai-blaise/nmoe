@@ -2,6 +2,17 @@ FROM xjdr/nmoe:deps
 
 WORKDIR /workspace/nmoe
 
+# =============================================================================
+# NCCL Configuration for NON-RDMA environments (TCP/Socket transport)
+#
+# WARNING: This Dockerfile is for environments WITHOUT InfiniBand RDMA.
+# For B200 RDMA cluster (8x mlx5 NICs), use Dockerfile.train.rdma or
+# override these at runtime with nmoe/runtime.py settings.
+#
+# The nmoe/runtime.py module sets NCCL_NET=IB and NCCL_IB_DISABLE=0 at
+# Python import time, which will override these Docker ENV defaults.
+# =============================================================================
+
 ENV NCCL_DEBUG=WARN
 ENV NCCL_NET=Socket
 ENV NCCL_IB_DISABLE=1
