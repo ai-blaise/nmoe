@@ -56,9 +56,9 @@ os.environ["NCCL_CROSS_NIC"] = "2"               # Round-robin multi-rail
 os.environ["NCCL_IB_QPS_PER_CONNECTION"] = "4"   # 4 QPs per connection
 os.environ["NCCL_IB_SPLIT_DATA_ON_QPS"] = "1"    # Split data across QPs
 
-# Large buffer for high-bandwidth 8-rail RDMA (512MB total)
-# Each rail gets ~64MB of buffer for deep pipelining
-os.environ["NCCL_BUFFSIZE"] = "536870912"        # 512MB (increased from 256MB)
+# NCCL buffer for 8-rail RDMA (128MB total, ~16MB per rail)
+# Reduced from 512MB to free ~384MB/GPU for model activations during backward pass
+os.environ["NCCL_BUFFSIZE"] = "134217728"         # 128MB (reduced from 512MB to fix CUDA OOM)
 
 # -----------------------------------------------------------------------------
 # NCCL RDMA/RoCE TRANSPORT TUNING (IB_* settings work for RoCE too)
@@ -82,10 +82,10 @@ os.environ["NCCL_IB_AR_THRESHOLD"] = "0"         # Disable AR
 # NCCL ALGORITHM AND PROTOCOL
 # -----------------------------------------------------------------------------
 # TREE algorithm for large 16-node all-reduce (better than RING for >8 nodes)
-os.environ["NCCL_ALGO"] = "TREE"
+os.environ["NCCL_ALGO"] = "RING,TREE"
 # SIMPLE protocol for large messages (>256KB), LL128 for small messages
 # NCCL auto-selects, but SIMPLE is optimal for MoE large tensors
-os.environ["NCCL_PROTO"] = "SIMPLE"
+os.environ["NCCL_PROTO"] = "LL,LL128,SIMPLE"
 # 512 threads per NCCL block (optimal for B200 SM count)
 os.environ["NCCL_NTHREADS"] = "512"
 
